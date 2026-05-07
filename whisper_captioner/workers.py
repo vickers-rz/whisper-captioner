@@ -114,6 +114,10 @@ def _cleanup_temp_paths(paths: list[Path]) -> None:
     paths.clear()
 
 
+def _subchunk_label(chunk_index: int, part_index: int) -> str:
+    return f"{chunk_index}.part{part_index}"
+
+
 def qwen3_asr_mode(mode: CaptionMode) -> bool:
     return mode.key in {"qwen3_asr_06b_4bit_mlx", "qwen3_asr_17b_8bit_mlx"}
 
@@ -1040,7 +1044,7 @@ class RollingPrefetchWorker(QObject):
                 path.unlink()
                 self.status.emit(f"Discarded derived subtitle cache after raw rebuild: {path.name}")
 
-    def _transcribe_chunk(self, chunk_wav: Path, chunk_out: Path, chunk_index: int) -> Path:
+    def _transcribe_chunk(self, chunk_wav: Path, chunk_out: Path, chunk_label: int | str) -> Path:
         if self.mode.backend == "mlx_audio":
             if qwen3_asr_mode(self.mode):
                 output_path = chunk_out.with_suffix("")
@@ -1054,7 +1058,7 @@ class RollingPrefetchWorker(QObject):
                         "--language", "zh",
                         "--chunk-duration", str(max(1, int(self.chunk_seconds))),
                     ],
-                    f"Transcribing chunk {chunk_index} with Qwen3-ASR",
+                    f"Transcribing chunk {chunk_label} with Qwen3-ASR",
                 )
                 txt_path = Path(str(output_path) + ".txt")
                 chunk_text = txt_path.read_text(encoding="utf-8", errors="ignore").strip() if txt_path.exists() else output_text
@@ -1073,7 +1077,7 @@ class RollingPrefetchWorker(QObject):
                     "--language", "zh",
                     "--chunk-duration", str(max(1, int(self.chunk_seconds))),
                 ],
-                f"Transcribing chunk {chunk_index} with MLX-Audio",
+                f"Transcribing chunk {chunk_label} with MLX-Audio",
             )
             return Path(str(output_path) + ".srt")
         if self.mode.backend == "mlx_whisper":
@@ -1088,7 +1092,7 @@ class RollingPrefetchWorker(QObject):
                     "--output-name", chunk_out.name,
                     "--verbose", "False",
                 ],
-                f"Transcribing chunk {chunk_index} with MLX Whisper",
+                f"Transcribing chunk {chunk_label} with MLX Whisper",
             )
             return chunk_out.with_suffix(".srt")
         if self.mode.backend == "sense_voice_cpp":
@@ -1101,7 +1105,7 @@ class RollingPrefetchWorker(QObject):
                     "-l", "zh",
                     "-itn",
                 ],
-                f"Transcribing chunk {chunk_index} with SenseVoice.cpp",
+                f"Transcribing chunk {chunk_label} with SenseVoice.cpp",
             )
             segments = self._trim_sense_voice_overlap(
                 parse_sense_voice_output(output_text),
@@ -1122,7 +1126,7 @@ class RollingPrefetchWorker(QObject):
                 "-osrt",
                 "-of", str(chunk_out),
             ],
-            f"Transcribing chunk {chunk_index}",
+            f"Transcribing chunk {chunk_label}",
         )
         return chunk_out.with_suffix(".srt")
 
@@ -1167,7 +1171,7 @@ class RollingPrefetchWorker(QObject):
                 ],
                 f"Preparing chunk {chunk_index} subchunk {part_index}",
             )
-            srt_path = self._transcribe_chunk(part_wav, part_out, int(f"{chunk_index}{part_index}"))
+            srt_path = self._transcribe_chunk(part_wav, part_out, _subchunk_label(chunk_index, part_index))
             if not srt_path.exists():
                 continue
             sub_segments = self._clamp_chunk_segments(parse_srt(srt_path), part_duration)
