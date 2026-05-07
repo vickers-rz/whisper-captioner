@@ -55,9 +55,15 @@ CHAT_HTML = """<!doctype html>
       background:
         radial-gradient(circle at top left, rgba(218, 171, 111, 0.24), transparent 30%),
         linear-gradient(180deg, #f8f2e8 0%, var(--bg) 100%);
-      min-height: 100vh;
+      height: 100vh;
+      overflow: hidden;
     }
-    .app { display: grid; grid-template-columns: 300px 1fr 320px; min-height: 100vh; }
+    .app {
+      display: grid;
+      grid-template-columns: 300px minmax(0, 1fr) 320px;
+      height: 100vh;
+      overflow: hidden;
+    }
     .panel {
       backdrop-filter: blur(10px);
       background: rgba(252, 251, 248, 0.82);
@@ -67,17 +73,21 @@ CHAT_HTML = """<!doctype html>
       background: linear-gradient(180deg, rgba(255,255,255,0.52), rgba(236,227,213,0.96));
       padding: 16px 14px;
       overflow: auto;
+      min-height: 0;
     }
     .workspace {
       display: grid;
-      grid-template-rows: auto auto 1fr auto;
+      grid-template-rows: auto auto auto minmax(0, 1fr) auto;
       min-width: 0;
+      min-height: 0;
+      overflow: hidden;
     }
     .inspector {
       border-left: 1px solid var(--border);
       padding: 16px 14px;
       overflow: auto;
       background: linear-gradient(180deg, rgba(255,255,255,0.7), rgba(247,242,233,0.92));
+      min-height: 0;
     }
     .brand {
       font-size: 18px;
@@ -195,6 +205,9 @@ CHAT_HTML = """<!doctype html>
       border: 1px solid var(--border);
       background: white;
     }
+    .toolbar-spacer {
+      flex: 1 1 auto;
+    }
     .messages {
       padding: 22px;
       overflow: auto;
@@ -202,6 +215,7 @@ CHAT_HTML = """<!doctype html>
       flex-direction: column;
       gap: 16px;
       min-width: 0;
+      min-height: 0;
     }
     .message {
       max-width: min(920px, 94%);
@@ -235,6 +249,8 @@ CHAT_HTML = """<!doctype html>
       padding: 16px 22px 24px;
       border-top: 1px solid var(--border);
       background: rgba(252,251,248,0.92);
+      position: relative;
+      z-index: 2;
     }
     .composer-shell {
       display: grid;
@@ -284,15 +300,34 @@ CHAT_HTML = """<!doctype html>
       font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
       word-break: break-all;
     }
+    .desktop-only {
+      display: inline-flex;
+    }
     .hidden { display: none; }
-    @media (max-width: 1180px) {
-      .app { grid-template-columns: 280px 1fr; }
-      .inspector { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--border); }
+    @media (max-width: 1360px) {
+      .app { grid-template-columns: 280px minmax(0, 1fr); }
+      .inspector {
+        position: fixed;
+        top: 0;
+        right: 0;
+        width: min(340px, 88vw);
+        height: 100vh;
+        border-left: 1px solid var(--border);
+        box-shadow: -24px 0 40px rgba(53, 36, 19, 0.14);
+        z-index: 20;
+        transform: translateX(100%);
+        transition: transform 180ms ease;
+      }
+      .inspector.open {
+        transform: translateX(0);
+      }
     }
     @media (max-width: 880px) {
       .app { grid-template-columns: 1fr; }
       .sidebar { border-right: 0; border-bottom: 1px solid var(--border); }
+      .workspace { grid-template-rows: auto auto auto minmax(0, 1fr) auto; }
       .composer-shell { grid-template-columns: 1fr; }
+      .desktop-only { display: none; }
     }
   </style>
 </head>
@@ -330,6 +365,8 @@ CHAT_HTML = """<!doctype html>
         <button id="attach-current-asset" class="secondary">把当前选中字幕挂到会话</button>
         <button id="cleanup" class="secondary">语句规整</button>
         <button id="article" class="secondary">转写成文稿</button>
+        <div class="toolbar-spacer"></div>
+        <button id="toggle-inspector" class="ghost desktop-only">当前资产</button>
         <button id="open-instructions" class="ghost">提示词说明</button>
       </div>
       <div id="provider-panel" class="warning" style="display:none;">
@@ -427,6 +464,8 @@ CHAT_HTML = """<!doctype html>
       assetSize: document.getElementById("asset-size"),
       assetPreview: document.getElementById("asset-preview"),
       openInstructions: document.getElementById("open-instructions"),
+      toggleInspector: document.getElementById("toggle-inspector"),
+      inspector: document.querySelector(".inspector"),
     };
 
     function fmtTime(value) {
@@ -506,7 +545,7 @@ CHAT_HTML = """<!doctype html>
         for (const msg of convo.messages) {
           const div = document.createElement("div");
           div.className = "message " + msg.role;
-          div.textContent = msg.content;
+          div.textContent = stripThinkingBlocks(msg.content);
           els.messages.appendChild(div);
         }
         els.messages.scrollTop = els.messages.scrollHeight;
@@ -532,6 +571,11 @@ CHAT_HTML = """<!doctype html>
       els.provider.value = currentKey || state.config.default_provider_key;
       els.providerEditorSelect.value = els.provider.value;
       syncProviderEditor();
+    }
+
+    function stripThinkingBlocks(text) {
+      if (!text) return "";
+      return text.replace(/<think>[\\s\\S]*?<\\/think>/g, "").trim() || text;
     }
 
     function updateWarning(convo) {
@@ -798,6 +842,9 @@ CHAT_HTML = """<!doctype html>
         "4. 如果字幕很长，建议切换到 Gemini 2.5 Pro。"
       ];
       setStatus(lines.join(" "));
+    });
+    els.toggleInspector.addEventListener("click", () => {
+      els.inspector.classList.toggle("open");
     });
 
     Promise.all([refreshConfig(), refreshAssets(), refreshConversations()])
