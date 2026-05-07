@@ -191,6 +191,15 @@ def llm_provider_ready(provider: LLMProvider, api_key: str) -> bool:
 def _extract_llm_reply(data: dict, fmt: str) -> str:
     """Extract reply text from LLM response based on format."""
     if fmt == "anthropic":
+        blocks = data.get("content", [])
+        if isinstance(blocks, list):
+            text_parts = [
+                str(block.get("text", "")).strip()
+                for block in blocks
+                if isinstance(block, dict) and block.get("type") == "text" and str(block.get("text", "")).strip()
+            ]
+            if text_parts:
+                return "\n".join(text_parts)
         return data["content"][0]["text"]
     return data["choices"][0]["message"]["content"]
 

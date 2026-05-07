@@ -170,6 +170,8 @@ LLM_PROVIDERS = [
     LLMProvider("gemini_pro", "Gemini 2.5 Pro",
                 "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
                 "gemini-2.5-pro", "openai"),
+    LLMProvider("minimax_m27", "MiniMAX M2.7",
+                "https://api.minimaxi.com/anthropic", "MiniMax-M2.7", "anthropic"),
     LLMProvider("claude_sonnet", "Claude Sonnet 4",
                 "https://api.anthropic.com/v1/messages", "claude-sonnet-4-20250514", "anthropic"),
     LLMProvider("custom", "Custom (OpenAI-compatible)", "", "", "openai"),

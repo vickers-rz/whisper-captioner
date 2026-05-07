@@ -326,10 +326,25 @@ CHAT_HTML = """<!doctype html>
       </div>
       <div class="toolbar">
         <select id="provider-select"></select>
+        <button id="provider-settings" class="ghost">模型设置</button>
         <button id="attach-current-asset" class="secondary">把当前选中字幕挂到会话</button>
         <button id="cleanup" class="secondary">语句规整</button>
         <button id="article" class="secondary">转写成文稿</button>
         <button id="open-instructions" class="ghost">提示词说明</button>
+      </div>
+      <div id="provider-panel" class="warning" style="display:none;">
+        <div style="font-weight:700; margin-bottom:10px;">当前 Web LLM 设置</div>
+        <div style="display:grid; gap:10px;">
+          <select id="provider-editor-select"></select>
+          <input id="provider-api-key" type="password" placeholder="API Key / Token">
+          <input id="provider-api-url" type="text" placeholder="自定义 API URL（仅自定义供应商必填）">
+          <input id="provider-model-id" type="text" placeholder="自定义 Model ID（仅自定义供应商必填）">
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button id="save-provider-settings" class="primary">保存当前供应商设置</button>
+            <button id="close-provider-settings" class="secondary">收起</button>
+          </div>
+          <div class="mini" id="provider-help"></div>
+        </div>
       </div>
       <div id="long-warning" class="warning"></div>
       <div id="messages" class="messages">
@@ -393,6 +408,15 @@ CHAT_HTML = """<!doctype html>
       cleanup: document.getElementById("cleanup"),
       article: document.getElementById("article"),
       provider: document.getElementById("provider-select"),
+      providerSettings: document.getElementById("provider-settings"),
+      providerPanel: document.getElementById("provider-panel"),
+      providerEditorSelect: document.getElementById("provider-editor-select"),
+      providerApiKey: document.getElementById("provider-api-key"),
+      providerApiUrl: document.getElementById("provider-api-url"),
+      providerModelId: document.getElementById("provider-model-id"),
+      saveProviderSettings: document.getElementById("save-provider-settings"),
+      closeProviderSettings: document.getElementById("close-provider-settings"),
+      providerHelp: document.getElementById("provider-help"),
       pickFile: document.getElementById("pick-file"),
       fileInput: document.getElementById("file-input"),
       attachCurrentAsset: document.getElementById("attach-current-asset"),
@@ -494,13 +518,20 @@ CHAT_HTML = """<!doctype html>
     function syncProvider(currentKey) {
       if (!state.providers.length) return;
       els.provider.innerHTML = "";
+      els.providerEditorSelect.innerHTML = "";
       for (const provider of state.providers) {
         const option = document.createElement("option");
         option.value = provider.key;
         option.textContent = provider.label;
         els.provider.appendChild(option);
+        const editorOption = document.createElement("option");
+        editorOption.value = provider.key;
+        editorOption.textContent = provider.label;
+        els.providerEditorSelect.appendChild(editorOption);
       }
       els.provider.value = currentKey || state.config.default_provider_key;
+      els.providerEditorSelect.value = els.provider.value;
+      syncProviderEditor();
     }
 
     function updateWarning(convo) {
@@ -630,6 +661,39 @@ CHAT_HTML = """<!doctype html>
       }
     }
 
+    function syncProviderEditor() {
+      const currentKey = els.providerEditorSelect.value || els.provider.value;
+      const provider = state.providers.find((item) => item.key === currentKey);
+      if (!provider) return;
+      els.providerApiKey.value = provider.api_key || "";
+      els.providerApiUrl.value = provider.api_url || "";
+      els.providerModelId.value = provider.model_id || "";
+      els.providerApiUrl.style.display = provider.key === "custom" ? "block" : "none";
+      els.providerModelId.style.display = provider.key === "custom" ? "block" : "none";
+      els.providerHelp.textContent = provider.help_text || "";
+    }
+
+    async function saveProviderSettings() {
+      const providerKey = els.providerEditorSelect.value;
+      try {
+        const data = await fetchJson("/api/provider_settings", {
+          method: "POST",
+          body: JSON.stringify({
+            provider_key: providerKey,
+            api_key: els.providerApiKey.value,
+            api_url: els.providerApiUrl.value,
+            model_id: els.providerModelId.value,
+          }),
+        });
+        state.providers = data.providers || [];
+        state.config = data;
+        syncProvider(els.provider.value || data.default_provider_key);
+        setStatus(`已保存 ${providerKey} 配置`);
+      } catch (err) {
+        setStatus(`保存失败：${err.message}`);
+      }
+    }
+
     async function attachSelectedAsset() {
       if (!state.selectedAssetId) {
         setStatus("请先在左侧选一份字幕");
@@ -700,6 +764,17 @@ CHAT_HTML = """<!doctype html>
       }
     });
     els.provider.addEventListener("change", setProvider);
+    els.providerSettings.addEventListener("click", () => {
+      const isHidden = els.providerPanel.style.display === "none";
+      els.providerPanel.style.display = isHidden ? "block" : "none";
+      els.providerEditorSelect.value = els.provider.value;
+      syncProviderEditor();
+    });
+    els.providerEditorSelect.addEventListener("change", syncProviderEditor);
+    els.saveProviderSettings.addEventListener("click", saveProviderSettings);
+    els.closeProviderSettings.addEventListener("click", () => {
+      els.providerPanel.style.display = "none";
+    });
     els.attachCurrentAsset.addEventListener("click", attachSelectedAsset);
     els.cleanup.addEventListener("click", () => runAction("cleanup"));
     els.article.addEventListener("click", () => runAction("article"));
@@ -733,7 +808,17 @@ CHAT_HTML = """<!doctype html>
 """
 
 
-SUPPORTED_PROVIDER_KEYS = {"local_rapidmlx_8b", "gemini_flash", "gemini_pro"}
+SUPPORTED_PROVIDER_KEYS = {
+    "local_rapidmlx_8b",
+    "gpt4o_mini",
+    "gpt4o",
+    "deepseek",
+    "gemini_flash",
+    "gemini_pro",
+    "minimax_m27",
+    "claude_sonnet",
+    "custom",
+}
 DEFAULT_PROVIDER_KEY = "local_rapidmlx_8b"
 LONG_CONTEXT_CHAR_THRESHOLD = 45000
 LONG_CONTEXT_SEGMENT_THRESHOLD = 1200
@@ -837,6 +922,14 @@ class QwenChatServiceManager:
                         self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                         return
                     self._write_json(asset, status=HTTPStatus.CREATED)
+                    return
+                if parsed.path == "/api/provider_settings":
+                    try:
+                        config = manager._save_provider_settings(payload)
+                    except Exception as exc:
+                        self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    self._write_json(config)
                     return
                 if parsed.path == "/api/conversations/from-asset":
                     try:
@@ -947,23 +1040,68 @@ class QwenChatServiceManager:
         return provider, api_key, api_url, model_id
 
     def _config_payload(self) -> dict[str, Any]:
+        settings = QSettings("WhisperCaptioner", "App")
         provider_map = self._provider_map()
         providers = []
-        for key in ("local_rapidmlx_8b", "gemini_flash", "gemini_pro"):
+        ordered_keys = (
+            "local_rapidmlx_8b",
+            "gpt4o_mini",
+            "gpt4o",
+            "deepseek",
+            "gemini_flash",
+            "gemini_pro",
+            "minimax_m27",
+            "claude_sonnet",
+            "custom",
+        )
+        for key in ordered_keys:
             provider = provider_map[key]
-            api_key = str(QSettings("WhisperCaptioner", "App").value(f"llm/apikey/{provider.key}", ""))
+            api_key = str(settings.value(f"llm/apikey/{provider.key}", ""))
+            api_url = str(settings.value("llm/custom_url", "")) if provider.key == "custom" else provider.api_url
+            model_id = str(settings.value("llm/custom_model", "")) if provider.key == "custom" else provider.model_id
             providers.append(
                 {
                     "key": provider.key,
                     "label": provider.label,
                     "requires_api_key": provider.requires_api_key,
                     "ready": llm_provider_ready(provider, api_key),
+                    "api_key": api_key,
+                    "api_url": api_url,
+                    "model_id": model_id,
+                    "help_text": self._provider_help_text(provider.key),
                 }
             )
         return {
             "default_provider_key": self._default_provider_key(),
             "providers": providers,
         }
+
+    def _provider_help_text(self, provider_key: str) -> str:
+        if provider_key == "local_rapidmlx_8b":
+            return "本地 Rapid-MLX，不需要 API Key。"
+        if provider_key == "gemini_flash":
+            return "使用 Google Gemini 2.5 Flash。请在此填入 Gemini API Key。"
+        if provider_key == "gemini_pro":
+            return "长字幕或长文稿建议切到 Gemini 2.5 Pro。"
+        if provider_key == "minimax_m27":
+            return (
+                "MiniMAX Token Plan 走 Anthropic 兼容接口。默认 URL 为 https://api.minimaxi.com/anthropic ，"
+                "模型默认是 MiniMax-M2.7。"
+            )
+        if provider_key == "custom":
+            return "自定义 OpenAI-compatible 接口时，请同时填写 API URL 和 Model ID。"
+        return "填写对应供应商的 API Key 后即可在 Web 工作台里直接切换使用。"
+
+    def _save_provider_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        provider_key = str(payload.get("provider_key", "")).strip()
+        if provider_key not in self._provider_map():
+            raise RuntimeError("Unsupported provider")
+        settings = QSettings("WhisperCaptioner", "App")
+        settings.setValue(f"llm/apikey/{provider_key}", str(payload.get("api_key", "")).strip())
+        if provider_key == "custom":
+            settings.setValue("llm/custom_url", str(payload.get("api_url", "")).strip())
+            settings.setValue("llm/custom_model", str(payload.get("model_id", "")).strip())
+        return self._config_payload()
 
     def _read_conversation_file(self, path: Path) -> Optional[dict[str, Any]]:
         try:
