@@ -16,6 +16,8 @@ licenses and usage terms.
 ### SenseVoice.cpp
 
 - Path: `third_party/SenseVoice.cpp`
+- Repository tracking status: intentionally not committed in this repository
+- Upstream source: `https://github.com/lovemefan/SenseVoice.cpp`
 - Upstream license file: `third_party/SenseVoice.cpp/LICENSE`
 - License observed locally: MIT
 
@@ -55,4 +57,3 @@ independently before bundling or distributing them.
   terms as this repository.
 - If you publish releases, provide a separate dependency manifest and include
   each upstream license where required.
-

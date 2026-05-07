@@ -185,6 +185,26 @@ Current app behavior:
 - Conda env `pyside6` for the GUI.
 - Local SenseVoice.cpp checkout and GGUF model under `/Users/vickers/whisper-captioner/third_party/SenseVoice.cpp` if you want the `SenseVoice.cpp FP16` backend.
 
+### SenseVoice.cpp Setup
+
+`third_party/` is intentionally not tracked in this repository.
+
+If you want the `SenseVoice.cpp FP16` backend, clone and build SenseVoice.cpp locally first:
+
+- Upstream project: [lovemefan/SenseVoice.cpp](https://github.com/lovemefan/SenseVoice.cpp)
+- Upstream SenseVoice model project: [FunAudioLLM/SenseVoice](https://github.com/FunAudioLLM/SenseVoice)
+
+Recommended local path for this project:
+
+```bash
+git clone https://github.com/lovemefan/SenseVoice.cpp /Users/vickers/whisper-captioner/third_party/SenseVoice.cpp
+cd /Users/vickers/whisper-captioner/third_party/SenseVoice.cpp
+cmake -B build
+cmake --build build -j
+```
+
+You also need a compatible GGUF model under the local SenseVoice.cpp models directory.
+
 ## License
 
 This repository uses a source-available non-commercial copyleft license.

@@ -10,6 +10,7 @@ __pycache__/
 
 dist/
 build/
+third_party/
 
 *.log
 *.tmp
