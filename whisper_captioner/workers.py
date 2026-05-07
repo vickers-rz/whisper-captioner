@@ -91,6 +91,29 @@ def source_output_dir(base_dir: Path, title: str) -> Path:
     return directory
 
 
+def _terminate_process(proc: Optional[subprocess.Popen[str]], timeout: float = 3.0) -> None:
+    if not proc or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _cleanup_temp_paths(paths: list[Path]) -> None:
+    for path in reversed(paths):
+        _safe_unlink(path)
+    paths.clear()
+
+
 def qwen3_asr_mode(mode: CaptionMode) -> bool:
     return mode.key in {"qwen3_asr_06b_4bit_mlx", "qwen3_asr_17b_8bit_mlx"}
 
@@ -269,6 +292,7 @@ class RealtimeWorker(QObject):
                 self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        self.proc = None
 
     @staticmethod
     def _extract_caption(line: str) -> str:
@@ -318,6 +342,7 @@ class QueueWorker(QObject):
         self.mode = mode
         self._stop = False
         self.proc: Optional[subprocess.Popen[str]] = None
+        self._temp_paths: list[Path] = []
 
     def run(self) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -330,12 +355,12 @@ class QueueWorker(QObject):
 
     def stop(self) -> None:
         self._stop = True
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        _terminate_process(self.proc)
+        self.proc = None
+
+    def _track_temp_path(self, path: Path) -> Path:
+        self._temp_paths.append(path)
+        return path
 
     def _process(self, source: str) -> bool:
         if not self.mode.available:
@@ -347,7 +372,8 @@ class QueueWorker(QObject):
         output_dir = source_output_dir(OUTPUT_DIR, source_title)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         base = output_dir / f"{safe_name}-{stamp}"
-        wav = Path(tempfile.gettempdir()) / f"whisper-captioner-{stamp}.wav"
+        self._temp_paths = []
+        wav = self._track_temp_path(Path(tempfile.gettempdir()) / f"whisper-captioner-{stamp}.wav")
 
         try:
             if source.startswith(("http://", "https://")):
@@ -370,6 +396,8 @@ class QueueWorker(QObject):
                 audio = next((p for p in candidates if p.suffix.lower() in {".wav", ".m4a", ".mp3", ".opus"}), None)
                 if audio is None:
                     raise RuntimeError("yt-dlp did not produce an audio file")
+                for candidate in candidates:
+                    self._track_temp_path(candidate)
                 wav = audio
             else:
                 self._run(
@@ -445,6 +473,8 @@ class QueueWorker(QObject):
         except Exception as exc:
             self.status.emit(f"Failed {source}: {exc}")
             return False
+        finally:
+            _cleanup_temp_paths(self._temp_paths)
 
     def _transcribe_local_qwen3_asr_chunked(self, wav: Path) -> list[SubtitleSegment]:
         duration = self._get_duration(wav)
@@ -454,8 +484,9 @@ class QueueWorker(QObject):
         chunk_index = 0
         while offset < duration and not self._stop:
             remaining = min(chunk_seconds, duration - offset)
-            chunk_wav = Path(tempfile.gettempdir()) / f"{wav.stem}-qwen3-chunk{chunk_index}.wav"
+            chunk_wav = self._track_temp_path(Path(tempfile.gettempdir()) / f"{wav.stem}-qwen3-chunk{chunk_index}.wav")
             chunk_out = Path(tempfile.gettempdir()) / f"{wav.stem}-qwen3-chunk{chunk_index}"
+            self._track_temp_path(chunk_out.with_suffix(".txt"))
             self._run(
                 [
                     FFMPEG,
@@ -541,7 +572,9 @@ class QueueWorker(QObject):
         chunk_index = 0
         while offset < total_duration and not self._stop:
             actual_duration = min(chunk_duration + overlap, total_duration - offset)
-            chunk_wav = Path(tempfile.gettempdir()) / f"{chunk_stem}-sensevoice-chunk{chunk_index}.wav"
+            chunk_wav = self._track_temp_path(
+                Path(tempfile.gettempdir()) / f"{chunk_stem}-sensevoice-chunk{chunk_index}.wav"
+            )
             self._run(
                 [
                     FFMPEG,
@@ -623,39 +656,43 @@ class QueueWorker(QObject):
     def _run(self, cmd: list[str], label: str) -> None:
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        assert self.proc.stdout
-        output_lines: list[str] = []
-        output_state: dict[str, object] = {}
-        for line in self.proc.stdout:
-            if self._stop:
-                self.proc.terminate()
-                raise RuntimeError("Queue stopped")
-            if line.strip():
-                output_lines.append(line.rstrip())
-            emit_throttled_process_output(self.status, line, output_state)
-        if self.proc.wait() != 0:
-            error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
-            raise RuntimeError(f"command failed: {cmd[0]}\n\nOutput:\n{error_context}")
-        self.proc = None
+        try:
+            assert self.proc.stdout
+            output_lines: list[str] = []
+            output_state: dict[str, object] = {}
+            for line in self.proc.stdout:
+                if self._stop:
+                    _terminate_process(self.proc)
+                    raise RuntimeError("Queue stopped")
+                if line.strip():
+                    output_lines.append(line.rstrip())
+                emit_throttled_process_output(self.status, line, output_state)
+            if self.proc.wait() != 0:
+                error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
+                raise RuntimeError(f"command failed: {cmd[0]}\n\nOutput:\n{error_context}")
+        finally:
+            self.proc = None
 
     def _run_capture(self, cmd: list[str], label: str) -> str:
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        assert self.proc.stdout
-        output_lines: list[str] = []
-        output_state: dict[str, object] = {}
-        for line in self.proc.stdout:
-            if self._stop:
-                self.proc.terminate()
-                raise RuntimeError("Queue stopped")
-            if line.strip():
-                output_lines.append(line.rstrip())
-            emit_throttled_process_output(self.status, line, output_state)
-        if self.proc.wait() != 0:
-            error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
-            raise RuntimeError(f"command failed: {cmd[0]}\n\nOutput:\n{error_context}")
-        self.proc = None
-        return "\n".join(output_lines)
+        try:
+            assert self.proc.stdout
+            output_lines: list[str] = []
+            output_state: dict[str, object] = {}
+            for line in self.proc.stdout:
+                if self._stop:
+                    _terminate_process(self.proc)
+                    raise RuntimeError("Queue stopped")
+                if line.strip():
+                    output_lines.append(line.rstrip())
+                emit_throttled_process_output(self.status, line, output_state)
+            if self.proc.wait() != 0:
+                error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
+                raise RuntimeError(f"command failed: {cmd[0]}\n\nOutput:\n{error_context}")
+            return "\n".join(output_lines)
+        finally:
+            self.proc = None
 
 
 class LLMTextWorker(QObject):
@@ -744,6 +781,7 @@ class RollingPrefetchWorker(QObject):
         self.llm_model_id = llm_model_id
         self._stop = False
         self.proc: Optional[subprocess.Popen[str]] = None
+        self._temp_paths: list[Path] = []
 
     def run(self) -> None:
         try:
@@ -755,201 +793,213 @@ class RollingPrefetchWorker(QObject):
 
     def stop(self) -> None:
         self._stop = True
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        _terminate_process(self.proc)
+        self.proc = None
+
+    def _track_temp_path(self, path: Path) -> Path:
+        self._temp_paths.append(path)
+        return path
 
     # ---- internal pipeline ----
 
     def _do_rolling_prefetch(self) -> None:
-        if not self.mode.available:
-            raise RuntimeError(f"Missing model: {self.mode.model}")
+        self._temp_paths = []
+        try:
+            if not self.mode.available:
+                raise RuntimeError(f"Missing model: {self.mode.model}")
 
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        self.cache_url = canonical_media_url(self.url)
-        job_key = cache_slug(self.cache_url, self.mode.backend, self.mode.model_name, self.chunk_seconds)
-        job_cache_dir = CACHE_DIR / job_key
-        job_cache_dir.mkdir(parents=True, exist_ok=True)
-        manifest = {
-            "url": self.url,
-            "cache_url": self.cache_url,
-            "model": str(self.mode.model),
-            "backend": self.mode.backend,
-            "chunk_seconds": self.chunk_seconds,
-            "pipeline_version": SUBTITLE_PIPELINE_VERSION,
-            "llm_provider": self.llm_provider.key if self.llm_provider else "raw",
-            "llm_model": self.llm_model_id or (self.llm_provider.model_id if self.llm_provider else ""),
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        (job_cache_dir / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        raw_output_base = self._raw_output_base(stamp)
-        output_base = self._optimized_output_base(stamp)
-
-        native_segments, native_kind = self._load_or_fetch_native_subtitles(job_cache_dir)
-        if native_kind == "zh":
-            self.native_subtitles_detected.emit(
-                native_segments,
-                "检测到视频自带中文字幕，已加载。跳过 Whisper 和 LLM 识别以节省资源。"
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            self.cache_url = canonical_media_url(self.url)
+            job_key = cache_slug(self.cache_url, self.mode.backend, self.mode.model_name, self.chunk_seconds)
+            job_cache_dir = CACHE_DIR / job_key
+            job_cache_dir.mkdir(parents=True, exist_ok=True)
+            manifest = {
+                "url": self.url,
+                "cache_url": self.cache_url,
+                "model": str(self.mode.model),
+                "backend": self.mode.backend,
+                "chunk_seconds": self.chunk_seconds,
+                "pipeline_version": SUBTITLE_PIPELINE_VERSION,
+                "llm_provider": self.llm_provider.key if self.llm_provider else "raw",
+                "llm_model": self.llm_model_id or (self.llm_provider.model_id if self.llm_provider else ""),
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            (job_cache_dir / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
-            return
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            raw_output_base = self._raw_output_base(stamp)
+            output_base = self._optimized_output_base(stamp)
 
-        # 1. Pause Chrome
-        self.status.emit("Pausing Chrome while captions are prepared")
-        from whisper_captioner.chrome_control import chrome_pause, chrome_pause_url
-        if chrome_pause_url(self.cache_url) is None:
-            chrome_pause()
-        if self._stop:
-            return
-
-        final_cache = self._final_subtitle_cache_path(job_cache_dir)
-        cached_segments = self._load_current_final_cache(final_cache)
-        if cached_segments is not None:
-            try:
-                self.status.emit(f"Loaded final subtitle cache: {final_cache}")
-                self._export_final_subtitles(cached_segments, output_base)
-                self.first_segments.emit(cached_segments)
-                self.all_done.emit()
-                return
-            except Exception as exc:
-                self.status.emit(f"Final subtitle cache unreadable, rebuilding: {exc}")
-
-        # 2. Download full audio
-        downloaded = Path(tempfile.gettempdir()) / f"whisper-rolling-{stamp}.%(ext)s"
-        self._run_cmd(
-            [
-                YT_DLP,
-                "-x",
-                "--audio-format",
-                "wav",
-                "--cookies-from-browser",
-                "chrome",
-                "-o",
-                str(downloaded),
-                self.url,
-            ],
-            "Downloading video audio",
-        )
-        candidates = sorted(Path(tempfile.gettempdir()).glob(f"whisper-rolling-{stamp}.*"))
-        audio = next(
-            (p for p in candidates if p.suffix.lower() in {".wav", ".m4a", ".mp3", ".opus"}),
-            None,
-        )
-        if audio is None:
-            raise RuntimeError("yt-dlp did not produce an audio file")
-        if self._stop:
-            return
-
-        # 3. Get duration
-        duration = self._get_duration(audio)
-        num_chunks = int(duration // self.chunk_seconds) + (1 if duration % self.chunk_seconds else 0)
-        self.status.emit(
-            f"Audio duration: {duration:.1f}s — processing in {num_chunks} chunk(s) of {self.chunk_seconds}s"
-        )
-
-        # 4. Chunk → transcribe → cache. LLM proofreading runs once on the full transcript.
-        offset = 0.0
-        chunk_index = 0
-        rebuilt_raw_cache = False
-
-        while offset < duration and not self._stop:
-            remaining = min(self.chunk_seconds, duration - offset)
-            chunk_wav = Path(tempfile.gettempdir()) / f"whisper-rolling-{stamp}-chunk{chunk_index}.wav"
-            chunk_out = Path(tempfile.gettempdir()) / f"whisper-rolling-{stamp}-chunk{chunk_index}"
-            raw_cache = job_cache_dir / f"chunk-{chunk_index:04d}-raw.json"
-
-            segments: list[SubtitleSegment] = []
-            use_cached = False
-            if raw_cache.exists():
-                cached_segments = load_segments(raw_cache)
-                if self._chunk_cache_looks_bad(cached_segments, remaining):
-                    self.status.emit(
-                        f"Chunk {chunk_index}: cached Whisper result looks sparse; rebuilding"
-                    )
-                    raw_cache.unlink(missing_ok=True)
-                    rebuilt_raw_cache = True
-                else:
-                    segments = cached_segments
-                    use_cached = True
-                    self.status.emit(f"Chunk {chunk_index}: loaded Whisper cache")
-
-            if not use_cached:
-                self.status.emit(f"Extracting chunk {chunk_index} ({offset:.0f}s – {offset + remaining:.0f}s)")
-                self._run_cmd(
-                    [
-                        FFMPEG, "-hide_banner", "-y",
-                        "-ss", str(offset),
-                        "-t", str(remaining),
-                        "-i", str(audio),
-                        "-ac", "1", "-ar", "16000",
-                        str(chunk_wav),
-                    ],
-                    f"Preparing chunk {chunk_index}",
+            native_segments, native_kind = self._load_or_fetch_native_subtitles(job_cache_dir)
+            if native_kind == "zh":
+                self.native_subtitles_detected.emit(
+                    native_segments,
+                    "检测到视频自带中文字幕，已加载。跳过 Whisper 和 LLM 识别以节省资源。"
                 )
-                if self._stop:
-                    break
+                return
 
-                self.status.emit(f"Transcribing chunk {chunk_index}")
-                srt_path = self._transcribe_chunk(chunk_wav, chunk_out, chunk_index)
-                if self._stop:
-                    break
+            # 1. Pause Chrome
+            self.status.emit("Pausing Chrome while captions are prepared")
+            from whisper_captioner.chrome_control import chrome_pause, chrome_pause_url
+            if chrome_pause_url(self.cache_url) is None:
+                chrome_pause()
+            if self._stop:
+                return
 
-                if srt_path.exists():
-                    raw_segments = parse_srt(srt_path)
-                    raw_segments = self._clamp_chunk_segments(raw_segments, remaining)
-                    if self._chunk_cache_looks_bad(
-                        [SubtitleSegment(s.start, s.end, s.text) for s in raw_segments],
-                        remaining,
-                    ):
-                        repaired_segments = self._repair_sparse_chunk_with_subchunks(
-                            chunk_wav, chunk_out, chunk_index, remaining
+            final_cache = self._final_subtitle_cache_path(job_cache_dir)
+            cached_segments = self._load_current_final_cache(final_cache)
+            if cached_segments is not None:
+                try:
+                    self.status.emit(f"Loaded final subtitle cache: {final_cache}")
+                    self._export_final_subtitles(cached_segments, output_base)
+                    self.first_segments.emit(cached_segments)
+                    self.all_done.emit()
+                    return
+                except Exception as exc:
+                    self.status.emit(f"Final subtitle cache unreadable, rebuilding: {exc}")
+
+            # 2. Download full audio
+            downloaded = Path(tempfile.gettempdir()) / f"whisper-rolling-{stamp}.%(ext)s"
+            self._run_cmd(
+                [
+                    YT_DLP,
+                    "-x",
+                    "--audio-format",
+                    "wav",
+                    "--cookies-from-browser",
+                    "chrome",
+                    "-o",
+                    str(downloaded),
+                    self.url,
+                ],
+                "Downloading video audio",
+            )
+            candidates = sorted(Path(tempfile.gettempdir()).glob(f"whisper-rolling-{stamp}.*"))
+            audio = next(
+                (p for p in candidates if p.suffix.lower() in {".wav", ".m4a", ".mp3", ".opus"}),
+                None,
+            )
+            if audio is None:
+                raise RuntimeError("yt-dlp did not produce an audio file")
+            for candidate in candidates:
+                self._track_temp_path(candidate)
+            if self._stop:
+                return
+
+            # 3. Get duration
+            duration = self._get_duration(audio)
+            num_chunks = int(duration // self.chunk_seconds) + (1 if duration % self.chunk_seconds else 0)
+            self.status.emit(
+                f"Audio duration: {duration:.1f}s — processing in {num_chunks} chunk(s) of {self.chunk_seconds}s"
+            )
+
+            # 4. Chunk → transcribe → cache. LLM proofreading runs once on the full transcript.
+            offset = 0.0
+            chunk_index = 0
+            rebuilt_raw_cache = False
+
+            while offset < duration and not self._stop:
+                remaining = min(self.chunk_seconds, duration - offset)
+                chunk_wav = self._track_temp_path(
+                    Path(tempfile.gettempdir()) / f"whisper-rolling-{stamp}-chunk{chunk_index}.wav"
+                )
+                chunk_out = Path(tempfile.gettempdir()) / f"whisper-rolling-{stamp}-chunk{chunk_index}"
+                for suffix in (".srt", ".txt"):
+                    self._track_temp_path(chunk_out.with_suffix(suffix))
+                raw_cache = job_cache_dir / f"chunk-{chunk_index:04d}-raw.json"
+
+                segments: list[SubtitleSegment] = []
+                use_cached = False
+                if raw_cache.exists():
+                    cached_segments = load_segments(raw_cache)
+                    if self._chunk_cache_looks_bad(cached_segments, remaining):
+                        self.status.emit(
+                            f"Chunk {chunk_index}: cached Whisper result looks sparse; rebuilding"
                         )
-                        if repaired_segments:
-                            raw_segments = repaired_segments
-                    # Shift timestamps to absolute position in the full audio.
-                    segments = [
-                        SubtitleSegment(s.start + offset, s.end + offset, s.text)
-                        for s in raw_segments
-                    ]
-                    save_segments(raw_cache, segments)
-                    rebuilt_raw_cache = True
-                    self.status.emit(f"Chunk {chunk_index}: saved Whisper cache")
-                else:
-                    segments = []
-                    self.status.emit(f"Chunk {chunk_index}: no SRT produced")
+                        raw_cache.unlink(missing_ok=True)
+                        rebuilt_raw_cache = True
+                    else:
+                        segments = cached_segments
+                        use_cached = True
+                        self.status.emit(f"Chunk {chunk_index}: loaded Whisper cache")
 
-                if self._chunk_cache_looks_bad(segments, remaining):
-                    self.status.emit(
-                        f"Chunk {chunk_index}: transcription still looks sparse after rebuild"
+                if not use_cached:
+                    self.status.emit(f"Extracting chunk {chunk_index} ({offset:.0f}s – {offset + remaining:.0f}s)")
+                    self._run_cmd(
+                        [
+                            FFMPEG, "-hide_banner", "-y",
+                            "-ss", str(offset),
+                            "-t", str(remaining),
+                            "-i", str(audio),
+                            "-ac", "1", "-ar", "16000",
+                            str(chunk_wav),
+                        ],
+                        f"Preparing chunk {chunk_index}",
                     )
+                    if self._stop:
+                        break
 
-            if segments:
-                self.status.emit(f"Chunk {chunk_index}: {len(segments)} raw segment(s) cached")
-            else:
-                self.status.emit(f"Chunk {chunk_index}: no speech detected")
+                    self.status.emit(f"Transcribing chunk {chunk_index}")
+                    srt_path = self._transcribe_chunk(chunk_wav, chunk_out, chunk_index)
+                    if self._stop:
+                        break
 
-            self.progress.emit(chunk_index + 1, num_chunks)
-            offset += remaining  # Use actual chunk duration, not fixed chunk_seconds
-            chunk_index += 1
+                    if srt_path.exists():
+                        raw_segments = parse_srt(srt_path)
+                        raw_segments = self._clamp_chunk_segments(raw_segments, remaining)
+                        if self._chunk_cache_looks_bad(
+                            [SubtitleSegment(s.start, s.end, s.text) for s in raw_segments],
+                            remaining,
+                        ):
+                            repaired_segments = self._repair_sparse_chunk_with_subchunks(
+                                chunk_wav, chunk_out, chunk_index, remaining
+                            )
+                            if repaired_segments:
+                                raw_segments = repaired_segments
+                        # Shift timestamps to absolute position in the full audio.
+                        segments = [
+                            SubtitleSegment(s.start + offset, s.end + offset, s.text)
+                            for s in raw_segments
+                        ]
+                        save_segments(raw_cache, segments)
+                        rebuilt_raw_cache = True
+                        self.status.emit(f"Chunk {chunk_index}: saved Whisper cache")
+                    else:
+                        segments = []
+                        self.status.emit(f"Chunk {chunk_index}: no SRT produced")
 
-        if not self._stop:
-            if rebuilt_raw_cache:
-                self._discard_derived_subtitle_caches(job_cache_dir)
-            all_raw_segments = self._load_all_raw_segments(job_cache_dir)
-            if all_raw_segments:
-                self._export_subtitles(all_raw_segments, raw_output_base)
-                self.status.emit(f"Raw subtitles written: {raw_output_base.with_suffix('.srt')}")
-            final_segments = self._run_full_document_polish(job_cache_dir, output_base)
-            if final_segments:
-                self.first_segments.emit(final_segments)
-            self.all_done.emit()
-            self.status.emit("All chunks transcribed")
+                    if self._chunk_cache_looks_bad(segments, remaining):
+                        self.status.emit(
+                            f"Chunk {chunk_index}: transcription still looks sparse after rebuild"
+                        )
+
+                if segments:
+                    self.status.emit(
+                        f"Chunk {chunk_index}: {len(segments)} raw segment(s) cached"
+                    )
+                else:
+                    self.status.emit(f"Chunk {chunk_index}: no speech detected")
+
+                self.progress.emit(chunk_index + 1, num_chunks)
+                offset += remaining  # Use actual chunk duration, not fixed chunk_seconds
+                chunk_index += 1
+
+            if not self._stop:
+                if rebuilt_raw_cache:
+                    self._discard_derived_subtitle_caches(job_cache_dir)
+                all_raw_segments = self._load_all_raw_segments(job_cache_dir)
+                if all_raw_segments:
+                    self._export_subtitles(all_raw_segments, raw_output_base)
+                    self.status.emit(f"Raw subtitles written: {raw_output_base.with_suffix('.srt')}")
+                final_segments = self._run_full_document_polish(job_cache_dir, output_base)
+                if final_segments:
+                    self.first_segments.emit(final_segments)
+                self.all_done.emit()
+                self.status.emit("All chunks transcribed")
+        finally:
+            _cleanup_temp_paths(self._temp_paths)
 
     def _llm_cache_path(self, job_cache_dir: Path, chunk_index: int) -> Path:
         if not self.llm_provider:
@@ -1094,8 +1144,10 @@ class RollingPrefetchWorker(QObject):
             part_duration = min(half, chunk_duration - start_offset)
             if part_duration <= 0:
                 continue
-            part_wav = chunk_wav.with_name(f"{chunk_wav.stem}-part{part_index}.wav")
+            part_wav = self._track_temp_path(chunk_wav.with_name(f"{chunk_wav.stem}-part{part_index}.wav"))
             part_out = chunk_out.with_name(f"{chunk_out.stem}-part{part_index}")
+            for suffix in (".srt", ".txt"):
+                self._track_temp_path(part_out.with_suffix(suffix))
             self._run_cmd(
                 [
                     FFMPEG,
@@ -1416,53 +1468,57 @@ class RollingPrefetchWorker(QObject):
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
-        assert self.proc.stdout
-        output_lines = []
-        output_state: dict[str, object] = {}
-        for line in self.proc.stdout:
-            if self._stop:
-                self.proc.terminate()
-                raise RuntimeError("Rolling prefetch stopped")
-            if line.strip():
-                output_lines.append(line.rstrip())
-                emit_throttled_process_output(self.status, line, output_state)
+        try:
+            assert self.proc.stdout
+            output_lines = []
+            output_state: dict[str, object] = {}
+            for line in self.proc.stdout:
+                if self._stop:
+                    _terminate_process(self.proc)
+                    raise RuntimeError("Rolling prefetch stopped")
+                if line.strip():
+                    output_lines.append(line.rstrip())
+                    emit_throttled_process_output(self.status, line, output_state)
 
-        returncode = self.proc.wait()
-        if returncode != 0 and not self._stop:
-            cmd_name = cmd[0]
-            error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
+            returncode = self.proc.wait()
+            if returncode != 0 and not self._stop:
+                cmd_name = cmd[0]
+                error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
 
-            # Provide better error messages for yt-dlp failures
-            if "yt-dlp" in cmd_name or "yt-dlp" in " ".join(cmd):
-                error_msg = f"yt-dlp failed to download the URL.\n\nLast output:\n{error_context}\n\nPossible reasons:\n- URL is not supported by yt-dlp (e.g., GitHub docs, Wikipedia)\n- Video is region-restricted or requires login\n- Chrome cookies are unavailable, expired, or locked by the browser\n- URL format is incorrect"
-                raise RuntimeError(error_msg)
+                # Provide better error messages for yt-dlp failures
+                if "yt-dlp" in cmd_name or "yt-dlp" in " ".join(cmd):
+                    error_msg = f"yt-dlp failed to download the URL.\n\nLast output:\n{error_context}\n\nPossible reasons:\n- URL is not supported by yt-dlp (e.g., GitHub docs, Wikipedia)\n- Video is region-restricted or requires login\n- Chrome cookies are unavailable, expired, or locked by the browser\n- URL format is incorrect"
+                    raise RuntimeError(error_msg)
 
-            raise RuntimeError(f"command failed: {cmd_name}\n\nOutput:\n{error_context}")
-        self.proc = None
+                raise RuntimeError(f"command failed: {cmd_name}\n\nOutput:\n{error_context}")
+        finally:
+            self.proc = None
 
     def _run_cmd_capture(self, cmd: list[str], label: str) -> str:
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
-        assert self.proc.stdout
-        output_lines = []
-        output_state: dict[str, object] = {}
-        for line in self.proc.stdout:
-            if self._stop:
-                self.proc.terminate()
-                raise RuntimeError("Rolling prefetch stopped")
-            if line.strip():
-                output_lines.append(line.rstrip())
-                emit_throttled_process_output(self.status, line, output_state)
+        try:
+            assert self.proc.stdout
+            output_lines = []
+            output_state: dict[str, object] = {}
+            for line in self.proc.stdout:
+                if self._stop:
+                    _terminate_process(self.proc)
+                    raise RuntimeError("Rolling prefetch stopped")
+                if line.strip():
+                    output_lines.append(line.rstrip())
+                    emit_throttled_process_output(self.status, line, output_state)
 
-        returncode = self.proc.wait()
-        if returncode != 0 and not self._stop:
-            cmd_name = cmd[0]
-            error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
-            raise RuntimeError(f"command failed: {cmd_name}\n\nOutput:\n{error_context}")
-        self.proc = None
-        return "\n".join(output_lines)
+            returncode = self.proc.wait()
+            if returncode != 0 and not self._stop:
+                cmd_name = cmd[0]
+                error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
+                raise RuntimeError(f"command failed: {cmd_name}\n\nOutput:\n{error_context}")
+            return "\n".join(output_lines)
+        finally:
+            self.proc = None
 
     def _sense_voice_effective_chunk_seconds(self) -> float:
         return float(self.chunk_seconds if hasattr(self, "chunk_seconds") else 30)
@@ -1485,7 +1541,9 @@ class RollingPrefetchWorker(QObject):
         chunk_index = 0
         while offset < total_duration and not self._stop:
             actual_duration = min(chunk_duration + overlap, total_duration - offset)
-            chunk_wav = Path(tempfile.gettempdir()) / f"{chunk_stem}-sensevoice-chunk{chunk_index}.wav"
+            chunk_wav = self._track_temp_path(
+                Path(tempfile.gettempdir()) / f"{chunk_stem}-sensevoice-chunk{chunk_index}.wav"
+            )
             self._run_cmd(
                 [
                     FFMPEG,
