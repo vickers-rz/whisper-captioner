@@ -1369,9 +1369,14 @@ class RollingPrefetchWorker(QObject):
             if cache_path.exists():
                 try:
                     segments = load_segments(cache_path)
+                    self.status.emit(
+                        f"Loaded native subtitle cache ({cache_name}) from {cache_path.name}"
+                    )
                     return segments, cache_name
                 except Exception as exc:
-                    self.status.emit(f"Native subtitle cache unreadable ({cache_name}): {exc}")
+                    self.status.emit(
+                        f"Native subtitle cache unreadable ({cache_name}, {cache_path.name}): {exc}"
+                    )
 
             subs_dir = job_cache_dir / f"native-subs-{cache_name}"
             subs_dir.mkdir(parents=True, exist_ok=True)
@@ -1413,11 +1418,11 @@ class RollingPrefetchWorker(QObject):
             if segments:
                 save_segments(cache_path, segments)
                 self.status.emit(
-                    f"Saved native subtitle cache from {len(subtitle_files)} file(s) for {lang_expr}"
+                    f"Saved native subtitle cache ({cache_name}) from {len(subtitle_files)} file(s) for {lang_expr}"
                 )
                 return segments, cache_name
 
-        self.status.emit("No usable native subtitle segments found")
+        self.status.emit("No usable native subtitle segments found for preferred native subtitle languages")
         return [], "none"
 
     def _extract_terms_with_mlx(self, job_cache_dir: Path, segments: list[SubtitleSegment]) -> list[str]:
