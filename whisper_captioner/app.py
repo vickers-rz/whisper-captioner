@@ -820,7 +820,10 @@ class MainWindow(QMainWindow):
         if not path or not path.exists():
             return
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"字幕偏移缓存 JSON 无法解析 ({path}): {exc}") from exc
             self.subtitle_offset = float(data.get("offset", DEFAULT_SUBTITLE_OFFSET))
             self.log(f"Loaded subtitle offset for this video: {self.subtitle_offset:+.2f}s")
         except Exception as exc:
