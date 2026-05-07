@@ -1229,7 +1229,12 @@ class RollingPrefetchWorker(QObject):
     def _load_current_final_cache(self, cache_path: Path) -> Optional[list[SubtitleSegment]]:
         if not cache_path.exists():
             return None
-        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Invalid final subtitle cache at {cache_path}: malformed JSON ({exc})"
+            ) from exc
         if isinstance(data, list):
             self.status.emit("Ignoring legacy final subtitle cache without pipeline signature")
             return None
