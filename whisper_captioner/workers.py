@@ -1236,7 +1236,15 @@ class RollingPrefetchWorker(QObject):
         if data.get("pipeline_signature") != self._pipeline_signature():
             self.status.emit("Final subtitle cache belongs to a different pipeline; rebuilding")
             return None
-        return [segment_from_dict(item) for item in data.get("segments", [])]
+        segments_data = data.get("segments", [])
+        if not isinstance(segments_data, list):
+            raise ValueError(
+                f"Invalid final subtitle cache at {cache_path}: 'segments' must be a list"
+            )
+        return [
+            segment_from_dict(item, path=cache_path, index=index)
+            for index, item in enumerate(segments_data)
+        ]
 
     def _save_current_final_cache(self, cache_path: Path, segments: list[SubtitleSegment]) -> None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
