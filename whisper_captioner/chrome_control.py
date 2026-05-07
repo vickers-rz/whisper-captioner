@@ -1,0 +1,211 @@
+from __future__ import annotations
+
+import subprocess
+from typing import Optional
+
+
+VIDEO_PICKER_JS = (
+    "const videos = Array.from(document.querySelectorAll('video')).filter(v => {"
+    "const r = v.getBoundingClientRect();"
+    "const s = getComputedStyle(v);"
+    "return r.width > 50 && r.height > 50 && s.visibility !== 'hidden' && s.display !== 'none';"
+    "});"
+    "const scored = videos.map((v, i) => ({v, score:"
+    "(!v.muted ? 10000 : 0) + (!v.paused ? 5000 : 0) + "
+    "(Number.isFinite(v.duration) ? v.duration : 0) + "
+    "((v.clientWidth || 0) * (v.clientHeight || 0) / 100000)}));"
+    "const picked = scored.sort((a,b) => b.score - a.score)[0];"
+    "const v = picked && picked.v;"
+)
+
+
+def run_chrome_script(script: str) -> str:
+    escaped = script.replace("\\", "\\\\").replace('"', '\\"')
+    apple_script = (
+        'tell application "Google Chrome"\n'
+        '  if not (exists window 1) then return ""\n'
+        f'  execute active tab of front window javascript "{escaped}"\n'
+        "end tell\n"
+    )
+    proc = subprocess.run(
+        ["/usr/bin/osascript", "-e", apple_script],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return proc.stdout.strip()
+
+
+def run_chrome_script_for_url(target_url: str, script: str, activate_tab: bool = True) -> str:
+    safe_url = target_url.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = script.replace("\\", "\\\\").replace('"', '\\"')
+    activation = ""
+    if activate_tab:
+        activation = (
+            '        set active tab index of w to (index of t)\n'
+            '        set index of w to 1\n'
+            '        activate\n'
+        )
+    apple_script = (
+        'tell application "Google Chrome"\n'
+        '  repeat with w in windows\n'
+        '    repeat with t in tabs of w\n'
+        f'      if URL of t starts with "{safe_url}" then\n'
+        f'{activation}'
+        f'        return execute t javascript "{escaped}"\n'
+        '      end if\n'
+        '    end repeat\n'
+        '  end repeat\n'
+        '  return ""\n'
+        'end tell\n'
+    )
+    proc = subprocess.run(
+        ["/usr/bin/osascript", "-e", apple_script],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return proc.stdout.strip()
+
+
+def chrome_pause() -> None:
+    run_chrome_script(
+        f"(() => {{ {VIDEO_PICKER_JS} "
+        "if (!v) return 'no-video'; v.pause(); return String(v.currentTime || 0); })()"
+    )
+
+
+def chrome_pause_url(target_url: str, activate_tab: bool = True) -> Optional[float]:
+    value = run_chrome_script_for_url(
+        target_url,
+        f"(() => {{ {VIDEO_PICKER_JS} "
+        "if (!v) return ''; v.pause(); return String(v.currentTime || 0); })()",
+        activate_tab=activate_tab,
+    )
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def chrome_play_from(seconds: float = 0.0) -> None:
+    run_chrome_script(
+        f"(() => {{ {VIDEO_PICKER_JS} "
+        "if (!v) return 'no-video'; "
+        f"v.currentTime = Math.max(0, {seconds}); "
+        "v.play(); return 'playing'; })()"
+    )
+
+
+def chrome_play_url_from(target_url: str, seconds: float) -> bool:
+    value = run_chrome_script_for_url(
+        target_url,
+        f"(() => {{ {VIDEO_PICKER_JS} "
+        "if (!v) return ''; "
+        f"v.currentTime = Math.max(0, {seconds}); "
+        "v.play(); return 'playing'; })()",
+    )
+    return value == "playing"
+
+
+def chrome_resume() -> None:
+    run_chrome_script(
+        f"(() => {{ {VIDEO_PICKER_JS} "
+        "if (!v) return 'no-video'; v.play(); return 'resumed'; })()"
+    )
+
+
+def chrome_resume_url(target_url: str, activate_tab: bool = True) -> bool:
+    value = run_chrome_script_for_url(
+        target_url,
+        f"(() => {{ {VIDEO_PICKER_JS} "
+        "if (!v) return ''; v.play(); return 'resumed'; })()",
+        activate_tab=activate_tab,
+    )
+    return value == "resumed"
+
+
+def chrome_toggle_playback() -> Optional[bool]:
+    value = run_chrome_script(
+        f"(() => {{ {VIDEO_PICKER_JS} "
+        "if (!v) return ''; "
+        "if (v.paused) { v.play(); return 'playing'; } "
+        "v.pause(); return 'paused'; })()"
+    )
+    if value == "playing":
+        return True
+    if value == "paused":
+        return False
+    return None
+
+
+def chrome_current_time() -> Optional[float]:
+    value = run_chrome_script(
+        f"(() => {{ {VIDEO_PICKER_JS} "
+        "if (!v) return ''; return String(v.currentTime || 0); })()"
+    )
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def chrome_current_time_url(target_url: str) -> Optional[float]:
+    value = run_chrome_script_for_url(
+        target_url,
+        f"(() => {{ {VIDEO_PICKER_JS} "
+        "if (!v) return ''; return String(v.currentTime || 0); })()",
+        activate_tab=False,
+    )
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def chrome_seek_relative(delta_seconds: float) -> Optional[float]:
+    value = run_chrome_script(
+        f"(() => {{ {VIDEO_PICKER_JS} "
+        "if (!v) return ''; "
+        f"const next = Math.max(0, Math.min(Number.isFinite(v.duration) ? v.duration : Infinity, (v.currentTime || 0) + ({delta_seconds}))); "
+        "v.currentTime = next; "
+        "return String(v.currentTime || 0); })()"
+    )
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def chrome_seek_url_relative(target_url: str, delta_seconds: float) -> Optional[float]:
+    value = run_chrome_script_for_url(
+        target_url,
+        f"(() => {{ {VIDEO_PICKER_JS} "
+        "if (!v) return ''; "
+        f"const next = Math.max(0, Math.min(Number.isFinite(v.duration) ? v.duration : Infinity, (v.currentTime || 0) + ({delta_seconds}))); "
+        "v.currentTime = next; "
+        "return String(v.currentTime || 0); })()",
+    )
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def chrome_get_url() -> str:
+    apple_script = (
+        'tell application "Google Chrome"\n'
+        '  if not (exists window 1) then return ""\n'
+        '  return URL of active tab of front window\n'
+        'end tell\n'
+    )
+    proc = subprocess.run(
+        ["/usr/bin/osascript", "-e", apple_script],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return proc.stdout.strip()

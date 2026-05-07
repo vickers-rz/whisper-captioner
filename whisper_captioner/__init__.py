@@ -1,0 +1,2 @@
+"""Whisper Captioner desktop app."""
+

@@ -1,0 +1,78 @@
+Whisper Captioner Non-Commercial Copyleft License v1.0
+
+Copyright (c) 2026 ZHAO ZHANG
+
+1. Definitions
+
+"Software" means this repository's original source code, scripts, project files,
+and documentation authored for the Whisper Captioner project, excluding
+third-party software, third-party models, and third-party assets that are
+distributed under their own separate terms.
+
+"Non-Commercial Use" means personal study, research, evaluation, teaching,
+experimentation, and use within an open-source project where no fee is charged
+for the Software itself and the Software is not used as part of a closed-source
+commercial offering.
+
+"Commercial Use" means any use primarily intended for or directed toward
+commercial advantage or monetary compensation, including but not limited to:
+selling the Software, bundling it in paid products or services, using it in
+closed-source SaaS or desktop products, or redistributing it as part of a
+commercial offering.
+
+2. Permissions
+
+Subject to the conditions below, you are allowed to:
+
+- use, copy, run, and modify the Software for personal learning, research, and
+  other Non-Commercial Use;
+- reference, reuse, and incorporate the Software in open-source projects, with
+  attribution;
+- create derivative works for Non-Commercial Use.
+
+3. Conditions
+
+If you use, copy, modify, or distribute the Software or derivative works, you
+must:
+
+- retain this license text and all existing copyright notices;
+- provide clear attribution to the original project;
+- distribute any derivative works in source-available form under this same
+  license or another license that is no less restrictive with respect to:
+  attribution, preservation of notices, disclosure of derivative source code,
+  and prohibition of closed-source commercial use;
+- clearly mark material changes you made when redistributing modified versions.
+
+4. Prohibited Uses
+
+You may not, without prior written authorization from the copyright holder:
+
+- use the Software in any closed-source commercial product or service;
+- commercially distribute the Software in binary or source form;
+- sublicense the Software for closed-source commercial use;
+- remove or obscure license notices, copyright notices, or attribution.
+
+5. Third-Party Components
+
+This license applies only to the original code and project material in this
+repository that is owned by the copyright holder. Third-party software,
+libraries, binaries, models, and assets remain subject to their own licenses
+and terms. You are responsible for complying with all third-party license and
+model-use requirements before use or redistribution.
+
+6. No Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. IN NO EVENT
+SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES,
+OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+7. Commercial Licensing
+
+If you want to use the Software in a closed-source commercial product, service,
+or distribution channel, you must obtain prior written authorization from the
+copyright holder.
+

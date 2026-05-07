@@ -1,0 +1,100 @@
+# Copilot Cloud Agent Setup for Whisper Captioner
+
+# This file configures the Copilot cloud agent environment for this repository.
+# It defines MCP servers, preinstalled tools, and dependencies needed for development.
+
+version: 1
+
+mcp_servers:
+  # Chrome DevTools Protocol (CDP) MCP for direct Chrome automation and debugging
+  # Connects via websocket to replace AppleScript-based Chrome control in whisper_captioner/app.py
+  # Enables Copilot to inspect/control video playback, manage tabs, and debug web interactions
+  chrome_cdp:
+    command: npx
+    args:
+      - "@modelcontextprotocol/server-chrome-cdp"
+      - "--ws-port"
+      - "9222"
+    install: true
+    optional: false
+    transport: websocket
+    env:
+      CHROME_WS_ENDPOINT: "ws://localhost:9222"
+      CHROME_HEADLESS: "false"
+
+  # Custom MCP server for testing LLM endpoints (OpenAI, Anthropic, local Rapid-MLX)
+  # Enables Copilot to validate LLM provider configurations and test proofreading prompts
+  llm_testing:
+    command: python
+    args:
+      - "-m"
+      - "mcp.servers.llm_testing"
+    install: false
+    optional: true
+    transport: stdio
+    env:
+      LLM_TEST_TIMEOUT: "30"
+      RAPIDMLX_HOST: "127.0.0.1"
+      RAPIDMLX_PORT: "8765"
+
+# Pre-installed tools and dependencies
+preinstalled_tools:
+  - name: conda
+    check: "conda --version"
+    install_command: "brew install conda"
+
+  - name: ffmpeg
+    check: "ffmpeg -version"
+    install_command: "brew install ffmpeg"
+
+  - name: yt-dlp
+    check: "yt-dlp --version"
+    install_command: "brew install yt-dlp"
+
+  - name: whisper-stream
+    check: "whisper-stream --help"
+    install_command: "brew install whisper-stream"
+
+  - name: nodejs
+    check: "node --version"
+    install_command: "brew install node"
+
+  - name: npm
+    check: "npm --version"
+    install_command: "brew install npm"
+
+# Environment setup
+environment:
+  CONDA_DEFAULT_ENV: pyside6
+  MODELS_DIR: ~/whisper-models
+  OUTPUT_DIR: ~/Movies/WhisperCaptioner
+
+# Setup commands to run in order
+setup_commands:
+  - description: Create conda environments if needed
+    command: |
+      if ! conda env list | grep -q "^pyside6"; then
+        conda create -n pyside6 python=3.11 pyside6 -y
+      fi
+
+  - description: Start Chrome with remote debugging port (required for CDP MCP)
+    command: |
+      # Launch Chrome with debugging enabled on port 9222 (if not already running)
+      if ! curl -s http://localhost:9222/json/version &> /dev/null; then
+        open -a "Google Chrome" --args --remote-debugging-port=9222 &
+        sleep 2
+      fi
+
+  - description: Install CDP MCP dependencies
+    command: npm install -g @modelcontextprotocol/server-chrome-cdp
+
+  - description: Verify required tools are available
+    command: |
+      for tool in ffmpeg yt-dlp whisper-stream; do
+        if ! command -v $tool &> /dev/null; then
+          echo "Warning: $tool not found. Please install it manually."
+        fi
+      done
+
+  - description: Test Chrome DevTools Protocol connection
+    command: curl -s http://localhost:9222/json/version | grep -q "Chrome" && echo "Chrome DevTools Protocol ready" || echo "Warning: Chrome DevTools not accessible"

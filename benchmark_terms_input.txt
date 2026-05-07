@@ -1,0 +1,9 @@
+INTP如何解决拖延症
+INTP天生喜欢一劳永逸的解决方式
+他们的懒惰
+是因为想要找到一个终极的解决办法
+所催生出来的行为
+OpenAI 的 Whisper 模型
+在 Atlas 浏览器和 Chrome 里都能用到
+Rapid-MLX 号称比 Ollama 更快
+Qwen2.5-3B-Instruct 可以本地跑术语抽取
