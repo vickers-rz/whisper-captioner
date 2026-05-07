@@ -1434,10 +1434,16 @@ class RollingPrefetchWorker(QObject):
         cache_path = job_cache_dir / "mlx-terms.json"
         if cache_path.exists():
             try:
-                data = json.loads(cache_path.read_text(encoding="utf-8"))
-                return [str(item["term"]) for item in data.get("terms", []) if item.get("term")]
+                try:
+                    data = json.loads(cache_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid MLX term cache at {cache_path}: malformed JSON ({exc})") from exc
+                terms_data = data.get("terms", [])
+                if not isinstance(terms_data, list):
+                    raise ValueError(f"Invalid MLX term cache at {cache_path}: 'terms' must be a list")
+                return [str(item["term"]) for item in terms_data if isinstance(item, dict) and item.get("term")]
             except Exception as exc:
-                self.status.emit(f"MLX term cache unreadable: {exc}")
+                self.status.emit(f"MLX term cache unreadable ({cache_path.name}): {exc}")
         if not segments or not Path(RAPIDMLX_PYTHON).exists() or not MLX_TERMS_SCRIPT.exists():
             return []
         sample = "\n".join(segment.text for segment in segments[:180])
