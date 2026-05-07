@@ -138,6 +138,28 @@ def _stream_process_output(
     return output_lines
 
 
+def _probe_audio_duration(audio_path: Path) -> float:
+    result = subprocess.run(
+        [
+            FFPROBE,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Could not determine audio duration: {result.stderr.strip()}")
+    try:
+        return float(result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"Could not determine audio duration: {result.stdout.strip()}") from exc
+
+
 def qwen3_asr_mode(mode: CaptionMode) -> bool:
     return mode.key in {"qwen3_asr_06b_4bit_mlx", "qwen3_asr_17b_8bit_mlx"}
 
@@ -657,25 +679,7 @@ class QueueWorker(QObject):
 
     @staticmethod
     def _get_duration(audio_path: Path) -> float:
-        result = subprocess.run(
-            [
-                FFPROBE,
-                "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(audio_path),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Could not determine audio duration: {result.stderr.strip()}")
-        try:
-            return float(result.stdout.strip())
-        except ValueError as exc:
-            raise RuntimeError(f"Could not determine audio duration: {result.stdout.strip()}") from exc
+        return _probe_audio_duration(audio_path)
 
     def _run(self, cmd: list[str], label: str) -> None:
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
@@ -1487,23 +1491,7 @@ class RollingPrefetchWorker(QObject):
             return []
 
     def _get_duration(self, audio_path: Path) -> float:
-        result = subprocess.run(
-            [
-                FFPROBE,
-                "-v", "quiet",
-                "-show_entries", "format=duration",
-                "-of", "csv=p=0",
-                str(audio_path),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        try:
-            return float(result.stdout.strip())
-        except ValueError:
-            raise RuntimeError(f"Could not determine audio duration: {result.stderr}")
+        return _probe_audio_duration(audio_path)
 
     def _run_cmd(self, cmd: list[str], label: str) -> None:
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
