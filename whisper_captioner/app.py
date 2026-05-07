@@ -47,6 +47,7 @@ from whisper_captioner.llm_handler import (
     test_llm_connection,
 )
 from whisper_captioner.overlay import SubtitleOverlay
+from whisper_captioner.qwen_chat_service import QwenChatServiceManager
 from whisper_captioner.ui_builder import build_main_window_ui
 from whisper_captioner.ui_shell import WINDOW_STYLESHEET
 from whisper_captioner.workers import (
@@ -127,6 +128,7 @@ class MainWindow(QMainWindow):
         self._max_status_lines = 1200
         self._status_summary = "就绪"
         self._current_progress: tuple[int, int] | None = None
+        self.qwen_chat_service = QwenChatServiceManager()
 
         self._log_flush_timer = QTimer(self)
         self._log_flush_timer.setInterval(120)
@@ -140,6 +142,8 @@ class MainWindow(QMainWindow):
         build_main_window_ui(self)
         self.llm_provider_combo.currentIndexChanged.connect(self._on_llm_provider_changed)
         self.llm_test_button.clicked.connect(self._test_llm)
+        self.qwen_chat_start_button.clicked.connect(self.start_qwen_chat_service)
+        self.qwen_chat_open_button.clicked.connect(self.open_qwen_chat)
         self.stop_button.clicked.connect(self.stop_all)
         self.add_button.clicked.connect(self.add_queue_item)
         self.up_button.clicked.connect(lambda: self.move_item(-1))
@@ -286,6 +290,30 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "测试失败", msg)
             self.log(f"LLM API test failed: {msg}")
         self.llm_test_button.setEnabled(True)
+
+    def start_qwen_chat_service(self) -> None:
+        try:
+            url = self.qwen_chat_service.start()
+        except Exception as exc:
+            self.log(f"Qwen3-8B chat service failed to start: {exc}")
+            QMessageBox.critical(self, "Qwen3-8B 聊天", f"启动本地聊天服务失败：\n\n{exc}")
+            return
+        self.log(f"Qwen3-8B chat service ready at {url}")
+        QMessageBox.information(
+            self,
+            "Qwen3-8B 聊天",
+            f"本地聊天服务已启动：\n\n{url}\n\n这条链路与当前转录功能无关，可单独测试 8B 模型能力。",
+        )
+
+    def open_qwen_chat(self) -> None:
+        try:
+            url = self.qwen_chat_service.start()
+        except Exception as exc:
+            self.log(f"Qwen3-8B chat service failed to start: {exc}")
+            QMessageBox.critical(self, "Qwen3-8B 聊天", f"启动本地聊天服务失败：\n\n{exc}")
+            return
+        subprocess.run(["open", url], check=False)
+        self.log(f"Opened Qwen3-8B chat at {url}")
 
     def _current_llm_provider_config(self):
         self._save_current_llm_key()
@@ -1457,6 +1485,8 @@ class App:
         menu = QMenu()
         show = QAction("显示控制面板")
         show.triggered.connect(self.window.show)
+        qwen_chat = QAction("打开 Qwen3-8B 聊天")
+        qwen_chat.triggered.connect(self.window.open_qwen_chat)
         overlay = QAction("显示/隐藏字幕浮窗")
         overlay.triggered.connect(lambda: self.overlay.setVisible(not self.overlay.isVisible()))
         pin = QAction("切换浮窗置顶")
@@ -1477,6 +1507,7 @@ class App:
         quit_action.triggered.connect(self.quit)
 
         menu.addAction(show)
+        menu.addAction(qwen_chat)
         menu.addAction(overlay)
         menu.addAction(pin)
         menu.addSeparator()
@@ -1494,6 +1525,7 @@ class App:
 
     def shutdown(self) -> None:
         self.window.stop_all()
+        self.window.qwen_chat_service.stop()
         self.window._flush_ui_logs()
         self.window._flush_file_logs()
         self.window.wait_for_threads()

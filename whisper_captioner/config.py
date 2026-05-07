@@ -9,6 +9,7 @@ OUTPUT_DIR = HOME / "Movies" / "WhisperCaptioner"
 CACHE_DIR = OUTPUT_DIR / "cache"
 LOG_DIR = OUTPUT_DIR / "logs"
 NOTES_DIR = OUTPUT_DIR / "notes"
+QWEN_CHAT_DIR = OUTPUT_DIR / "qwen-chat"
 
 WHISPER_STREAM = "/opt/homebrew/bin/whisper-stream"
 WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
