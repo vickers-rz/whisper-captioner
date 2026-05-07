@@ -118,6 +118,26 @@ def _subchunk_label(chunk_index: int, part_index: int) -> str:
     return f"{chunk_index}.part{part_index}"
 
 
+def _stream_process_output(
+    proc: subprocess.Popen[str],
+    *,
+    status_signal: Signal,
+    stop_flag: callable,
+    stop_message: str,
+) -> list[str]:
+    assert proc.stdout
+    output_lines: list[str] = []
+    output_state: dict[str, object] = {}
+    for line in proc.stdout:
+        if stop_flag():
+            _terminate_process(proc)
+            raise RuntimeError(stop_message)
+        if line.strip():
+            output_lines.append(line.rstrip())
+        emit_throttled_process_output(status_signal, line, output_state)
+    return output_lines
+
+
 def qwen3_asr_mode(mode: CaptionMode) -> bool:
     return mode.key in {"qwen3_asr_06b_4bit_mlx", "qwen3_asr_17b_8bit_mlx"}
 
@@ -661,16 +681,12 @@ class QueueWorker(QObject):
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         try:
-            assert self.proc.stdout
-            output_lines: list[str] = []
-            output_state: dict[str, object] = {}
-            for line in self.proc.stdout:
-                if self._stop:
-                    _terminate_process(self.proc)
-                    raise RuntimeError("Queue stopped")
-                if line.strip():
-                    output_lines.append(line.rstrip())
-                emit_throttled_process_output(self.status, line, output_state)
+            output_lines = _stream_process_output(
+                self.proc,
+                status_signal=self.status,
+                stop_flag=lambda: self._stop,
+                stop_message="Queue stopped",
+            )
             if self.proc.wait() != 0:
                 error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
                 raise RuntimeError(f"command failed: {cmd[0]}\n\nOutput:\n{error_context}")
@@ -681,16 +697,12 @@ class QueueWorker(QObject):
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         try:
-            assert self.proc.stdout
-            output_lines: list[str] = []
-            output_state: dict[str, object] = {}
-            for line in self.proc.stdout:
-                if self._stop:
-                    _terminate_process(self.proc)
-                    raise RuntimeError("Queue stopped")
-                if line.strip():
-                    output_lines.append(line.rstrip())
-                emit_throttled_process_output(self.status, line, output_state)
+            output_lines = _stream_process_output(
+                self.proc,
+                status_signal=self.status,
+                stop_flag=lambda: self._stop,
+                stop_message="Queue stopped",
+            )
             if self.proc.wait() != 0:
                 error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
                 raise RuntimeError(f"command failed: {cmd[0]}\n\nOutput:\n{error_context}")
@@ -1499,17 +1511,12 @@ class RollingPrefetchWorker(QObject):
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
         try:
-            assert self.proc.stdout
-            output_lines = []
-            output_state: dict[str, object] = {}
-            for line in self.proc.stdout:
-                if self._stop:
-                    _terminate_process(self.proc)
-                    raise RuntimeError("Rolling prefetch stopped")
-                if line.strip():
-                    output_lines.append(line.rstrip())
-                    emit_throttled_process_output(self.status, line, output_state)
-
+            output_lines = _stream_process_output(
+                self.proc,
+                status_signal=self.status,
+                stop_flag=lambda: self._stop,
+                stop_message="Rolling prefetch stopped",
+            )
             returncode = self.proc.wait()
             if returncode != 0 and not self._stop:
                 cmd_name = cmd[0]
@@ -1530,17 +1537,12 @@ class RollingPrefetchWorker(QObject):
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
         try:
-            assert self.proc.stdout
-            output_lines = []
-            output_state: dict[str, object] = {}
-            for line in self.proc.stdout:
-                if self._stop:
-                    _terminate_process(self.proc)
-                    raise RuntimeError("Rolling prefetch stopped")
-                if line.strip():
-                    output_lines.append(line.rstrip())
-                    emit_throttled_process_output(self.status, line, output_state)
-
+            output_lines = _stream_process_output(
+                self.proc,
+                status_signal=self.status,
+                stop_flag=lambda: self._stop,
+                stop_message="Rolling prefetch stopped",
+            )
             returncode = self.proc.wait()
             if returncode != 0 and not self._stop:
                 cmd_name = cmd[0]
