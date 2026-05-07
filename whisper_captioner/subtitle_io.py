@@ -158,7 +158,21 @@ def parse_subtitle_file(path: Path) -> list[SubtitleSegment]:
         return parse_srt(path)
     if suffix == ".vtt":
         return parse_vtt(path)
+    if suffix == ".txt":
+        return parse_plaintext(path)
     return []
+
+
+def parse_plaintext(path: Path) -> list[SubtitleSegment]:
+    content = path.read_text(encoding="utf-8", errors="ignore")
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    segments: list[SubtitleSegment] = []
+    cursor = 0.0
+    for line in lines:
+        end = cursor + 1.0
+        segments.append(SubtitleSegment(cursor, end, line))
+        cursor = end
+    return segments
 
 
 def parse_sense_voice_output(text: str) -> list[SubtitleSegment]:

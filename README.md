@@ -28,6 +28,7 @@ The project has been split out of the original single-file prototype:
 - `whisper_captioner/workers.py`: realtime capture, buffered capture, queue processing, and controlled URL subtitle preparation workers.
 - `whisper_captioner/llm_handler.py`: Gemini/OpenAI-compatible/Anthropic/Rapid-MLX subtitle proofreading calls.
 - `whisper_captioner/mlx_terms.py`: local Rapid-MLX/MLX term extraction helper, currently not part of the main Gemini full-document pipeline.
+- `whisper_captioner/qwen_chat_service.py`: local subtitle post-processing web workspace for Qwen3-8B / Gemini chat, manual subtitle upload, and second-stage-only cleanup or article rewriting.
 
 ## Current Stability Notes
 
@@ -82,6 +83,25 @@ Post-processing outputs are stored next to the current video's cache:
 
 - `video-summary-analysis.md`: video summary, structure, argument analysis, keywords, and one-line conclusion.
 - `video-article.md`: a polished long-form article rewritten from the transcript.
+
+## Subtitle Post-Processing Workspace
+
+The local Qwen web entry has been expanded into a subtitle post-processing workspace.
+
+What it can do:
+
+- Upload third-party `.srt`, `.vtt`, or `.txt` files without running the transcription pipeline.
+- Scan previously generated subtitle files under `~/Movies/WhisperCaptioner` and show them in a history sidebar.
+- Attach any uploaded or historical subtitle file to a work conversation.
+- Chat with the LLM grounded on the attached subtitle content.
+- Run one-click `语句规整` or `转写成文稿` actions on the attached subtitle.
+- Switch between `Local Rapid-MLX Qwen3-8B`, `Gemini 2.5 Flash`, and `Gemini 2.5 Pro`.
+
+Notes:
+
+- Long subtitle payloads now show an explicit warning when they are likely beyond the more comfortable single-shot range for local Qwen3-8B.
+- When that warning appears, switch to `Gemini 2.5 Pro` if you have already configured its API key in the desktop app Settings pane.
+- Action exports are written under `~/Movies/WhisperCaptioner/qwen-chat/exports/`.
 
 Sync controls:
 
