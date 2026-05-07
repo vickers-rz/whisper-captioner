@@ -74,7 +74,10 @@ def save_segments(path: Path, segments: list[SubtitleSegment]) -> None:
 
 
 def load_segments(path: Path) -> list[SubtitleSegment]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid subtitle cache at {path}: malformed JSON ({exc})") from exc
     if not isinstance(data, list):
         raise ValueError(f"Invalid subtitle cache at {path}: top-level JSON must be a list")
     return [segment_from_dict(item, path=path, index=index) for index, item in enumerate(data)]
