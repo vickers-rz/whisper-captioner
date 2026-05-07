@@ -112,7 +112,9 @@ Current role:
 
 Key observation:
 
-- Cache identity logic is compact and clear, but canonical coverage still needs follow-up for more URL forms.
+- Cache identity logic is compact and clear.
+- The highest-value canonical follow-ups already landed for `youtu.be`, `youtube.com/shorts/<id>`, and `youtube.com/live/<id>`.
+- Remaining follow-ups still include short-link expansion such as `b23.tv`.
 
 ### `whisper_captioner/subtitle_io.py`
 
@@ -124,7 +126,8 @@ Current role:
 
 Key observation:
 
-- `load_segments()` is a critical trust boundary and should reject malformed cache payloads early.
+- `load_segments()` is a critical trust boundary.
+- Basic schema validation and malformed-JSON reporting have now been added.
 
 ### `whisper_captioner/chrome_control.py`
 
@@ -171,8 +174,8 @@ Key observation:
 1. `MainWindow` still owns too much business state and playback logic.
 2. `QueueWorker` and `RollingPrefetchWorker` duplicate backend-specific transcription logic.
 3. `RollingPrefetchWorker` is named and documented like a rolling pipeline, but the current implementation behaves closer to controlled batch processing that starts playback once final subtitles are ready.
-4. `load_segments()` is used in multiple cache paths and needs strict validation.
-5. Temporary files and subprocess lifecycle cleanup need stronger guarantees.
+4. Cache validation is stronger now, but cache payload formats are still split across plain segment lists and richer JSON payloads.
+5. Temporary files and subprocess lifecycle cleanup are much better than before, but the code is still concentrated inside `workers.py`.
 6. Chrome tab targeting still relies on prefix matching rather than stable tab identity.
 
 ## Recommended Target Structure
@@ -288,6 +291,25 @@ Work:
 - Clean them in `finally` blocks.
 - Avoid broad temp-directory glob deletes.
 
+### Additional Low-Risk Follow-Ups Already Landed
+
+Files:
+
+- `whisper_captioner/workers.py`
+- `whisper_captioner/app.py`
+
+Work:
+
+- Clarify MLX subchunk labels in logs.
+- Improve native subtitle cache load/save/fetch diagnostics.
+- Improve malformed JSON reporting for:
+  - final subtitle cache
+  - subtitle offset cache
+  - MLX term cache
+- Deduplicate worker process streaming helpers.
+- Deduplicate audio duration probing logic.
+- Unify segment-cache load context inside `RollingPrefetchWorker`.
+
 ## File-by-File Checklist
 
 1. `whisper_captioner/subtitle_io.py`
@@ -305,9 +327,70 @@ Work:
 
 ## Current Implementation Status
 
-At the time this document was written:
+At the current project state:
 
-- Patch 1 had been started.
-- Patch 2 had been started.
-- Patches 3 and 4 were queued next.
+- Patch 1 is complete.
+- Patch 2 is complete.
+- Patch 3 is complete.
+- Patch 4 is complete.
+- Several additional low-risk cleanup patches are also complete.
 
+## Current Repository Packaging Status
+
+- The repository is now tracked in git and pushed to a private GitHub repository.
+- `third_party/` is intentionally not tracked.
+- Local `SenseVoice.cpp` setup is documented in `README.md` instead of being vendored into the repository.
+- `.gitignore` excludes:
+  - model weights and binary model artifacts
+  - `.env` and key-like local files
+  - build outputs and cache noise such as `dist/` and `__pycache__/`
+
+## Completed Patch Summary
+
+Completed in code and already pushed:
+
+1. `subtitle_io.py`
+   - Added strict segment schema validation.
+   - Added malformed JSON reporting with file paths.
+2. `cache.py`
+   - Added canonical handling for `youtu.be`, `youtube.com/shorts/<id>`, and `youtube.com/live/<id>`.
+3. `workers.py`
+   - Unified subprocess termination semantics.
+   - Added temp-file tracking and cleanup.
+   - Clarified MLX subchunk labels.
+   - Improved final subtitle cache validation and malformed-JSON reporting.
+   - Improved native subtitle cache diagnostics.
+   - Improved MLX term cache diagnostics.
+   - Deduplicated process-streaming helpers.
+   - Deduplicated audio duration probing.
+   - Added a small internal cache-load helper for rolling worker paths.
+4. `app.py`
+   - Improved malformed-JSON reporting for subtitle offset cache loading.
+
+## Recent Commits
+
+Recent applied commits include:
+
+- `2decbbd` Unify segment cache load context in rolling worker
+- `eb1649e` Deduplicate audio duration probing logic
+- `f07f21e` Deduplicate worker process streaming helpers
+- `fd9464e` Add context to native subtitle fetch failures
+- `2823f1c` Clarify MLX term cache read errors
+- `ebbd6f8` Clarify subtitle offset cache JSON parse errors
+- `9a50432` Report final subtitle cache JSON parse errors clearly
+- `af93997` Report subtitle cache JSON parse errors with file paths
+- `168c59f` Clarify native subtitle cache status messages
+- `73b52bf` Validate final subtitle cache segments with source paths
+- `08c6b7f` Clarify MLX subchunk transcription labels
+- `00c51a3` Clean up worker subprocess lifecycle and temp files
+
+## Suggested Next Steps
+
+The next sensible low-risk steps are:
+
+1. Continue shrinking repeated helper patterns inside `workers.py` without changing behavior.
+2. Decide whether `RollingPrefetchWorker` should remain a batch-oriented controlled pipeline or return to a true rolling playback pipeline.
+3. Once behavior is frozen, start extracting:
+   - a dedicated process runner
+   - a transcription backend router
+   - a controlled playback controller
