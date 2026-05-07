@@ -208,6 +208,11 @@ CHAT_HTML = """<!doctype html>
     .toolbar-spacer {
       flex: 1 1 auto;
     }
+    .danger {
+      background: rgba(167, 43, 43, 0.12);
+      border: 1px solid rgba(167, 43, 43, 0.2);
+      color: #7b1d1d;
+    }
     .messages {
       padding: 22px;
       overflow: auto;
@@ -246,33 +251,54 @@ CHAT_HTML = """<!doctype html>
       display: none;
     }
     .composer {
-      padding: 16px 22px 24px;
-      border-top: 1px solid var(--border);
-      background: rgba(252,251,248,0.92);
+      padding: 14px 22px 24px;
+      border-top: 1px solid rgba(215, 200, 179, 0.7);
+      background:
+        linear-gradient(180deg, rgba(252,251,248,0.4), rgba(252,251,248,0.94) 22%, rgba(252,251,248,0.98) 100%);
+      backdrop-filter: blur(12px);
       position: relative;
       z-index: 2;
     }
     .composer-shell {
-      display: grid;
-      grid-template-columns: 1fr 220px;
-      gap: 12px;
-      align-items: end;
-    }
-    textarea {
-      width: 100%;
-      min-height: 110px;
-      max-height: 260px;
-      resize: vertical;
-      border-radius: 18px;
-      border: 1px solid var(--border);
-      background: rgba(255,255,255,0.96);
-      padding: 16px 18px;
-      color: var(--text);
-    }
-    .actions {
       display: flex;
       flex-direction: column;
       gap: 10px;
+      border: 1px solid rgba(215, 200, 179, 0.9);
+      border-radius: 24px;
+      background: rgba(255,255,255,0.96);
+      box-shadow: 0 18px 32px rgba(58, 40, 23, 0.08);
+      padding: 14px;
+    }
+    textarea {
+      width: 100%;
+      min-height: 92px;
+      max-height: 240px;
+      resize: none;
+      border-radius: 18px;
+      border: 0;
+      background: transparent;
+      padding: 8px 6px 2px;
+      color: var(--text);
+      outline: none;
+    }
+    .actions {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .composer-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .composer-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-left: auto;
     }
     .chip {
       display: inline-flex;
@@ -303,6 +329,13 @@ CHAT_HTML = """<!doctype html>
     .desktop-only {
       display: inline-flex;
     }
+    .chip.clickable {
+      cursor: pointer;
+    }
+    .chip.clickable:hover {
+      border-color: rgba(159, 78, 47, 0.35);
+      background: rgba(255,255,255,0.92);
+    }
     .hidden { display: none; }
     @media (max-width: 1360px) {
       .app { grid-template-columns: 280px minmax(0, 1fr); }
@@ -326,7 +359,8 @@ CHAT_HTML = """<!doctype html>
       .app { grid-template-columns: 1fr; }
       .sidebar { border-right: 0; border-bottom: 1px solid var(--border); }
       .workspace { grid-template-rows: auto auto auto minmax(0, 1fr) auto; }
-      .composer-shell { grid-template-columns: 1fr; }
+      .actions { flex-direction: column; align-items: stretch; }
+      .composer-right { margin-left: 0; width: 100%; justify-content: space-between; }
       .desktop-only { display: none; }
     }
   </style>
@@ -366,6 +400,7 @@ CHAT_HTML = """<!doctype html>
         <button id="cleanup" class="secondary">语句规整</button>
         <button id="article" class="secondary">转写成文稿</button>
         <div class="toolbar-spacer"></div>
+        <button id="delete-conversation" class="danger">删除对话</button>
         <button id="toggle-inspector" class="ghost desktop-only">当前资产</button>
         <button id="open-instructions" class="ghost">提示词说明</button>
       </div>
@@ -391,8 +426,13 @@ CHAT_HTML = """<!doctype html>
         <div class="composer-shell">
           <textarea id="prompt" placeholder="围绕当前字幕提问，或直接输入后处理要求。按 Cmd/Ctrl + Enter 发送。"></textarea>
           <div class="actions">
-            <button id="send" class="primary">发送</button>
-            <div class="mini">长字幕建议切到 Gemini 2.5 Pro。</div>
+            <div class="composer-left">
+              <button id="composer-upload" class="ghost">添加文件</button>
+              <div class="mini">长字幕建议切到 Gemini 2.5 Pro。</div>
+            </div>
+            <div class="composer-right">
+              <button id="send" class="primary">发送</button>
+            </div>
           </div>
         </div>
       </div>
@@ -442,6 +482,7 @@ CHAT_HTML = """<!doctype html>
       send: document.getElementById("send"),
       newChat: document.getElementById("new-chat"),
       refresh: document.getElementById("refresh"),
+      deleteConversation: document.getElementById("delete-conversation"),
       cleanup: document.getElementById("cleanup"),
       article: document.getElementById("article"),
       provider: document.getElementById("provider-select"),
@@ -455,6 +496,7 @@ CHAT_HTML = """<!doctype html>
       closeProviderSettings: document.getElementById("close-provider-settings"),
       providerHelp: document.getElementById("provider-help"),
       pickFile: document.getElementById("pick-file"),
+      composerUpload: document.getElementById("composer-upload"),
       fileInput: document.getElementById("file-input"),
       attachCurrentAsset: document.getElementById("attach-current-asset"),
       subtitleChip: document.getElementById("subtitle-chip"),
@@ -539,6 +581,7 @@ CHAT_HTML = """<!doctype html>
       els.title.textContent = convo.title || "新工作会话";
       const subtitle = convo.subtitle;
       els.subtitleChip.textContent = subtitle ? `已挂字幕: ${subtitle.filename}` : "未挂载字幕";
+      els.subtitleChip.classList.toggle("clickable", Boolean(subtitle));
       if (!convo.messages.length) {
         els.messages.innerHTML = `<div class="empty">当前会话还没有消息。${subtitle ? "你现在可以直接针对这份字幕提问，或点击上方动作按钮。" : "先从左侧选择一份字幕并挂到会话，或者直接聊天测试模型能力。"} </div>`;
       } else {
@@ -660,6 +703,35 @@ CHAT_HTML = """<!doctype html>
       setStatus(`最后更新：${fmtTime(convo.updated_at)}`);
     }
 
+    async function deleteConversation() {
+      if (!state.currentId) {
+        setStatus("当前没有可删除的对话");
+        return;
+      }
+      if (!window.confirm("确定要删除当前对话吗？此操作不可撤销。")) {
+        return;
+      }
+      try {
+        await fetchJson(`/api/conversations/${state.currentId}/delete`, {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        const removedId = state.currentId;
+        state.currentId = null;
+        state.currentConversation = null;
+        await refreshConversations();
+        if (!state.currentId) {
+          els.messages.innerHTML = `<div class="empty">当前对话已删除。你可以新建工作会话，或先从左侧选择一份字幕继续处理。</div>`;
+          els.title.textContent = "新工作会话";
+          els.subtitleChip.textContent = "未挂载字幕";
+          els.subtitleChip.classList.remove("clickable");
+        }
+        setStatus(`已删除对话：${removedId.slice(0, 8)}`);
+      } catch (err) {
+        setStatus(`删除失败：${err.message}`);
+      }
+    }
+
     async function ensureConversation() {
       if (!state.currentId) {
         await createConversation();
@@ -757,6 +829,23 @@ CHAT_HTML = """<!doctype html>
       }
     }
 
+    async function detachSubtitle() {
+      if (!state.currentId || !state.currentConversation?.subtitle) {
+        return;
+      }
+      try {
+        const convo = await fetchJson(`/api/conversations/${state.currentId}/detach_subtitle`, {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        renderMessages(convo);
+        await refreshConversations(convo.id);
+        setStatus("已解除当前对话挂载的字幕");
+      } catch (err) {
+        setStatus(`解除挂载失败：${err.message}`);
+      }
+    }
+
     async function runAction(action) {
       await ensureConversation();
       setStatus(action === "cleanup" ? "正在规整字幕..." : "正在转写成文稿...");
@@ -801,6 +890,7 @@ CHAT_HTML = """<!doctype html>
       await refreshConversations();
       setStatus("已刷新");
     });
+    els.deleteConversation.addEventListener("click", deleteConversation);
     els.prompt.addEventListener("keydown", (event) => {
       if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
         event.preventDefault();
@@ -820,9 +910,15 @@ CHAT_HTML = """<!doctype html>
       els.providerPanel.style.display = "none";
     });
     els.attachCurrentAsset.addEventListener("click", attachSelectedAsset);
+    els.subtitleChip.addEventListener("click", () => {
+      if (state.currentConversation?.subtitle) {
+        detachSubtitle();
+      }
+    });
     els.cleanup.addEventListener("click", () => runAction("cleanup"));
     els.article.addEventListener("click", () => runAction("article"));
     els.pickFile.addEventListener("click", () => els.fileInput.click());
+    els.composerUpload.addEventListener("click", () => els.fileInput.click());
     els.fileInput.addEventListener("change", async () => {
       const file = els.fileInput.files[0];
       if (!file) return;
@@ -1007,6 +1103,24 @@ class QwenChatServiceManager:
                         self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                         return
                     self._write_json(manager._decorate_conversation(convo))
+                    return
+                if parsed.path.startswith("/api/conversations/") and parsed.path.endswith("/detach_subtitle"):
+                    convo_id = parsed.path.removeprefix("/api/conversations/").removesuffix("/detach_subtitle")
+                    try:
+                        convo = manager._detach_subtitle(convo_id)
+                    except Exception as exc:
+                        self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    self._write_json(manager._decorate_conversation(convo))
+                    return
+                if parsed.path.startswith("/api/conversations/") and parsed.path.endswith("/delete"):
+                    convo_id = parsed.path.removeprefix("/api/conversations/").removesuffix("/delete")
+                    try:
+                        manager._delete_conversation(convo_id)
+                    except Exception as exc:
+                        self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    self._write_json({"ok": True, "id": convo_id})
                     return
                 if parsed.path.startswith("/api/conversations/") and parsed.path.endswith("/actions"):
                     convo_id = parsed.path.removeprefix("/api/conversations/").removesuffix("/actions")
@@ -1198,13 +1312,14 @@ class QwenChatServiceManager:
     def _list_assets(self) -> list[dict[str, Any]]:
         assets: list[dict[str, Any]] = []
         seen: set[str] = set()
+        dedupe: dict[str, dict[str, Any]] = {}
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
 
         for path in sorted(self.uploads_dir.glob("*")):
             asset = self._asset_from_path(path, "手动上传")
             if asset and asset["id"] not in seen:
                 seen.add(asset["id"])
-                assets.append(asset)
+                dedupe[self._asset_dedupe_key(asset)] = asset
 
         excluded_roots = {
             self.storage_dir.resolve(),
@@ -1224,10 +1339,26 @@ class QwenChatServiceManager:
             asset = self._asset_from_path(path, "历史生成")
             if asset and asset["id"] not in seen:
                 seen.add(asset["id"])
-                assets.append(asset)
+                key = self._asset_dedupe_key(asset)
+                existing = dedupe.get(key)
+                if existing is None or self._prefer_asset(asset, existing):
+                    dedupe[key] = asset
 
+        assets = list(dedupe.values())
         assets.sort(key=lambda item: (item["source_label"] != "手动上传", item["filename"].lower()))
         return assets
+
+    def _asset_dedupe_key(self, asset: dict[str, Any]) -> str:
+        return Path(str(asset["filename"])).stem.lower()
+
+    def _prefer_asset(self, candidate: dict[str, Any], current: dict[str, Any]) -> bool:
+        candidate_suffix = Path(str(candidate["filename"])).suffix.lower()
+        current_suffix = Path(str(current["filename"])).suffix.lower()
+        if candidate_suffix == ".txt" and current_suffix != ".txt":
+            return True
+        if candidate_suffix != ".txt" and current_suffix == ".txt":
+            return False
+        return str(candidate["filename"]).lower() < str(current["filename"]).lower()
 
     def _find_asset(self, asset_id: str) -> Optional[dict[str, Any]]:
         for asset in self._list_assets():
@@ -1308,6 +1439,19 @@ class QwenChatServiceManager:
         convo["updated_at"] = self._now()
         self._save_conversation(convo)
         return convo
+
+    def _detach_subtitle(self, convo_id: str) -> dict[str, Any]:
+        convo = self._load_required_conversation(convo_id)
+        convo["subtitle"] = None
+        convo["updated_at"] = self._now()
+        self._save_conversation(convo)
+        return convo
+
+    def _delete_conversation(self, convo_id: str) -> None:
+        path = self._conversation_path(convo_id)
+        if not path.exists():
+            raise RuntimeError("Conversation not found")
+        path.unlink()
 
     def _append_and_reply(self, convo_id: str, content: str) -> dict[str, Any]:
         convo = self._load_required_conversation(convo_id)
