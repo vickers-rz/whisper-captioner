@@ -1405,7 +1405,9 @@ class RollingPrefetchWorker(QObject):
                     f"Fetching native subtitles ({lang_expr})",
                 )
             except Exception as exc:
-                self.status.emit(f"No native subtitles fetched for {lang_expr}: {exc}")
+                self.status.emit(
+                    f"No native subtitles fetched for {lang_expr} ({cache_name}, {subs_dir.name}): {exc}"
+                )
                 continue
 
             subtitle_files = sorted(
