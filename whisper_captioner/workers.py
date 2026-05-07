@@ -933,7 +933,10 @@ class RollingPrefetchWorker(QObject):
                 segments: list[SubtitleSegment] = []
                 use_cached = False
                 if raw_cache.exists():
-                    cached_segments = load_segments(raw_cache)
+                    cached_segments = self._load_segment_cache(
+                        raw_cache,
+                        f"Chunk {chunk_index} raw subtitle cache",
+                    )
                     if self._chunk_cache_looks_bad(cached_segments, remaining):
                         self.status.emit(
                             f"Chunk {chunk_index}: cached Whisper result looks sparse; rebuilding"
@@ -1043,11 +1046,17 @@ class RollingPrefetchWorker(QObject):
         polish_key = cache_slug(provider_key, model_key, self.llm_api_url, "full-document-polish-v1")
         return job_cache_dir / f"all-polished-{polish_key}.json"
 
+    def _load_segment_cache(self, path: Path, context: str) -> list[SubtitleSegment]:
+        try:
+            return load_segments(path)
+        except Exception as exc:
+            raise ValueError(f"{context} unreadable ({path.name}): {exc}") from exc
+
     def _load_all_raw_segments(self, job_cache_dir: Path) -> list[SubtitleSegment]:
         raw_files = sorted(job_cache_dir.glob("chunk-*-raw.json"))
         all_segments: list[SubtitleSegment] = []
         for path in raw_files:
-            all_segments.extend(load_segments(path))
+            all_segments.extend(self._load_segment_cache(path, "Raw subtitle cache"))
         all_segments.sort(key=lambda item: (item.start, item.end))
         return all_segments
 
@@ -1344,11 +1353,11 @@ class RollingPrefetchWorker(QObject):
         cache_path = self._full_polish_cache_path(job_cache_dir)
         all_segments: list[SubtitleSegment] = []
         for path in raw_files:
-            all_segments.extend(load_segments(path))
+            all_segments.extend(self._load_segment_cache(path, "Raw subtitle cache"))
         all_segments.sort(key=lambda item: (item.start, item.end))
         try:
             if self.llm_provider and llm_provider_ready(self.llm_provider, self.llm_api_key) and cache_path.exists():
-                polished = load_segments(cache_path)
+                polished = self._load_segment_cache(cache_path, "Full-document LLM polish cache")
                 self.status.emit("Loaded full-document LLM polish cache")
             elif self.llm_provider and llm_provider_ready(self.llm_provider, self.llm_api_key):
                 self.status.emit(f"Running full-document LLM polish on {len(all_segments)} segment(s)")
@@ -1389,15 +1398,16 @@ class RollingPrefetchWorker(QObject):
             cache_path = job_cache_dir / f"native-subtitles-{cache_name}.json"
             if cache_path.exists():
                 try:
-                    segments = load_segments(cache_path)
+                    segments = self._load_segment_cache(
+                        cache_path,
+                        f"Native subtitle cache ({cache_name})",
+                    )
                     self.status.emit(
                         f"Loaded native subtitle cache ({cache_name}) from {cache_path.name}"
                     )
                     return segments, cache_name
                 except Exception as exc:
-                    self.status.emit(
-                        f"Native subtitle cache unreadable ({cache_name}, {cache_path.name}): {exc}"
-                    )
+                    self.status.emit(str(exc))
 
             subs_dir = job_cache_dir / f"native-subs-{cache_name}"
             subs_dir.mkdir(parents=True, exist_ok=True)
