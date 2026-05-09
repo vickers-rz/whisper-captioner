@@ -133,6 +133,11 @@ def ensure_local_rapidmlx_server(
     raise RuntimeError("Rapid-MLX server did not become ready in time")
 
 
+def _strip_think_blocks(text: str) -> str:
+    """Remove any residual <think>...</think> blocks from model output."""
+    return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or text
+
+
 def _build_llm_call(
     provider: LLMProvider,
     api_key: str,
@@ -163,6 +168,21 @@ def _build_llm_call(
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
         }
+    elif fmt == "ollama":
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            "think": False,
+            "stream": False,
+            "options": {
+                "temperature": 0.3,
+                "num_predict": max_tokens,
+            },
+        }
+        headers = {"Content-Type": "application/json"}
     else:
         body = {
             "model": model,
@@ -201,6 +221,9 @@ def _extract_llm_reply(data: dict, fmt: str) -> str:
             if text_parts:
                 return "\n".join(text_parts)
         return data["content"][0]["text"]
+    if fmt == "ollama":
+        content = data.get("message", {}).get("content", "")
+        return _strip_think_blocks(content)
     return data["choices"][0]["message"]["content"]
 
 

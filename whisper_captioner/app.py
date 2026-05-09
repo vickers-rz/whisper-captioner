@@ -52,8 +52,11 @@ from whisper_captioner.ui_builder import build_main_window_ui
 from whisper_captioner.ui_shell import WINDOW_STYLESHEET
 from whisper_captioner.workers import (
     LLMTextWorker,
+    NUCRealtimeWorker,
     QueueWorker,
     RealtimeWorker,
+    RealtimePolishWorker,
+    RealtimeReRecognizeWorker,
     RollingPrefetchWorker,
     clean_title_for_filename,
     infer_source_title,
@@ -68,6 +71,10 @@ from whisper_captioner.config import (
     LOG_DIR,
     NOTES_DIR,
     WHISPER_STREAM,
+    MODELS_DIR,
+    OUTPUT_DIR,
+    REALTIME_DIR,
+    SUBTITLE_PIPELINE_VERSION,
 )
 from whisper_captioner.models import CaptionMode, LLM_PROVIDERS, MODES, SubtitleSegment
 from whisper_captioner.subtitle_io import (
@@ -93,7 +100,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Whisper Captioner")
         self.resize(1000, 680)
         self.realtime_thread: Optional[QThread] = None
-        self.realtime_worker: Optional[RealtimeWorker] = None
+        self.realtime_worker: Optional[Union[RealtimeWorker, NUCRealtimeWorker]] = None
+        self.realtime_polish_thread: Optional[QThread] = None
+        self.realtime_polish_worker: Optional[RealtimePolishWorker] = None
+        self.realtime_re_recognize_thread: Optional[QThread] = None
+        self.realtime_re_recognize_worker: Optional[RealtimeReRecognizeWorker] = None
+        
+        # Audio capturing and control state
         self.queue_thread: Optional[QThread] = None
         self.queue_worker: Optional[QueueWorker] = None
         self.controlled_thread: Optional[QThread] = None
@@ -162,6 +175,18 @@ class MainWindow(QMainWindow):
         self.overlay_more_opacity_button.clicked.connect(lambda: self.overlay.adjust_opacity(0.05))
         self.overlay_less_opacity_button.clicked.connect(lambda: self.overlay.adjust_opacity(-0.05))
         self.overlay_reset_button.clicked.connect(self.overlay._reset_position)
+
+        # Realtime Session UI Connections
+        self.session_list.itemSelectionChanged.connect(self._on_session_selected)
+        self.session_view_combo.currentIndexChanged.connect(self._on_session_selected)
+        self.session_polish_button.clicked.connect(self._polish_session)
+        self.session_rerecognize_button.clicked.connect(self._re_recognize_session)
+        self.session_open_button.clicked.connect(self._open_session_dir)
+        self.session_delete_button.clicked.connect(self._delete_session)
+
+        QTimer.singleShot(100, self._load_realtime_sessions)
+        
+        # Initial status update
         self.clear_cache_button.clicked.connect(self.clear_current_video_cache)
         self.open_cache_button.clicked.connect(self.open_current_cache_in_finder)
         self.open_outputs_button.clicked.connect(self.reveal_current_outputs_in_finder)
@@ -195,8 +220,6 @@ class MainWindow(QMainWindow):
             self.mode_combo.setCurrentIndex(0)
         self.llm_group.setChecked(settings.value("llm/enabled", True, type=bool))
         saved_provider = str(settings.value("llm/provider", "gemini_flash"))
-        if saved_provider in {"local_rapidmlx", "local_rapidmlx_8b"}:
-            saved_provider = "gemini_flash"
         idx = self.llm_provider_combo.findData(saved_provider)
         if idx >= 0:
             self.llm_provider_combo.setCurrentIndex(idx)
@@ -860,11 +883,13 @@ class MainWindow(QMainWindow):
     def start_realtime(self) -> None:
         mode = self.current_mode()
         if not mode.realtime:
-            idx = self.mode_combo.findData("realtime_small")
+            idx = self.mode_combo.findData("realtime_nuc")
+            if idx < 0:
+                idx = self.mode_combo.findData("realtime_small")
             if idx >= 0:
                 self.mode_combo.setCurrentIndex(idx)
                 mode = self.current_mode()
-                self.log("Switched to realtime small mode for SoundSource/Loopback captions.")
+                self.log(f"Switched to {mode.label} for realtime captions.")
             else:
                 QMessageBox.information(self, "模式", "请先选择一个适合实时字幕的模式。")
                 return
@@ -874,18 +899,36 @@ class MainWindow(QMainWindow):
         capture_id = self._capture_id()
         self._save_capture_id()
         self.overlay.show()
-        self.overlay.set_caption("正在监听 Loopback 输入。")
-        self.log(
-            f"Realtime route: Chrome/player -> SoundSource -> Loopback input; "
-            f"whisper-stream capture id {capture_id}"
-        )
-        self.realtime_thread = QThread()
-        self.realtime_worker = RealtimeWorker(mode, capture_id=capture_id)
+        self.overlay.set_caption("正在监听 Loopback 输入…")
+
+        if mode.backend == "nuc_asr":
+            self.log(
+                f"NUC realtime: Loopback :{capture_id} → "
+                f"{mode.model} (3s chunks, CUDA large-v3)"
+            )
+            self.realtime_thread = QThread()
+            self.realtime_worker = NUCRealtimeWorker(
+                base_url=str(mode.model),
+                capture_id=capture_id,
+                chunk_seconds=3.0,
+            )
+        else:
+            self.log(
+                f"Realtime route: Chrome/player -> SoundSource -> Loopback input; "
+                f"whisper-stream capture id {capture_id}"
+            )
+            self.realtime_thread = QThread()
+            self.realtime_worker = RealtimeWorker(mode, capture_id=capture_id)
+
         self.realtime_worker.moveToThread(self.realtime_thread)
         self.realtime_thread.started.connect(self.realtime_worker.run)
         self.realtime_worker.caption.connect(self.overlay.set_caption)
         self.realtime_worker.caption.connect(self.log)
         self.realtime_worker.status.connect(self.log)
+        if hasattr(self.realtime_worker, "session_saved"):
+            self.realtime_worker.session_saved.connect(
+                lambda p: self.log(f"Realtime session saved to: {p}")
+            )
         self.realtime_worker.finished.connect(self.realtime_thread.quit)
         self.realtime_thread.finished.connect(self._clear_realtime)
         self.realtime_button.setEnabled(False)
@@ -1028,6 +1071,177 @@ class MainWindow(QMainWindow):
         if hasattr(self, "realtime_button"):
             self.realtime_button.setEnabled(True)
             self.realtime_button.setText("实时字幕")
+        self._load_realtime_sessions()
+
+    def _load_realtime_sessions(self) -> None:
+        if not hasattr(self, "session_list"):
+            return
+        self.session_list.clear()
+        if not REALTIME_DIR.exists():
+            return
+        
+        sessions = [d for d in REALTIME_DIR.iterdir() if d.is_dir() and (d / "manifest.json").exists()]
+        sessions.sort(key=lambda d: d.name, reverse=True)
+        
+        for session_dir in sessions:
+            try:
+                with open(session_dir / "manifest.json", "r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+                dur = manifest.get("duration_seconds", 0)
+                chunks = manifest.get("num_chunks", 0)
+                label = f"{session_dir.name[:8]} {session_dir.name[9:11]}:{session_dir.name[11:13]} ({dur:.1f}s, {chunks}c)"
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, str(session_dir))
+                self.session_list.addItem(item)
+            except Exception:
+                pass
+
+    def _on_session_selected(self) -> None:
+        if not hasattr(self, "session_list") or not self.session_list.currentItem():
+            return
+            
+        session_dir = Path(self.session_list.currentItem().data(Qt.ItemDataRole.UserRole))
+        view_idx = self.session_view_combo.currentIndex()
+        
+        # 0 = Raw, 1 = Polished
+        if view_idx == 1:
+            json_path = session_dir / "polished-segments.json"
+            if not json_path.exists():
+                self.session_transcript.setPlainText("未找到校对后的字幕，请先执行【LLM 校对】。")
+                return
+        else:
+            json_path = session_dir / "raw-segments.json"
+            if not json_path.exists():
+                self.session_transcript.setPlainText("未找到原始字幕。")
+                return
+                
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            segments = [SubtitleSegment(s["start"], s["end"], s["text"]) for s in data]
+            text = "\n".join(f"[{s.start:05.1f}-{s.end:05.1f}] {s.text}" for s in segments)
+            self.session_transcript.setPlainText(text)
+        except Exception as exc:
+            self.session_transcript.setPlainText(f"加载失败: {exc}")
+
+    def _polish_session(self) -> None:
+        if not hasattr(self, "session_list") or not self.session_list.currentItem():
+            return
+            
+        session_dir = Path(self.session_list.currentItem().data(Qt.ItemDataRole.UserRole))
+        json_path = session_dir / "raw-segments.json"
+        if not json_path.exists():
+            self.log("找不到 raw-segments.json，无法进行校对。")
+            return
+            
+        provider = self.current_llm_provider()
+        api_key = self.current_api_key()
+        if not provider or not llm_provider_ready(provider, api_key):
+            self.log("请先在【设置】中配置有效的 LLM 提供商和 API Key。")
+            return
+            
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            segments = [SubtitleSegment(s["start"], s["end"], s["text"]) for s in data]
+            
+            self.realtime_polish_thread = QThread()
+            self.realtime_polish_worker = RealtimePolishWorker(
+                session_dir,
+                segments,
+                provider,
+                api_key,
+                self.llm_custom_url_input.text().strip(),
+                self.llm_custom_model_input.text().strip(),
+            )
+            self.realtime_polish_worker.moveToThread(self.realtime_polish_thread)
+            self.realtime_polish_thread.started.connect(self.realtime_polish_worker.run)
+            self.realtime_polish_worker.status.connect(self.log)
+            self.realtime_polish_worker.finished.connect(self.realtime_polish_thread.quit)
+            self.realtime_polish_thread.finished.connect(self._clear_realtime_polish)
+            self.realtime_polish_thread.start()
+            
+            self.session_polish_button.setEnabled(False)
+            self.log("开始后台规整...")
+        except Exception as exc:
+            self.log(f"启动规整失败: {exc}")
+
+    def _clear_realtime_polish(self) -> None:
+        if self.realtime_polish_worker:
+            self.realtime_polish_worker.deleteLater()
+            self.realtime_polish_worker = None
+        if self.realtime_polish_thread:
+            self.realtime_polish_thread.deleteLater()
+            self.realtime_polish_thread = None
+        if hasattr(self, "session_polish_button"):
+            self.session_polish_button.setEnabled(True)
+        self._on_session_selected()
+
+    def _re_recognize_session(self) -> None:
+        if not hasattr(self, "session_list") or not self.session_list.currentItem():
+            return
+            
+        session_dir = Path(self.session_list.currentItem().data(Qt.ItemDataRole.UserRole))
+        if not (session_dir / "full-audio.wav").exists():
+            self.log("没有找到 full-audio.wav，无法重新识别。")
+            return
+            
+        mode = self.current_mode()
+        if mode.backend != "nuc_asr":
+            self.log("请在下拉框中选择一个 nuc_asr 模型作为识别后端。")
+            return
+            
+        provider = self.current_llm_provider()
+        api_key = self.current_api_key()
+        
+        self.realtime_re_recognize_thread = QThread()
+        self.realtime_re_recognize_worker = RealtimeReRecognizeWorker(
+            session_dir,
+            str(mode.model),
+            provider if llm_provider_ready(provider, api_key) else None,
+            api_key,
+            self.llm_custom_url_input.text().strip(),
+            self.llm_custom_model_input.text().strip(),
+        )
+        self.realtime_re_recognize_worker.moveToThread(self.realtime_re_recognize_thread)
+        self.realtime_re_recognize_thread.started.connect(self.realtime_re_recognize_worker.run)
+        self.realtime_re_recognize_worker.status.connect(self.log)
+        self.realtime_re_recognize_worker.finished.connect(self.realtime_re_recognize_thread.quit)
+        self.realtime_re_recognize_thread.finished.connect(self._clear_realtime_re_recognize)
+        self.realtime_re_recognize_thread.start()
+        
+        self.session_rerecognize_button.setEnabled(False)
+        self.log("开始重识别...")
+
+    def _clear_realtime_re_recognize(self) -> None:
+        if self.realtime_re_recognize_worker:
+            self.realtime_re_recognize_worker.deleteLater()
+            self.realtime_re_recognize_worker = None
+        if self.realtime_re_recognize_thread:
+            self.realtime_re_recognize_thread.deleteLater()
+            self.realtime_re_recognize_thread = None
+        if hasattr(self, "session_rerecognize_button"):
+            self.session_rerecognize_button.setEnabled(True)
+        self._on_session_selected()
+
+    def _open_session_dir(self) -> None:
+        if not hasattr(self, "session_list") or not self.session_list.currentItem():
+            return
+        session_dir = Path(self.session_list.currentItem().data(Qt.ItemDataRole.UserRole))
+        subprocess.run(["open", str(session_dir)])
+
+    def _delete_session(self) -> None:
+        if not hasattr(self, "session_list") or not self.session_list.currentItem():
+            return
+        session_dir = Path(self.session_list.currentItem().data(Qt.ItemDataRole.UserRole))
+        reply = QMessageBox.question(self, "确认删除", f"确定要删除会话目录吗？\n{session_dir}", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            import shutil
+            try:
+                shutil.rmtree(session_dir)
+                self._load_realtime_sessions()
+            except Exception as exc:
+                self.log(f"删除失败: {exc}")
 
     def add_queue_item(self) -> None:
         text = self._normalize_source_input(self.url_input.text())

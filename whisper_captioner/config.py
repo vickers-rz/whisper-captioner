@@ -7,9 +7,13 @@ HOME = Path.home()
 MODELS_DIR = HOME / "whisper-models"
 OUTPUT_DIR = HOME / "Movies" / "WhisperCaptioner"
 CACHE_DIR = OUTPUT_DIR / "cache"
+REALTIME_DIR = OUTPUT_DIR / "realtime"
 LOG_DIR = OUTPUT_DIR / "logs"
 NOTES_DIR = OUTPUT_DIR / "notes"
 QWEN_CHAT_DIR = OUTPUT_DIR / "qwen-chat"
+
+REALTIME_CHUNK_SECONDS = 3.0
+REALTIME_POLISH_BATCH_SECONDS = 30.0
 
 WHISPER_STREAM = "/opt/homebrew/bin/whisper-stream"
 WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
@@ -30,6 +34,9 @@ RAPIDMLX_SERVED_MODEL = "qwen2.5-3b-mlx"
 RAPIDMLX_8B_PORT = "8766"
 RAPIDMLX_8B_MODEL = "mlx-community/Qwen3-8B-4bit"
 RAPIDMLX_8B_SERVED_MODEL = "qwen3-8b-mlx"
+
+NUC_OLLAMA_HOST = "192.168.31.196"
+NUC_OLLAMA_PORT = "11434"
 
 MLX_TERMS_SCRIPT = Path(__file__).with_name("mlx_terms.py")
 

@@ -7,6 +7,8 @@ from .config import (
     MLX_WHISPER_FP16_MODEL,
     MLX_WHISPER_Q5_MODEL,
     MODELS_DIR,
+    NUC_OLLAMA_HOST,
+    NUC_OLLAMA_PORT,
     QWEN3_ASR_06B_4BIT_MLX_MODEL,
     QWEN3_ASR_17B_8BIT_MLX_MODEL,
     RAPIDMLX_HOST,
@@ -68,6 +70,14 @@ MODES = [
         MODELS_DIR / "ggml-large-v3-turbo-q5_0.bin",
         True,
         ("-l", "zh", "--step", "3000", "--length", "10000", "--keep", "500"),
+    ),
+    CaptionMode(
+        "realtime_nuc",
+        "实时字幕 NUC large-v3（远程 CUDA，3s延迟）",
+        f"http://{NUC_OLLAMA_HOST}:8000",
+        True,
+        ("-l", "zh"),
+        "nuc_asr",
     ),
     CaptionMode(
         "qwen3_asr_06b_4bit_mlx",
@@ -138,6 +148,14 @@ MODES = [
         False,
         ("-l", "zh", "-osrt", "-otxt"),
     ),
+    CaptionMode(
+        "nuc_asr",
+        "NUC faster-whisper large-v3（远程 CUDA）",
+        f"http://{NUC_OLLAMA_HOST}:8000",
+        False,
+        ("-l", "zh"),
+        "nuc_asr",
+    ),
 ]
 
 
@@ -156,6 +174,22 @@ LLM_PROVIDERS = [
         f"http://{RAPIDMLX_HOST}:{RAPIDMLX_PORT}/v1/chat/completions",
         RAPIDMLX_SERVED_MODEL,
         "openai",
+        False,
+    ),
+    LLMProvider(
+        "nuc_ollama_8b",
+        "NUC Ollama Qwen3-8B",
+        f"http://{NUC_OLLAMA_HOST}:{NUC_OLLAMA_PORT}/api/chat",
+        "qwen3:8b",
+        "ollama",
+        False,
+    ),
+    LLMProvider(
+        "nuc_ollama_14b",
+        "NUC Ollama Qwen3-14B-8K",
+        f"http://{NUC_OLLAMA_HOST}:{NUC_OLLAMA_PORT}/api/chat",
+        "qwen3-14b-8k",
+        "ollama",
         False,
     ),
     LLMProvider("gpt4o_mini", "OpenAI GPT-4o-mini",

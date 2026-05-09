@@ -23,6 +23,49 @@ from whisper_captioner.models import LLM_PROVIDERS, MODES
 from whisper_captioner.transcript_panel import build_transcript_panel
 
 
+def build_realtime_review_panel(window) -> QWidget:
+    tab = QWidget()
+    layout = QHBoxLayout(tab)
+    
+    left_panel = QWidget()
+    left_layout = QVBoxLayout(left_panel)
+    left_layout.addWidget(QLabel("会话列表"))
+    window.session_list = QListWidget()
+    window.session_list.setMinimumWidth(200)
+    left_layout.addWidget(window.session_list)
+    layout.addWidget(left_panel, 1)
+
+    right_panel = QWidget()
+    right_layout = QVBoxLayout(right_panel)
+    
+    header_row = QHBoxLayout()
+    header_row.addWidget(QLabel("内容视图:"))
+    window.session_view_combo = QComboBox()
+    window.session_view_combo.addItems(["原始字幕 (Raw)", "LLM 规整 (Polished)"])
+    header_row.addWidget(window.session_view_combo)
+    header_row.addStretch()
+    right_layout.addLayout(header_row)
+
+    window.session_transcript = QTextEdit()
+    window.session_transcript.setReadOnly(True)
+    right_layout.addWidget(window.session_transcript)
+
+    button_row = QHBoxLayout()
+    window.session_polish_button = QPushButton("LLM 校对")
+    window.session_rerecognize_button = QPushButton("重新识别")
+    window.session_open_button = QPushButton("打开目录")
+    window.session_delete_button = QPushButton("删除会话")
+    
+    button_row.addWidget(window.session_polish_button)
+    button_row.addWidget(window.session_rerecognize_button)
+    button_row.addStretch()
+    button_row.addWidget(window.session_open_button)
+    button_row.addWidget(window.session_delete_button)
+    right_layout.addLayout(button_row)
+
+    layout.addWidget(right_panel, 3)
+    return tab
+
 def build_main_window_ui(window) -> None:
     window.mode_combo = QComboBox()
     for mode in MODES:
@@ -260,6 +303,7 @@ def build_main_window_ui(window) -> None:
     tabs.addTab(queue_tab, "队列")
     tabs.addTab(analysis_tab, "分析")
     tabs.addTab(transcript_tab, "全文字幕")
+    tabs.addTab(build_realtime_review_panel(window), "实时回顾")
     tabs.addTab(settings_tab, "设置")
     root_layout.addWidget(tabs)
     root_layout.addWidget(window.progress_bar)

@@ -8,9 +8,11 @@ This module provides worker classes that run in separate threads:
 
 from __future__ import annotations
 
+import datetime
 import json
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -33,7 +35,9 @@ from whisper_captioner.config import (
     MLX_WHISPER,
     MLX_TERMS_SCRIPT,
     MODELS_DIR,
+    NUC_OLLAMA_HOST,
     OUTPUT_DIR,
+    REALTIME_DIR,
     RAPIDMLX_8B_MODEL,
     RAPIDMLX_8B_PORT,
     RAPIDMLX_8B_SERVED_MODEL,
@@ -57,6 +61,11 @@ from whisper_captioner.llm_handler import (
     llm_provider_ready,
 )
 from whisper_captioner.models import CaptionMode, LLMProvider, SubtitleSegment
+from whisper_captioner.subtitle_io import (
+    save_segments,
+    save_segments_as_srt,
+    save_segments_as_txt,
+)
 from whisper_captioner.subtitle_io import (
     load_segments,
     overlapping_segments,
@@ -162,6 +171,66 @@ def _probe_audio_duration(audio_path: Path) -> float:
 
 def qwen3_asr_mode(mode: CaptionMode) -> bool:
     return mode.key in {"qwen3_asr_06b_4bit_mlx", "qwen3_asr_17b_8bit_mlx"}
+
+
+def _transcribe_via_nuc_asr(
+    audio_path: Path,
+    base_url: str = "",
+    language: str = "zh",
+    response_format: str = "verbose_json",
+    timeout: int = 120,
+) -> list[SubtitleSegment]:
+    """Send an audio file to the NUC faster-whisper-server and return segments."""
+    import urllib.request
+    import uuid
+
+    if not base_url:
+        base_url = f"http://{NUC_OLLAMA_HOST}:8000"
+    url = f"{base_url}/v1/audio/transcriptions"
+
+    boundary = uuid.uuid4().hex
+    audio_data = audio_path.read_bytes()
+    filename = audio_path.name
+
+    body_parts = []
+    for field_name, field_value in [("model", "large-v3"), ("language", language), ("response_format", response_format)]:
+        body_parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{field_name}"\r\n\r\n'
+            f"{field_value}\r\n"
+        )
+    body_parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: audio/wav\r\n\r\n"
+    )
+    body = b""
+    for part in body_parts:
+        body += part.encode("utf-8")
+    body += audio_data
+    body += f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    segments: list[SubtitleSegment] = []
+    if response_format == "verbose_json":
+        for seg in data.get("segments", []):
+            text = seg.get("text", "").strip()
+            if text:
+                segments.append(SubtitleSegment(seg["start"], seg["end"], text))
+    else:
+        text = data.get("text", "").strip()
+        if text:
+            duration = data.get("duration", 30.0)
+            segments.append(SubtitleSegment(0.0, duration, text))
+    return segments
 
 
 def qwen3_event_label(text: str) -> bool:
@@ -351,6 +420,427 @@ class RealtimeWorker(QObject):
         return ""
 
 
+class NUCRealtimeWorker(QObject):
+    """Capture Loopback audio in rolling 3s chunks and transcribe via NUC CUDA."""
+
+    caption = Signal(str)
+    status = Signal(str)
+    finished = Signal()
+    session_saved = Signal(str)
+    segments_updated = Signal(list)
+
+    def __init__(
+        self,
+        base_url: str,
+        capture_id: int = 0,
+        chunk_seconds: float = 3.0,
+        save_audio: bool = True,
+        session_dir: Optional[Path] = None,
+    ) -> None:
+        super().__init__()
+        self.base_url = base_url
+        self.capture_id = capture_id
+        self.chunk_seconds = chunk_seconds
+        self.save_audio = save_audio
+        self.session_dir = session_dir
+        self._stop = False
+        self._recording_proc: Optional[subprocess.Popen[str]] = None
+        self._all_segments: list[SubtitleSegment] = []
+
+    def run(self) -> None:
+        import threading
+
+        if self.session_dir is None:
+            session_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            self.session_dir = REALTIME_DIR / session_id
+
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        audio_dir = self.session_dir / "audio"
+        audio_dir.mkdir(exist_ok=True)
+
+        self.status.emit(
+            f"NUC realtime: capturing Loopback :{self.capture_id}, "
+            f"{self.chunk_seconds}s chunks → {self.base_url}"
+        )
+
+        # Quick connectivity check
+        try:
+            import urllib.request
+            test_req = urllib.request.Request(f"{self.base_url}/v1/models", method="GET")
+            urllib.request.urlopen(test_req, timeout=3)
+        except Exception as exc:
+            self.status.emit(f"NUC ASR 不可达：{exc}")
+            self.caption.emit("NUC ASR 不可达，请检查 NUC 是否在线")
+            self.finished.emit()
+            return
+
+        chunk_index = 0
+        transcribe_thread: Optional[threading.Thread] = None
+        transcribe_result: list[str] = []
+
+        def _transcribe_chunk(wav_path: Path, result_list: list[str], current_index: int) -> None:
+            """Run in background thread to overlap with next recording."""
+            try:
+                segments = _transcribe_via_nuc_asr(
+                    wav_path,
+                    base_url=self.base_url,
+                    timeout=int(self.chunk_seconds * 10),
+                )
+                
+                # Shift timestamps and accumulate
+                offset = current_index * self.chunk_seconds
+                shifted_segments = []
+                for seg in segments:
+                    shifted_seg = SubtitleSegment(
+                        start=seg.start + offset,
+                        end=seg.end + offset,
+                        text=seg.text
+                    )
+                    shifted_segments.append(shifted_seg)
+                
+                if shifted_segments:
+                    self._all_segments.extend(shifted_segments)
+                    self.segments_updated.emit(self._all_segments.copy())
+
+                text = " ".join(seg.text for seg in segments).strip()
+                result_list.append(text)
+            except Exception as exc:
+                result_list.append(f"[NUC ASR error: {exc}]")
+            finally:
+                if not self.save_audio:
+                    _safe_unlink(wav_path)
+
+        try:
+            while not self._stop:
+                # Record one chunk
+                if self.save_audio:
+                    chunk_wav = audio_dir / f"{chunk_index:03d}.wav"
+                else:
+                    chunk_wav = Path(tempfile.gettempdir()) / f"nuc-rt-chunk-{chunk_index}.wav"
+                    
+                record_ok = self._record_chunk(chunk_wav)
+
+                if self._stop:
+                    if not self.save_audio:
+                        _safe_unlink(chunk_wav)
+                    break
+
+                # Collect previous transcription result
+                if transcribe_thread is not None:
+                    transcribe_thread.join(timeout=self.chunk_seconds * 5)
+                    if transcribe_result:
+                        text = transcribe_result[-1]
+                        if text and not text.startswith("[NUC ASR error"):
+                            self.caption.emit(text)
+                        elif text:
+                            self.status.emit(text)
+                    transcribe_result.clear()
+
+                if not record_ok:
+                    if not self.save_audio:
+                        _safe_unlink(chunk_wav)
+                    self.status.emit("Recording failed, retrying...")
+                    time.sleep(0.5)
+                    continue
+
+                # Start transcription in background
+                transcribe_thread = threading.Thread(
+                    target=_transcribe_chunk,
+                    args=(chunk_wav, transcribe_result, chunk_index),
+                    daemon=True,
+                )
+                transcribe_thread.start()
+                chunk_index += 1
+
+            # Collect final result
+            if transcribe_thread is not None:
+                transcribe_thread.join(timeout=10)
+                if transcribe_result:
+                    text = transcribe_result[-1]
+                    if text and not text.startswith("[NUC ASR error"):
+                        self.caption.emit(text)
+
+        except Exception as exc:
+            self.status.emit(f"NUC realtime error: {exc}")
+        finally:
+            self.status.emit("NUC realtime stopped")
+            self._save_session_artifacts(chunk_index)
+            self.finished.emit()
+
+    def _save_session_artifacts(self, num_chunks: int) -> None:
+        """Save segments, transcript, and manifest. Concat audio if saved."""
+        if not self.session_dir or not self.session_dir.exists():
+            return
+            
+        try:
+            if self._all_segments:
+                save_segments(self.session_dir / "raw-segments.json", self._all_segments)
+                save_segments_as_txt(self.session_dir / "transcript-raw.txt", self._all_segments)
+                save_segments_as_srt(self.session_dir / "transcript.srt", self._all_segments)
+            
+            manifest = {
+                "start_time": self.session_dir.name,
+                "duration_seconds": num_chunks * self.chunk_seconds,
+                "num_chunks": num_chunks,
+                "chunk_seconds": self.chunk_seconds,
+                "model": "nuc_asr_large_v3",
+                "has_audio": self.save_audio,
+                "num_segments": len(self._all_segments),
+            }
+            with open(self.session_dir / "manifest.json", "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2, ensure_ascii=False)
+                
+            if self.save_audio and num_chunks > 0:
+                self._concat_audio_chunks(num_chunks)
+                
+            self.session_saved.emit(str(self.session_dir))
+        except Exception as exc:
+            self.status.emit(f"Error saving session artifacts: {exc}")
+
+    def _concat_audio_chunks(self, num_chunks: int) -> None:
+        """Concatenate individual chunks into full-audio.wav."""
+        audio_dir = self.session_dir / "audio"
+        list_file = self.session_dir / "concat_list.txt"
+        
+        try:
+            with open(list_file, "w", encoding="utf-8") as f:
+                for i in range(num_chunks):
+                    wav_path = audio_dir / f"{i:03d}.wav"
+                    if wav_path.exists():
+                        f.write(f"file '{wav_path.absolute()}'\n")
+                        
+            out_file = self.session_dir / "full-audio.wav"
+            cmd = [
+                FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "concat", "-safe", "0",
+                "-i", str(list_file),
+                "-c", "copy",
+                str(out_file)
+            ]
+            subprocess.run(cmd, check=True)
+        except Exception as exc:
+            self.status.emit(f"Error concatenating audio: {exc}")
+        finally:
+            _safe_unlink(list_file)
+
+    def stop(self) -> None:
+        self._stop = True
+        if self._recording_proc and self._recording_proc.poll() is None:
+            self._recording_proc.send_signal(signal.SIGTERM)
+            try:
+                self._recording_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._recording_proc.kill()
+        self._recording_proc = None
+
+    def _record_chunk(self, output_path: Path) -> bool:
+        """Record one chunk from Loopback via ffmpeg AVFoundation."""
+        cmd = [
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-f", "avfoundation",
+            "-i", f":{self.capture_id}",
+            "-t", str(self.chunk_seconds),
+            "-ac", "1",
+            "-ar", "16000",
+            "-y",
+            str(output_path),
+        ]
+        try:
+            self._recording_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            _, stderr = self._recording_proc.communicate(
+                timeout=self.chunk_seconds + 5
+            )
+            ok = self._recording_proc.returncode == 0 and output_path.exists()
+            if not ok and stderr:
+                self.status.emit(f"ffmpeg capture error: {stderr.strip()[:200]}")
+            self._recording_proc = None
+            return ok
+        except subprocess.TimeoutExpired:
+            if self._recording_proc:
+                self._recording_proc.kill()
+            self._recording_proc = None
+            return False
+        except Exception:
+            self._recording_proc = None
+            return False
+
+
+class RealtimePolishWorker(QObject):
+    """Batch polish segments from a realtime session using LLM."""
+
+    status = Signal(str)
+    polished_segments = Signal(list)
+    finished = Signal()
+
+    def __init__(
+        self,
+        session_dir: Path,
+        segments: list[SubtitleSegment],
+        provider: LLMProvider,
+        api_key: str,
+        api_url_override: str = "",
+        model_id_override: str = "",
+        batch_seconds: float = 30.0,
+    ) -> None:
+        super().__init__()
+        self.session_dir = session_dir
+        self.segments = segments
+        self.provider = provider
+        self.api_key = api_key
+        self.api_url_override = api_url_override
+        self.model_id_override = model_id_override
+        self.batch_seconds = batch_seconds
+        self._stop = False
+
+    def run(self) -> None:
+        if not self.segments:
+            self.finished.emit()
+            return
+
+        self.status.emit(f"开始 LLM 规整... ({len(self.segments)} 段)")
+        polished: list[SubtitleSegment] = []
+        batch: list[SubtitleSegment] = []
+        batch_start_time = self.segments[0].start
+
+        try:
+            for seg in self.segments:
+                if self._stop:
+                    break
+                batch.append(seg)
+                if seg.end - batch_start_time >= self.batch_seconds:
+                    self._process_batch(batch, polished)
+                    batch.clear()
+                    if self._stop:
+                        break
+                    batch_start_time = seg.end
+
+            if batch and not self._stop:
+                self._process_batch(batch, polished)
+
+            if not self._stop:
+                if polished:
+                    # Save results
+                    save_segments(self.session_dir / "polished-segments.json", polished)
+                    save_segments_as_txt(self.session_dir / "transcript-polished.txt", polished)
+                self.polished_segments.emit(polished)
+                self.status.emit("LLM 规整完成")
+
+        except Exception as exc:
+            self.status.emit(f"LLM 规整错误: {exc}")
+        finally:
+            self.finished.emit()
+
+    def _process_batch(self, batch: list[SubtitleSegment], polished_list: list[SubtitleSegment]) -> None:
+        self.status.emit(f"规整进度: {len(polished_list)} / {len(self.segments)}...")
+        corrected = llm_proofread(
+            batch,
+            self.provider,
+            self.api_key,
+            self.api_url_override,
+            self.model_id_override,
+            timeout=30,
+        )
+        polished_list.extend(corrected)
+
+    def stop(self) -> None:
+        self._stop = True
+
+
+class RealtimeReRecognizeWorker(QObject):
+    """Re-recognize full audio from a realtime session and optionally polish."""
+
+    status = Signal(str)
+    result_segments = Signal(list)
+    finished = Signal()
+
+    def __init__(
+        self,
+        session_dir: Path,
+        base_url: str,
+        provider: Optional[LLMProvider] = None,
+        api_key: str = "",
+        api_url_override: str = "",
+        model_id_override: str = "",
+    ) -> None:
+        super().__init__()
+        self.session_dir = session_dir
+        self.base_url = base_url
+        self.provider = provider
+        self.api_key = api_key
+        self.api_url_override = api_url_override
+        self.model_id_override = model_id_override
+
+    def run(self) -> None:
+        audio_file = self.session_dir / "full-audio.wav"
+        if not audio_file.exists():
+            self.status.emit("找不到完整的会话音频。")
+            self.finished.emit()
+            return
+
+        try:
+            self.status.emit("开始重新识别全量音频...")
+            segments = _transcribe_via_nuc_asr(
+                audio_file, base_url=self.base_url, timeout=600
+            )
+            
+            # Save new raw segments
+            save_segments(self.session_dir / "raw-segments.json", segments)
+            save_segments_as_txt(self.session_dir / "transcript-raw.txt", segments)
+            save_segments_as_srt(self.session_dir / "transcript.srt", segments)
+            
+            # Update manifest segment count
+            manifest_file = self.session_dir / "manifest.json"
+            if manifest_file.exists():
+                with open(manifest_file, "r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+                manifest["num_segments"] = len(segments)
+                with open(manifest_file, "w", encoding="utf-8") as f:
+                    json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+            if self.provider:
+                self.status.emit("开始重新 LLM 规整...")
+                # Polish the entire new segments
+                # For long sessions, might need batching, but let's reuse RealtimePolishWorker logic manually
+                polished: list[SubtitleSegment] = []
+                batch: list[SubtitleSegment] = []
+                batch_start_time = segments[0].start if segments else 0
+                
+                for seg in segments:
+                    batch.append(seg)
+                    if seg.end - batch_start_time >= 30.0:
+                        corrected = llm_proofread(
+                            batch, self.provider, self.api_key,
+                            self.api_url_override, self.model_id_override, timeout=30
+                        )
+                        polished.extend(corrected)
+                        batch.clear()
+                        batch_start_time = seg.end
+                        
+                if batch:
+                    corrected = llm_proofread(
+                        batch, self.provider, self.api_key,
+                        self.api_url_override, self.model_id_override, timeout=30
+                    )
+                    polished.extend(corrected)
+                    
+                save_segments(self.session_dir / "polished-segments.json", polished)
+                save_segments_as_txt(self.session_dir / "transcript-polished.txt", polished)
+                self.result_segments.emit(polished)
+                self.status.emit("重识别 + 规整完成")
+            else:
+                self.result_segments.emit(segments)
+                self.status.emit("重新识别完成")
+                
+        except Exception as exc:
+            self.status.emit(f"重识别错误: {exc}")
+        finally:
+            self.finished.emit()
+
+
 def emit_throttled_process_output(status_signal: Signal, line: str, state: dict) -> None:
     line = line.rstrip()
     if not line:
@@ -496,6 +986,11 @@ class QueueWorker(QObject):
                 )
             elif self.mode.backend == "sense_voice_cpp":
                 segments = self._transcribe_local_sense_voice_cpp_chunked(wav)
+                save_segments_as_txt(base.with_suffix(".txt"), segments)
+                save_segments_as_srt(base.with_suffix(".srt"), segments)
+            elif self.mode.backend == "nuc_asr":
+                self.status.emit("Transcribing with NUC remote ASR (faster-whisper CUDA)...")
+                segments = _transcribe_via_nuc_asr(wav, base_url=str(self.mode.model), timeout=300)
                 save_segments_as_txt(base.with_suffix(".txt"), segments)
                 save_segments_as_srt(base.with_suffix(".srt"), segments)
             else:
@@ -1138,6 +1633,12 @@ class RollingPrefetchWorker(QObject):
                 trailing_trim=0.0,
                 chunk_duration=self._sense_voice_chunk_window_seconds(),
             )
+            srt_path = chunk_out.with_suffix(".srt")
+            save_segments_as_srt(srt_path, segments)
+            return srt_path
+        if self.mode.backend == "nuc_asr":
+            self.status.emit(f"Transcribing chunk {chunk_label} with NUC remote ASR...")
+            segments = _transcribe_via_nuc_asr(chunk_wav, base_url=str(self.mode.model))
             srt_path = chunk_out.with_suffix(".srt")
             save_segments_as_srt(srt_path, segments)
             return srt_path
