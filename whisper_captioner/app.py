@@ -68,6 +68,7 @@ from whisper_captioner.config import (
     CACHE_DIR,
     DEFAULT_SUBTITLE_OFFSET,
     FFMPEG,
+    GENERATED_DIR,
     LOG_DIR,
     NOTES_DIR,
     WHISPER_STREAM,
@@ -213,6 +214,8 @@ class MainWindow(QMainWindow):
     def _load_settings(self) -> None:
         settings = QSettings("WhisperCaptioner", "App")
         saved_mode = str(settings.value("mode/key", "hq_turbo"))
+        if saved_mode == "nuc_qwen3_asr_7b":
+            saved_mode = "nuc_qwen3_asr_1p7b"
         mode_idx = self.mode_combo.findData(saved_mode)
         if mode_idx >= 0:
             self.mode_combo.setCurrentIndex(mode_idx)
@@ -364,7 +367,7 @@ class MainWindow(QMainWindow):
 
     def _video_output_dir(self) -> Path:
         source = self.url_input.text().strip() or self._controlled_url or self._note_base_name()
-        return source_output_dir(NOTES_DIR.parent, clean_title_for_filename(infer_source_title(source)))
+        return source_output_dir(GENERATED_DIR, clean_title_for_filename(infer_source_title(source)))
 
     def _save_shared_note_copy(self, task_key: str, text: str) -> Optional[Path]:
         note_dir = self._video_output_dir()
@@ -1758,6 +1761,8 @@ class App:
 
 
 if __name__ == "__main__":
-    from whisper_captioner.config import OUTPUT_DIR
+    from whisper_captioner.config import OUTPUT_DIR, apply_resource_environment
+
+    apply_resource_environment()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     sys.exit(App().run())

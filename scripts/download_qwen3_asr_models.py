@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 from huggingface_hub import snapshot_download
+from whisper_captioner.config import apply_resource_environment
 
 
 REPOS = [
@@ -13,6 +14,7 @@ REPOS = [
 
 
 def main() -> None:
+    apply_resource_environment()
     for repo in REPOS:
         print(f"=== {repo} ===", flush=True)
         last_exc: Exception | None = None

@@ -45,6 +45,18 @@ The project now has two primary runtime flows:
 5. Save `raw-segments.json`, `manifest.json`, and initial `.srt`/`.txt` exports.
 6. Trigger background LLM batch-polishing (`RealtimePolishWorker`) or full-audio re-transcription (`RealtimeReRecognizeWorker`) via the "实时回顾" UI tab.
 
+### 3. Remote NUC ASR Coexistence
+
+The NUC now runs two ASR lanes with explicit scheduling:
+
+1. The app still calls `:8000` for the default/realtime `faster-whisper` lane.
+2. `:8000` is now a lightweight busy-aware proxy that exposes `/health`, `/busy`, and `/v1/audio/transcriptions`.
+3. The proxy forwards real `faster-whisper-server` work to the internal backend on `:18000`.
+4. The optional `Qwen3-ASR 1.7B` offline lane remains app-facing on `:8001`, with its backend on `:8002`.
+5. `nuc-service-scheduler` reads Docker state, GPU memory, and the `:8000/busy` signal before admitting `Qwen` work.
+6. If `faster-whisper` has active requests, `Qwen` admission returns HTTP `429` so the realtime/default lane keeps priority.
+7. If `Qwen` is admitted, the scheduler starts the backend on demand and the proxy schedules idle shutdown after the request window.
+
 ## Current Dependency Map
 
 ```mermaid
@@ -118,6 +130,7 @@ Current role:
 Key observation:
 
 - This is the heaviest module and the best candidate for future splitting.
+- The NUC remote ASR calls remain intentionally simple HTTP clients; the service coexistence policy now lives on the NUC side instead of being duplicated in the desktop app.
 
 ### `whisper_captioner/cache.py`
 
@@ -196,6 +209,8 @@ Key observation:
 5. Temporary files and subprocess lifecycle cleanup are much better than before, but the code is still concentrated inside `workers.py`. The addition of multiple new realtime workers increases the surface area here.
 6. Chrome tab targeting still relies on prefix matching rather than stable tab identity.
 7. Remote NUC LAN inference introduces network availability risks (e.g., timeouts, connection drops) that are handled via graceful UI fallbacks, but add state complexity.
+8. The NUC service layer now includes container lifecycle control. Normal Qwen idle cleanup uses stop/start semantics, but deploy/recreate scripts should continue to be reviewed carefully because they change service topology.
+9. The `:8000` proxy preserves the public endpoint but adds one more hop; health checks must verify both proxy and upstream backend.
 
 ## Recommended Target Structure
 
@@ -361,8 +376,8 @@ At the current project state:
 ## Current Repository Packaging Status
 
 - The repository is now tracked in git and pushed to a private GitHub repository.
-- `third_party/` is intentionally not tracked.
-- Local `SenseVoice.cpp` setup is documented in `README.md` instead of being vendored into the repository.
+- Repo-local `third_party/` is intentionally not tracked.
+- Local `SenseVoice.cpp` setup is documented in `README.md` and now lives under `~/Movies/whisper-captioner_APP_Resource/third_party/` instead of being vendored into the repository.
 - `.gitignore` excludes:
   - model weights and binary model artifacts
   - `.env` and key-like local files

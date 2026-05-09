@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 from PySide6.QtCore import QSettings
 
-from whisper_captioner.config import OUTPUT_DIR, QWEN_CHAT_DIR
+from whisper_captioner.config import GENERATED_DIR, OUTPUT_DIR, QWEN_CHAT_DIR
 from whisper_captioner.llm_handler import llm_generate_text, llm_provider_ready
 from whisper_captioner.models import LLM_PROVIDERS, LLMProvider, SubtitleSegment
 from whisper_captioner.subtitle_io import (
@@ -1304,25 +1304,30 @@ class QwenChatServiceManager:
         excluded_roots = {
             self.storage_dir.resolve(),
             (OUTPUT_DIR / "cache").resolve(),
+            (OUTPUT_DIR / "artifacts" / "logs").resolve(),
+            (OUTPUT_DIR / "artifacts" / "notes").resolve(),
             (OUTPUT_DIR / "logs").resolve(),
             (OUTPUT_DIR / "notes").resolve(),
         }
-        for path in sorted(OUTPUT_DIR.rglob("*")):
-            if path.suffix.lower() not in {".srt", ".vtt", ".txt"}:
-                continue
-            try:
-                resolved = path.resolve()
-            except OSError:
-                continue
-            if any(root == resolved or root in resolved.parents for root in excluded_roots):
-                continue
-            asset = self._asset_from_path(path, "历史生成")
-            if asset and asset["id"] not in seen:
-                seen.add(asset["id"])
-                key = self._asset_dedupe_key(asset)
-                existing = dedupe.get(key)
-                if existing is None or self._prefer_asset(asset, existing):
-                    dedupe[key] = asset
+        scan_roots: list[Path] = [GENERATED_DIR] if GENERATED_DIR.exists() else []
+
+        for root_dir in scan_roots:
+            for path in sorted(root_dir.rglob("*")):
+                if path.suffix.lower() not in {".srt", ".vtt", ".txt"}:
+                    continue
+                try:
+                    resolved = path.resolve()
+                except OSError:
+                    continue
+                if any(root == resolved or root in resolved.parents for root in excluded_roots):
+                    continue
+                asset = self._asset_from_path(path, "历史生成")
+                if asset and asset["id"] not in seen:
+                    seen.add(asset["id"])
+                    key = self._asset_dedupe_key(asset)
+                    existing = dedupe.get(key)
+                    if existing is None or self._prefer_asset(asset, existing):
+                        dedupe[key] = asset
 
         assets = list(dedupe.values())
         assets.sort(key=lambda item: (item["source_label"] != "手动上传", item["filename"].lower()))

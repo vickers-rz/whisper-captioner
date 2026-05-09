@@ -30,6 +30,18 @@ The project has been split out of the original single-file prototype:
 - `whisper_captioner/mlx_terms.py`: local Rapid-MLX/MLX term extraction helper, currently not part of the main Gemini full-document pipeline.
 - `whisper_captioner/qwen_chat_service.py`: local subtitle post-processing web workspace for Qwen3-8B / Gemini chat, manual subtitle upload, and second-stage-only cleanup or article rewriting.
 
+Runtime layout:
+
+- `~/Movies/WhisperCaptioner/artifacts/generated/`: generated subtitle, transcript, and shared Markdown outputs grouped by source title.
+- `~/Movies/WhisperCaptioner/artifacts/logs/`: application logs.
+- `~/Movies/WhisperCaptioner/artifacts/notes/`: standalone note exports that are not tied to a generated subtitle folder.
+- `~/Movies/WhisperCaptioner/cache/`: per-source processing caches and final segment JSON.
+- `~/Movies/WhisperCaptioner/qwen-chat/`: web workspace uploads, storage, and action exports.
+- `~/Movies/WhisperCaptioner/realtime/`: persisted realtime session audio and review manifests.
+- `~/Movies/whisper-captioner_APP_Resource/whisper-models/`: local Whisper model binaries.
+- `~/Movies/whisper-captioner_APP_Resource/third_party/`: local third-party source checkouts and built binaries used by optional backends.
+- `~/Movies/whisper-captioner_APP_Resource/huggingface-cache/`: Hugging Face / MLX model cache used by `huggingface_hub`, `mlx-audio`, and related downloads.
+
 ## Current Stability Notes
 
 Recent maintenance focused on the controlled URL path and smaller-screen usability:
@@ -43,6 +55,7 @@ Recent maintenance focused on the controlled URL path and smaller-screen usabili
 ## Modes
 
 - `NUC faster-whisper large-v3（远程 CUDA）`: highest-performance remote inference via NUC RTX 3080 Ti.
+- `NUC Qwen3-ASR 1.7B（远程高质量离线）`: remote high-quality offline mode for long audio, queued on the NUC and kept separate from realtime ASR.
 - `实时字幕 NUC large-v3（远程 CUDA，3s延迟）`: low-latency realtime mode offloaded to the NUC, with full session persistence.
 - `实时字幕 whisper.cpp small（SoundSource/Loopback）`: lowest-latency local realtime mode for Loopback-routed Chrome or local player audio.
 - `实时字幕 whisper.cpp q5_0（large-v3-turbo）`: higher-quality local realtime mode when you can tolerate a bit more latency.
@@ -92,7 +105,7 @@ The local Qwen web entry has been expanded into a subtitle post-processing works
 What it can do:
 
 - Upload third-party `.srt`, `.vtt`, or `.txt` files without running the transcription pipeline.
-- Scan previously generated subtitle files under `~/Movies/WhisperCaptioner` and show them in a history sidebar.
+- Scan previously generated subtitle files under `~/Movies/WhisperCaptioner/artifacts/generated/` and show them in a history sidebar.
 - Attach any uploaded or historical subtitle file to a work conversation.
 - Chat with the LLM grounded on the attached subtitle content.
 - Run one-click `语句规整` or `转写成文稿` actions on the attached subtitle.
@@ -128,6 +141,15 @@ Some third-party speech tools may emit transient sidecar files such as `fbank_lf
 - These runtime artifacts are not treated as source files.
 - The repository ignores known generated artifacts.
 - Selected subprocesses are launched with `cwd=~/Movies/WhisperCaptioner` so those files land in the output area instead of polluting the source tree.
+
+## Artifact Migration
+
+Generated subtitle and transcript outputs now default to `~/Movies/WhisperCaptioner/artifacts/generated/`.
+
+- New queue exports, controlled subtitle exports, and shared per-video Markdown copies are written there.
+- The web workspace scans this location directly for historical generated subtitle assets.
+- `hallucination_blocklist.txt`, `cache/`, `qwen-chat/`, and `realtime/` remain at the top level because they are runtime state, not exported deliverables.
+- Optional local models, third-party backends, and Hugging Face cache now live under `~/Movies/whisper-captioner_APP_Resource/`.
 
 ## Local Benchmark Notes
 
@@ -177,10 +199,94 @@ For short 5.5s mixed Chinese/English/Tech audio chunks (typical of realtime chun
 
 The app natively integrates with an external Intel NUC equipped with an NVIDIA RTX 3080 Ti via LAN (e.g., `192.168.31.196`) to dramatically accelerate inference.
 
-- **NUC ASR**: Powered by `faster-whisper-server` (Docker) exposing an OpenAI-compatible `/v1/audio/transcriptions` endpoint on port `8000`.
+- **NUC ASR**: App-facing `:8000` remains an OpenAI-compatible `/v1/audio/transcriptions` endpoint. In the current NUC layout it is fronted by a thin busy-aware proxy, which forwards real transcription to the internal `faster-whisper-server` backend on `:18000`.
+- **NUC High-Quality ASR**: Optional `Qwen3-ASR 1.7B` path exposed through a separate proxy on port `8001`, intended for single-concurrency long-audio offline jobs rather than realtime chunks.
 - **NUC LLM**: Powered by native `Ollama` exposing `/api/chat` on port `11434`. Models like `qwen3:14b` run 6.5x faster than local Rapid-MLX on the Mac.
 
 To use this, simply select a `nuc_asr` or `nuc_ollama` provider from the app UI dropdowns. The app implements automatic timeouts and fallbacks to ensure local Mac usability if the NUC is offline.
+
+Current NUC port map:
+
+- `:8000`: app-facing realtime/default ASR lane; busy-aware proxy that also exposes `/health` and `/busy`.
+- `:18000`: internal `faster-whisper-server` backend used by the `:8000` proxy.
+- `:8001`: app-facing `Qwen3-ASR 1.7B` high-quality offline proxy.
+- `:8002`: debug-accessible `Qwen3-ASR 1.7B` backend served by official `qwen-asr-serve`.
+- `:11434`: Ollama LLM API.
+
+### NUC Qwen3-ASR 1.7B Deployment
+
+For a higher-quality long-audio path that does not replace the stable realtime `faster-whisper` service:
+
+```bash
+bash /Users/vickers/whisper-captioner/scripts/nuc_deploy_qwen3_asr_1p7b.sh
+```
+
+This deploys:
+
+- a local-only service scheduler sidecar that can start/stop the `Qwen3-ASR 1.7B` backend on demand
+- an official `qwen-asr-serve` backend on port `8002`
+- a lightweight serializing proxy on port `8001`
+- single-concurrency admission with a GPU-free-memory guard and `faster-whisper` busy-awareness
+- automatic backend warm-start before a request and idle backend shutdown after the request window expires
+
+To make `Qwen` automatically yield while `:8000` is handling a realtime `faster-whisper` request, enable the ASR busy proxy on the NUC:
+
+```bash
+bash /Users/vickers/whisper-captioner/scripts/nuc_enable_asr_busy_proxy.sh
+```
+
+This keeps `:8000` as the app-facing endpoint, but turns it into a tiny front proxy that:
+
+- counts active `faster-whisper` requests
+- exposes `/busy` for the scheduler
+- forwards real transcription work to an internal backend on `:18000`
+
+Admission behavior:
+
+- When `:8000/busy` reports active requests, `:8001` rejects new `Qwen` work with HTTP `429` so realtime/default ASR wins.
+- When the busy endpoint is unavailable, the scheduler falls back to GPU utilization as a conservative signal.
+- When free GPU memory is below `MIN_FREE_MB_TO_START_QWEN`, `:8001` rejects with HTTP `503`.
+- After a `Qwen` request finishes, the backend is stopped after the idle timeout so it does not sit on VRAM.
+
+Validated coexistence check:
+
+```bash
+curl -fsS http://127.0.0.1:8000/busy
+curl -fsS http://127.0.0.1:8001/healthz
+```
+
+During an active `:8000` transcription, `/busy` should report `active_requests: 1`, and a concurrent `:8001` transcription request should be deferred with HTTP `429`.
+
+### NUC GPU Guard Helper
+
+When the NUC GPU gets pinned by `Qwen3-ASR 1.7B` or `faster-whisper`, use:
+
+```bash
+bash /Users/vickers/whisper-captioner/scripts/nuc_gpu_memory_guard.sh status
+bash /Users/vickers/whisper-captioner/scripts/nuc_gpu_memory_guard.sh auto-clean
+bash /Users/vickers/whisper-captioner/scripts/nuc_gpu_memory_guard.sh prep-asr
+bash /Users/vickers/whisper-captioner/scripts/nuc_gpu_memory_guard.sh idle-watch
+bash /Users/vickers/whisper-captioner/scripts/nuc_gpu_memory_guard.sh unload-all
+bash /Users/vickers/whisper-captioner/scripts/nuc_gpu_memory_guard.sh start-qwen
+```
+
+Notes:
+
+- `auto-clean` only stops the `Qwen3-ASR 1.7B` proxy/backend containers when free GPU memory drops below the threshold.
+- `prep-asr` first frees Qwen GPU occupancy if needed, then checks `faster-whisper` and restarts only `nuc-asr` if health is still bad.
+- `idle-watch` is the low-risk “use it and turn it off” helper: it proactively stops `Qwen3-ASR 1.7B` when left running, while leaving `faster-whisper` to its own built-in idle offload unless health is bad.
+- `unload-all` stops both ASR lanes and frees GPU memory without deleting the containers.
+- `start-qwen` first tries `docker start` on the existing `Qwen3-ASR 1.7B` containers, and only falls back to redeploy if they no longer exist.
+- If a container does not stop cleanly, the script escalates from `docker stop` to `docker kill`, but it does not remove containers.
+
+The first deploy may take a while because the official image is large and Docker needs to pull it before the backend can start.
+
+Operational intent:
+
+- keep `:8000` `faster-whisper` as the default realtime / daily ASR lane
+- use `NUC Qwen3-ASR 1.7B（远程高质量离线）` only for batch-style long audio
+- let the service scheduler handle ordinary Qwen warm-start, admission, and idle-stop behavior automatically
+- do not assume `Qwen3-ASR 1.7B` can stably coexist with heavy `14B` Ollama traffic under peak GPU load
 
 ## Realtime Session Persistence & Review
 
@@ -243,14 +349,15 @@ Current app behavior:
 ## Requirements
 
 - Loopback input device: `Whisper Captions`, visible to AVFoundation as audio device `0`.
-- Whisper models in `/Users/vickers/whisper-models`.
+- Whisper models in `~/Movies/whisper-captioner_APP_Resource/whisper-models`.
+- Hugging Face cache in `~/Movies/whisper-captioner_APP_Resource/huggingface-cache`.
 - `whisper-stream`, `whisper-cli`, `ffmpeg`, `ffprobe`, and `yt-dlp`.
 - Conda env `pyside6` for the GUI.
-- Local SenseVoice.cpp checkout and GGUF model under `/Users/vickers/whisper-captioner/third_party/SenseVoice.cpp` if you want the `SenseVoice.cpp FP16` backend.
+- Local SenseVoice.cpp checkout and GGUF model under `~/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp` if you want the `SenseVoice.cpp FP16` backend.
 
 ### SenseVoice.cpp Setup
 
-`third_party/` is intentionally not tracked in this repository.
+The local SenseVoice.cpp checkout is intentionally not tracked in this repository and now lives under the separate app resource area instead of inside the repo tree.
 
 If you want the `SenseVoice.cpp FP16` backend, clone and build SenseVoice.cpp locally first:
 
@@ -260,8 +367,8 @@ If you want the `SenseVoice.cpp FP16` backend, clone and build SenseVoice.cpp lo
 Recommended local path for this project:
 
 ```bash
-git clone https://github.com/lovemefan/SenseVoice.cpp /Users/vickers/whisper-captioner/third_party/SenseVoice.cpp
-cd /Users/vickers/whisper-captioner/third_party/SenseVoice.cpp
+git clone https://github.com/lovemefan/SenseVoice.cpp ~/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp
+cd ~/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp
 cmake -B build
 cmake --build build -j
 ```

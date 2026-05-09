@@ -3,7 +3,7 @@ set -u
 
 WHISPER_STREAM="${WHISPER_STREAM:-/opt/homebrew/bin/whisper-stream}"
 FFMPEG="${FFMPEG:-/opt/homebrew/bin/ffmpeg}"
-MODEL="${MODEL:-/Users/vickers/whisper-models/ggml-small.bin}"
+MODEL="${MODEL:-$HOME/Movies/whisper-captioner_APP_Resource/whisper-models/ggml-small.bin}"
 
 RUN_PIDS=()
 TMP_FILES=()

@@ -10,8 +10,9 @@ from .config import (
     NUC_OLLAMA_HOST,
     NUC_OLLAMA_PORT,
     NUC_ASR_PORT,
+    NUC_QWEN3_ASR_PORT,
     QWEN3_ASR_06B_4BIT_MLX_MODEL,
-    QWEN3_ASR_17B_8BIT_MLX_MODEL,
+    QWEN3_ASR_1P7B_8BIT_MLX_MODEL,
     RAPIDMLX_HOST,
     RAPIDMLX_PORT,
     RAPIDMLX_8B_PORT,
@@ -105,9 +106,9 @@ MODES = [
         "mlx_audio",
     ),
     CaptionMode(
-        "qwen3_asr_17b_8bit_mlx",
+        "qwen3_asr_1p7b_8bit_mlx",
         "Qwen3-ASR 1.7B 8bit（高质量）",
-        QWEN3_ASR_17B_8BIT_MLX_MODEL,
+        QWEN3_ASR_1P7B_8BIT_MLX_MODEL,
         False,
         ("-l", "zh"),
         "mlx_audio",
@@ -156,6 +157,14 @@ MODES = [
         False,
         ("-l", "zh"),
         "nuc_asr",
+    ),
+    CaptionMode(
+        "nuc_qwen3_asr_1p7b",
+        "NUC Qwen3-ASR 1.7B（远程高质量离线）",
+        f"http://{NUC_OLLAMA_HOST}:{NUC_QWEN3_ASR_PORT}",
+        False,
+        ("-l", "zh"),
+        "nuc_qwen3_asr_1p7b",
     ),
 ]
 

@@ -31,6 +31,7 @@ from whisper_captioner.config import (
     DEFAULT_SUBTITLE_OFFSET,
     FFMPEG,
     FFPROBE,
+    GENERATED_DIR,
     MLX_AUDIO_STT,
     MLX_WHISPER,
     MLX_TERMS_SCRIPT,
@@ -171,7 +172,11 @@ def _probe_audio_duration(audio_path: Path) -> float:
 
 
 def qwen3_asr_mode(mode: CaptionMode) -> bool:
-    return mode.key in {"qwen3_asr_06b_4bit_mlx", "qwen3_asr_17b_8bit_mlx"}
+    return mode.key in {"qwen3_asr_06b_4bit_mlx", "qwen3_asr_1p7b_8bit_mlx"}
+
+
+def nuc_qwen3_asr_1p7b_mode(mode: CaptionMode) -> bool:
+    return mode.backend == "nuc_qwen3_asr_1p7b"
 
 
 def _transcribe_via_nuc_asr(
@@ -195,6 +200,70 @@ def _transcribe_via_nuc_asr(
 
     body_parts = []
     for field_name, field_value in [("model", "large-v3"), ("language", language), ("response_format", response_format)]:
+        body_parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{field_name}"\r\n\r\n'
+            f"{field_value}\r\n"
+        )
+    body_parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: audio/wav\r\n\r\n"
+    )
+    body = b""
+    for part in body_parts:
+        body += part.encode("utf-8")
+    body += audio_data
+    body += f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    segments: list[SubtitleSegment] = []
+    if response_format == "verbose_json":
+        for seg in data.get("segments", []):
+            text = seg.get("text", "").strip()
+            if text:
+                segments.append(SubtitleSegment(seg["start"], seg["end"], text))
+    else:
+        text = data.get("text", "").strip()
+        if text:
+            duration = data.get("duration", 30.0)
+            segments.append(SubtitleSegment(0.0, duration, text))
+    return segments
+
+
+def _transcribe_via_nuc_qwen3_asr_1p7b(
+    audio_path: Path,
+    base_url: str = "",
+    language: str = "zh",
+    response_format: str = "verbose_json",
+    timeout: int = 900,
+) -> list[SubtitleSegment]:
+    """Send an audio file to the NUC Qwen3-ASR 1.7B proxy and return pseudo-timestamped segments."""
+    import urllib.request
+    import uuid
+
+    if not base_url:
+        base_url = f"http://{NUC_OLLAMA_HOST}:8001"
+    url = f"{base_url}/v1/audio/transcriptions"
+
+    boundary = uuid.uuid4().hex
+    audio_data = audio_path.read_bytes()
+    filename = audio_path.name
+
+    body_parts = []
+    for field_name, field_value in [
+        ("model", "qwen3-asr-1p7b"),
+        ("language", language),
+        ("response_format", response_format),
+    ]:
         body_parts.append(
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="{field_name}"\r\n\r\n'
@@ -907,7 +976,7 @@ class QueueWorker(QObject):
 
         source_title = infer_source_title(source)
         safe_name = clean_title_for_filename(source_title)
-        output_dir = source_output_dir(OUTPUT_DIR, source_title)
+        output_dir = source_output_dir(GENERATED_DIR, source_title)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         base = output_dir / f"{safe_name}-{stamp}"
         self._temp_paths = []
@@ -995,6 +1064,11 @@ class QueueWorker(QObject):
                 segments = _transcribe_via_nuc_asr(wav, base_url=str(self.mode.model), timeout=300)
                 save_segments_as_txt(base.with_suffix(".txt"), segments)
                 save_segments_as_srt(base.with_suffix(".srt"), segments)
+            elif self.mode.backend == "nuc_qwen3_asr_1p7b":
+                self.status.emit("Transcribing with NUC remote Qwen3-ASR 1.7B (high-quality offline)...")
+                segments = self._transcribe_nuc_qwen3_asr_1p7b_chunked(wav, base_url=str(self.mode.model))
+                save_segments_as_txt(base.with_suffix(".txt"), segments)
+                save_segments_as_srt(base.with_suffix(".srt"), segments)
             else:
                 self._run(
                     [
@@ -1065,6 +1139,47 @@ class QueueWorker(QObject):
             offset += remaining
             chunk_index += 1
         return all_segments
+
+    def _transcribe_nuc_qwen3_asr_1p7b_chunked(self, wav: Path, base_url: str) -> list[SubtitleSegment]:
+        duration = self._get_duration(wav)
+        chunk_seconds = 30.0
+        overlap_seconds = 2.0
+        all_segments: list[SubtitleSegment] = []
+        offset = 0.0
+        chunk_index = 0
+        while offset < duration and not self._stop:
+            actual_start = max(0.0, offset - (overlap_seconds if chunk_index > 0 else 0.0))
+            leading_trim = offset - actual_start
+            remaining = min(chunk_seconds + leading_trim + overlap_seconds, duration - actual_start)
+            chunk_wav = self._track_temp_path(Path(tempfile.gettempdir()) / f"{wav.stem}-nuc-qwen3-chunk{chunk_index}.wav")
+            self._run(
+                [
+                    FFMPEG,
+                    "-hide_banner",
+                    "-y",
+                    "-ss", str(actual_start),
+                    "-t", str(remaining),
+                    "-i", str(wav),
+                    "-ac", "1",
+                    "-ar", "16000",
+                    str(chunk_wav),
+                ],
+                f"Preparing NUC Qwen3-ASR 1.7B chunk {chunk_index}",
+            )
+            raw_segments = _transcribe_via_nuc_qwen3_asr_1p7b(chunk_wav, base_url=base_url, timeout=900)
+            trimmed = self._trim_overlap_segments(
+                raw_segments,
+                leading_trim=leading_trim,
+                trailing_trim=overlap_seconds if actual_start + remaining < duration else 0.0,
+                chunk_duration=remaining,
+            )
+            all_segments.extend(
+                SubtitleSegment(segment.start + actual_start, segment.end + actual_start, segment.text)
+                for segment in trimmed
+            )
+            offset += chunk_seconds
+            chunk_index += 1
+        return self._merge_near_duplicate_segments(all_segments)
 
     def _transcribe_local_sense_voice_cpp_chunked(self, wav: Path) -> list[SubtitleSegment]:
         duration = self._get_duration(wav)
@@ -1173,6 +1288,45 @@ class QueueWorker(QObject):
             if text and end > start:
                 trimmed.append(SubtitleSegment(start, end, text))
         return trimmed
+
+    @staticmethod
+    def _trim_overlap_segments(
+        segments: list[SubtitleSegment],
+        leading_trim: float,
+        trailing_trim: float,
+        chunk_duration: float,
+    ) -> list[SubtitleSegment]:
+        trimmed: list[SubtitleSegment] = []
+        upper_bound = max(0.0, chunk_duration - trailing_trim)
+        for segment in segments:
+            start = max(segment.start, leading_trim)
+            end = min(segment.end, upper_bound)
+            text = segment.text.strip()
+            if text and end > start:
+                trimmed.append(SubtitleSegment(start, end, text))
+        return trimmed
+
+    @staticmethod
+    def _merge_near_duplicate_segments(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
+        if not segments:
+            return []
+        ordered = sorted(segments, key=lambda item: (item.start, item.end))
+        merged: list[SubtitleSegment] = [ordered[0]]
+        for segment in ordered[1:]:
+            previous = merged[-1]
+            if (
+                segment.text == previous.text
+                and abs(segment.start - previous.start) <= 1.5
+                and abs(segment.end - previous.end) <= 1.5
+            ):
+                merged[-1] = SubtitleSegment(
+                    min(previous.start, segment.start),
+                    max(previous.end, segment.end),
+                    previous.text,
+                )
+                continue
+            merged.append(segment)
+        return merged
 
     @staticmethod
     def _get_duration(audio_path: Path) -> float:
@@ -1648,6 +1802,18 @@ class RollingPrefetchWorker(QObject):
             srt_path = chunk_out.with_suffix(".srt")
             save_segments_as_srt(srt_path, segments)
             return srt_path
+        if self.mode.backend == "nuc_qwen3_asr_1p7b":
+            self.status.emit(f"Transcribing chunk {chunk_label} with NUC remote Qwen3-ASR 1.7B...")
+            segments = _transcribe_via_nuc_qwen3_asr_1p7b(chunk_wav, base_url=str(self.mode.model))
+            segments = self._trim_overlap_segments(
+                segments,
+                leading_trim=0.0,
+                trailing_trim=0.0,
+                chunk_duration=float(self.chunk_seconds),
+            )
+            srt_path = chunk_out.with_suffix(".srt")
+            save_segments_as_srt(srt_path, segments)
+            return srt_path
         self._run_cmd(
             [
                 WHISPER_CLI,
@@ -1798,15 +1964,15 @@ class RollingPrefetchWorker(QObject):
 
     def _output_base(self, stamp: str) -> Path:
         title = clean_title_for_filename(self._source_title())
-        return source_output_dir(OUTPUT_DIR, title) / f"{title}-{self._output_variant_suffix()}-{stamp}"
+        return source_output_dir(GENERATED_DIR, title) / f"{title}-{self._output_variant_suffix()}-{stamp}"
 
     def _raw_output_base(self, stamp: str) -> Path:
         title = clean_title_for_filename(self._source_title())
-        return source_output_dir(OUTPUT_DIR, title) / f"{title}-{self._output_variant_suffix()}-原始识别字幕"
+        return source_output_dir(GENERATED_DIR, title) / f"{title}-{self._output_variant_suffix()}-原始识别字幕"
 
     def _optimized_output_base(self, stamp: str) -> Path:
         title = clean_title_for_filename(self._source_title())
-        return source_output_dir(OUTPUT_DIR, title) / f"{title}-{self._output_variant_suffix()}-LLM优化字幕"
+        return source_output_dir(GENERATED_DIR, title) / f"{title}-{self._output_variant_suffix()}-LLM优化字幕"
 
     def _output_variant_suffix(self) -> str:
         parts = [clean_title_for_filename(self.mode.key, fallback="mode")]
