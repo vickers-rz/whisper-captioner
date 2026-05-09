@@ -951,17 +951,7 @@ CHAT_HTML = """<!doctype html>
 """
 
 
-SUPPORTED_PROVIDER_KEYS = {
-    "local_rapidmlx_8b",
-    "gpt4o_mini",
-    "gpt4o",
-    "deepseek",
-    "gemini_flash",
-    "gemini_pro",
-    "minimax_m27",
-    "claude_sonnet",
-    "custom",
-}
+SUPPORTED_PROVIDER_KEYS = {p.key for p in LLM_PROVIDERS}
 DEFAULT_PROVIDER_KEY = "local_rapidmlx_8b"
 LONG_CONTEXT_CHAR_THRESHOLD = 45000
 LONG_CONTEXT_SEGMENT_THRESHOLD = 1200
@@ -1204,17 +1194,7 @@ class QwenChatServiceManager:
         settings = QSettings("WhisperCaptioner", "App")
         provider_map = self._provider_map()
         providers = []
-        ordered_keys = (
-            "local_rapidmlx_8b",
-            "gpt4o_mini",
-            "gpt4o",
-            "deepseek",
-            "gemini_flash",
-            "gemini_pro",
-            "minimax_m27",
-            "claude_sonnet",
-            "custom",
-        )
+        ordered_keys = tuple(p.key for p in LLM_PROVIDERS)
         for key in ordered_keys:
             provider = provider_map[key]
             api_key = str(settings.value(f"llm/apikey/{provider.key}", ""))

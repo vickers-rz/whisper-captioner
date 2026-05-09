@@ -20,6 +20,7 @@ from whisper_captioner.config import (
     RAPIDMLX_MODEL,
     RAPIDMLX_PORT,
     RAPIDMLX_SERVED_MODEL,
+    OUTPUT_DIR,
 )
 from whisper_captioner.models import LLMProvider, SubtitleSegment
 from whisper_captioner.subtitle_io import overlapping_segments
@@ -124,6 +125,7 @@ def ensure_local_rapidmlx_server(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            cwd=str(OUTPUT_DIR),
         )
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

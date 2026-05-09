@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 HOME = Path.home()
+PROJECT_ROOT = Path(__file__).parent.parent
 MODELS_DIR = HOME / "whisper-models"
 OUTPUT_DIR = HOME / "Movies" / "WhisperCaptioner"
 CACHE_DIR = OUTPUT_DIR / "cache"
@@ -11,6 +12,7 @@ REALTIME_DIR = OUTPUT_DIR / "realtime"
 LOG_DIR = OUTPUT_DIR / "logs"
 NOTES_DIR = OUTPUT_DIR / "notes"
 QWEN_CHAT_DIR = OUTPUT_DIR / "qwen-chat"
+HALLUCINATION_BLOCKLIST_PATH = OUTPUT_DIR / "hallucination_blocklist.txt"
 
 REALTIME_CHUNK_SECONDS = 3.0
 REALTIME_POLISH_BATCH_SECONDS = 30.0
@@ -22,8 +24,8 @@ MLX_AUDIO_STT = "/opt/anaconda3/envs/pyside6/bin/mlx_audio.stt.generate"
 FFMPEG = "/opt/homebrew/bin/ffmpeg"
 YT_DLP = "/opt/homebrew/bin/yt-dlp"
 FFPROBE = "/opt/homebrew/bin/ffprobe"
-SENSE_VOICE_CPP_MAIN = "/Users/vickers/whisper-captioner/third_party/SenseVoice.cpp/build/bin/sense-voice-main"
-SENSE_VOICE_CPP_FP16_MODEL = "/Users/vickers/whisper-captioner/third_party/SenseVoice.cpp/models/sense-voice-gguf/sense-voice-small-fp16.gguf"
+SENSE_VOICE_CPP_MAIN = str(PROJECT_ROOT / "third_party/SenseVoice.cpp/build/bin/sense-voice-main")
+SENSE_VOICE_CPP_FP16_MODEL = str(PROJECT_ROOT / "third_party/SenseVoice.cpp/models/sense-voice-gguf/sense-voice-small-fp16.gguf")
 
 RAPIDMLX_PYTHON = "/opt/anaconda3/envs/rapidmlx/bin/python"
 RAPIDMLX_BIN = "/opt/anaconda3/envs/rapidmlx/bin/rapid-mlx"
@@ -37,6 +39,7 @@ RAPIDMLX_8B_SERVED_MODEL = "qwen3-8b-mlx"
 
 NUC_OLLAMA_HOST = "192.168.31.196"
 NUC_OLLAMA_PORT = "11434"
+NUC_ASR_PORT = "8000"
 
 MLX_TERMS_SCRIPT = Path(__file__).with_name("mlx_terms.py")
 

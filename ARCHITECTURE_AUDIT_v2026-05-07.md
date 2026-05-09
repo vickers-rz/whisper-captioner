@@ -19,9 +19,11 @@ This document captures the current code structure, the main runtime flows, and t
   - `whisper_captioner/config.py`
   - UI builder / panel modules
 
-## Current Mainline
+## Current Mainlines
 
-The current recommended mainline is the controlled URL captions path:
+The project now has two primary runtime flows:
+
+### 1. Controlled URL Captions
 
 1. Read URL from the input box, selected queue item, or current Chrome tab.
 2. Canonicalize the media URL and derive a cache directory.
@@ -34,14 +36,26 @@ The current recommended mainline is the controlled URL captions path:
 9. Save final subtitle cache plus exported `.srt` and `.txt`.
 10. Start controlled playback and drive the subtitle overlay from Chrome `currentTime`.
 
+### 2. Realtime Session Captures
+
+1. Start Loopback capture and begin 3s rolling chunk transcription (`NUCRealtimeWorker` / `RealtimeWorker`).
+2. Stream segments to the floating `SubtitleOverlay` for low-latency display.
+3. Persist 3s `.wav` chunks directly to a timestamped `~/Movies/WhisperCaptioner/realtime/YYYYMMDD-HHMMSS/audio/` directory.
+4. On stop, concatenate all chunks into a `full-audio.wav`.
+5. Save `raw-segments.json`, `manifest.json`, and initial `.srt`/`.txt` exports.
+6. Trigger background LLM batch-polishing (`RealtimePolishWorker`) or full-audio re-transcription (`RealtimeReRecognizeWorker`) via the "实时回顾" UI tab.
+
 ## Current Dependency Map
 
 ```mermaid
 graph TD
     A["app.py / MainWindow"] --> B["workers.py / RealtimeWorker"]
+    A --> B2["workers.py / NUCRealtimeWorker"]
     A --> C["workers.py / QueueWorker"]
     A --> D["workers.py / RollingPrefetchWorker"]
     A --> E["workers.py / LLMTextWorker"]
+    A --> E2["workers.py / RealtimePolishWorker"]
+    A --> E3["workers.py / RealtimeReRecognizeWorker"]
     A --> F["overlay.py / SubtitleOverlay"]
     A --> G["chrome_control.py"]
     A --> H["subtitle_io.py"]
@@ -66,6 +80,7 @@ graph TD
 
     M --> N["analysis_panel.py"]
     M --> O["transcript_panel.py"]
+    M --> P["build_realtime_review_panel"]
     M --> K
 ```
 
@@ -91,11 +106,13 @@ Key observation:
 Current role:
 
 - realtime whisper-stream capture
+- realtime NUC Loopback capture (`NUCRealtimeWorker`)
 - queue/local transcription
 - controlled URL pipeline
+- realtime session LLM polishing and full re-recognition (`RealtimePolishWorker`, `RealtimeReRecognizeWorker`)
 - chunking strategies
 - subprocess execution
-- backend dispatch
+- backend dispatch (local and LAN HTTP)
 - final subtitle export
 
 Key observation:
@@ -161,6 +178,7 @@ Current role:
 
 - provider abstraction
 - local Rapid-MLX bootstrap
+- native Ollama REST API integration with think block stripping
 - subtitle proofreading
 - free-form analysis generation
 - native/reference fusion support
@@ -175,8 +193,9 @@ Key observation:
 2. `QueueWorker` and `RollingPrefetchWorker` duplicate backend-specific transcription logic.
 3. `RollingPrefetchWorker` is named and documented like a rolling pipeline, but the current implementation behaves closer to controlled batch processing that starts playback once final subtitles are ready.
 4. Cache validation is stronger now, but cache payload formats are still split across plain segment lists and richer JSON payloads.
-5. Temporary files and subprocess lifecycle cleanup are much better than before, but the code is still concentrated inside `workers.py`.
+5. Temporary files and subprocess lifecycle cleanup are much better than before, but the code is still concentrated inside `workers.py`. The addition of multiple new realtime workers increases the surface area here.
 6. Chrome tab targeting still relies on prefix matching rather than stable tab identity.
+7. Remote NUC LAN inference introduces network availability risks (e.g., timeouts, connection drops) that are handled via graceful UI fallbacks, but add state complexity.
 
 ## Recommended Target Structure
 
@@ -248,6 +267,10 @@ Work:
 - Normalize `youtube.com/shorts/<id>` to `watch?v=<id>`.
 - Normalize `youtube.com/live/<id>` to `watch?v=<id>`.
 - Preserve current bilibili `?p=` support.
+
+Status:
+
+- Landed after the initial audit. The remaining canonical follow-up is still short-link expansion such as `b23.tv`.
 
 ### Patch 3: `workers.py` subprocess cleanup
 
@@ -367,10 +390,15 @@ Completed in code and already pushed:
 4. `app.py`
    - Improved malformed-JSON reporting for subtitle offset cache loading.
 
-## Recent Commits
+## Recent Commits & Milestone Updates
 
-Recent applied commits include:
+Recent major features and applied commits include:
 
+- **NUC Remote Inference Integration**: Added `nuc_asr` backend via `faster-whisper-server` and native Ollama integration over LAN.
+- **Realtime Session Persistence**: Added 3s chunk saving, full audio concatenation, and `manifest.json` generation for the realtime capture flow.
+- **Realtime Review & Polish**: Introduced the "实时回顾" UI tab and `RealtimePolishWorker` for batch-proofreading recorded realtime sessions.
+- **Hardcode Refactoring**: Genericized Web UI model parsing to strictly mirror runtime models. Replaced absolute developer paths (`/Users/...`) with `PROJECT_ROOT` and extracted raw API ports (`8000`) into centralized config variables.
+- **Working Directory Isolation**: Route selected subprocesses through `cwd=OUTPUT_DIR` so runtime garbage files (e.g., `fbank_lfr_cmvn_feature.json`) and tool side effects are isolated from the source tree without changing the app's global process working directory.
 - `2decbbd` Unify segment cache load context in rolling worker
 - `eb1649e` Deduplicate audio duration probing logic
 - `f07f21e` Deduplicate worker process streaming helpers

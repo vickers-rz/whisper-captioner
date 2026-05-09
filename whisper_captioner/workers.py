@@ -160,6 +160,7 @@ def _probe_audio_duration(audio_path: Path) -> float:
         stderr=subprocess.PIPE,
         text=True,
         check=False,
+        cwd=str(OUTPUT_DIR),
     )
     if result.returncode != 0:
         raise RuntimeError(f"Could not determine audio duration: {result.stderr.strip()}")
@@ -384,6 +385,7 @@ class RealtimeWorker(QObject):
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                cwd=str(OUTPUT_DIR),
             )
             assert self.proc.stdout
             for line in self.proc.stdout:
@@ -617,7 +619,7 @@ class NUCRealtimeWorker(QObject):
                 "-c", "copy",
                 str(out_file)
             ]
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True, cwd=str(OUTPUT_DIR))
         except Exception as exc:
             self.status.emit(f"Error concatenating audio: {exc}")
         finally:
@@ -649,7 +651,7 @@ class NUCRealtimeWorker(QObject):
         ]
         try:
             self._recording_proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=str(OUTPUT_DIR)
             )
             _, stderr = self._recording_proc.communicate(
                 timeout=self.chunk_seconds + 5
@@ -1178,7 +1180,9 @@ class QueueWorker(QObject):
 
     def _run(self, cmd: list[str], label: str) -> None:
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(OUTPUT_DIR)
+        )
         try:
             output_lines = _stream_process_output(
                 self.proc,
@@ -1194,7 +1198,9 @@ class QueueWorker(QObject):
 
     def _run_capture(self, cmd: list[str], label: str) -> str:
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(OUTPUT_DIR)
+        )
         try:
             output_lines = _stream_process_output(
                 self.proc,
@@ -1833,6 +1839,7 @@ class RollingPrefetchWorker(QObject):
                 stderr=subprocess.PIPE,
                 timeout=30,
                 check=False,
+                cwd=str(OUTPUT_DIR),
             )
             title = result.stdout.strip().splitlines()
             return title[0].strip() if title else ""
@@ -2007,7 +2014,7 @@ class RollingPrefetchWorker(QObject):
     def _run_cmd(self, cmd: list[str], label: str) -> None:
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
         self.proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(OUTPUT_DIR)
         )
         try:
             output_lines = _stream_process_output(
@@ -2033,7 +2040,7 @@ class RollingPrefetchWorker(QObject):
     def _run_cmd_capture(self, cmd: list[str], label: str) -> str:
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
         self.proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(OUTPUT_DIR)
         )
         try:
             output_lines = _stream_process_output(

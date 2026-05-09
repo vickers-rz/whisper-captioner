@@ -46,11 +46,10 @@ Claude 已经把原来的单文件原型拆成多个模块，当前代码可以�
 - Analysis 输出缓存目前只按当前视频 cache 目录区分，没有单独写入 LLM provider/model signature；如果切换模型后想强制重生成，需要删除对应 Markdown 缓存文件。
 - `mlx-community/whisper-large-v3-turbo-asr-5bit` 必须走 `mlx-audio`，不能走 `mlx-whisper` 或 Rapid-MLX；当前已验证可生成 SRT，但本机样本速度和时间轴表现不如 whisper.cpp q5_0。
 - `app.py` 仍承担 UI 状态机和播放编排，长期可以继续拆出 `playback_controller.py` 或 `controlled_session.py`。
-- `cache.py` 的 canonical URL 仍可增强：YouTube Shorts (`/shorts/<id>`) 尚未统一为 `watch?v=<id>`；`b23.tv` 短链也尚未展开，会造成缓存复用不足。
-- `subtitle_io.load_segments()` 目前假定 JSON schema 正确。坏 cache 可能触发较晚的异常；建议增加字段校验和更清楚的错误信息。
+- `cache.py` 的 canonical URL 仍可增强：`youtu.be` / `youtube.com/shorts/<id>` / `youtube.com/live/<id>` 已统一为 `watch?v=<id>`，但 `b23.tv` 短链仍未展开，会造成缓存复用不足。
 - `workers.py` 仍有临时文件清理问题。`yt-dlp` 下载文件、chunk wav、subchunk wav 长期使用会累积在系统临时目录。
 - `workers.py` 的 subprocess helper 在异常路径上没有统一 `finally: self.proc = None`，通常不致命，但会留下已结束进程引用。
-- `_repair_sparse_chunk_with_subchunks()` 里的 `int(f"{chunk_index}{part_index}")` 只用于日志/标签，但编号语义不准确，建议改为清晰的 label 生成方式。
+- 幻听抑制目前依赖 `workers.py` 内置规则和 `~/Movies/WhisperCaptioner/hallucination_blocklist.txt` 文本黑名单，适合拦截固定跑题字幕，但仍不是更通用的声学/VAD 方案。
 - `QueueWorker` 和 `RollingPrefetchWorker` 仍有多处重复转写逻辑。后续应把命令执行、backend transcriber、cache pipeline 拆开。
 
 ## 新发现但暂不建议直接按单行修改
@@ -59,12 +58,11 @@ Claude 已经把原来的单文件原型拆成多个模块，当前代码可以�
 
 ## 建议的下一步小修顺序
 
-1. 修 `cache.py` 的 YouTube Shorts canonical URL，顺手考虑 `youtu.be` 和 `youtube.com/live/<id>`。
-2. 给 `subtitle_io.load_segments()` 加基础 schema 校验，坏 cache 报错要能定位文件和字段。
-3. 修 `_repair_sparse_chunk_with_subchunks()` 的 subchunk label，避免拼接编号误导日志。
-4. 整理 `QueueWorker` / `RollingPrefetchWorker` 的 `_run*` helper，确保 `self.proc` 在成功、失败、中止路径都会清理。
-5. 增加临时文件清理，只清理当前 job 的 `whisper-rolling-<stamp>*`、chunk/subchunk 文件，避免误删用户文件。
-6. 单独设计 Chrome tab identity：短期记录 AppleScript window/tab index，长期考虑 CDP。
+1. 扩展 `cache.py` 的短链 canonical 处理，优先补 `b23.tv` 展开。
+2. 整理 `QueueWorker` / `RollingPrefetchWorker` 的 `_run*` helper，确保 `self.proc` 在成功、失败、中止路径都会清理。
+3. 增加临时文件清理，只清理当前 job 的 `whisper-rolling-<stamp>*`、chunk/subchunk 文件，避免误删用户文件。
+4. 单独设计 Chrome tab identity：短期记录 AppleScript window/tab index，长期考虑 CDP。
+5. 如果固定幻听短语继续增多，可把黑名单维护入口暴露到 UI，而不只依赖手工编辑文本文件。
 
 ## 架构优化方向
 

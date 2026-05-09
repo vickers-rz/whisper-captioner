@@ -1758,4 +1758,6 @@ class App:
 
 
 if __name__ == "__main__":
+    from whisper_captioner.config import OUTPUT_DIR
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     sys.exit(App().run())

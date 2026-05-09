@@ -9,6 +9,7 @@ from .config import (
     MODELS_DIR,
     NUC_OLLAMA_HOST,
     NUC_OLLAMA_PORT,
+    NUC_ASR_PORT,
     QWEN3_ASR_06B_4BIT_MLX_MODEL,
     QWEN3_ASR_17B_8BIT_MLX_MODEL,
     RAPIDMLX_HOST,
@@ -74,7 +75,7 @@ MODES = [
     CaptionMode(
         "realtime_nuc",
         "实时字幕 NUC large-v3（远程 CUDA，3s延迟）",
-        f"http://{NUC_OLLAMA_HOST}:8000",
+        f"http://{NUC_OLLAMA_HOST}:{NUC_ASR_PORT}",
         True,
         ("-l", "zh"),
         "nuc_asr",
@@ -151,7 +152,7 @@ MODES = [
     CaptionMode(
         "nuc_asr",
         "NUC faster-whisper large-v3（远程 CUDA）",
-        f"http://{NUC_OLLAMA_HOST}:8000",
+        f"http://{NUC_OLLAMA_HOST}:{NUC_ASR_PORT}",
         False,
         ("-l", "zh"),
         "nuc_asr",

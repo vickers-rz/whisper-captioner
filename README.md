@@ -25,8 +25,8 @@ The project has been split out of the original single-file prototype:
 - `whisper_captioner/cache.py`: canonical media URL handling, Bilibili page-aware cache keys, and URL validation.
 - `whisper_captioner/chrome_control.py`: Chrome AppleScript video control helpers. Polling helpers read video time without activating Chrome; playback helpers can intentionally activate the target tab.
 - `whisper_captioner/overlay.py`: floating subtitle overlay, pin button, drag/resize, font, opacity, and playback controls.
-- `whisper_captioner/workers.py`: realtime capture, buffered capture, queue processing, and controlled URL subtitle preparation workers.
-- `whisper_captioner/llm_handler.py`: Gemini/OpenAI-compatible/Anthropic/Rapid-MLX subtitle proofreading calls.
+- `whisper_captioner/workers.py`: realtime loopback capture (`RealtimeWorker`, `NUCRealtimeWorker`), realtime session polishing/re-recognition workers, controlled URL subtitle processing, local queue workers, and hallucination phrase filtering backed by an external blocklist file.
+- `whisper_captioner/llm_handler.py`: Native Ollama API, Gemini, OpenAI-compatible, Anthropic, and Rapid-MLX subtitle proofreading calls.
 - `whisper_captioner/mlx_terms.py`: local Rapid-MLX/MLX term extraction helper, currently not part of the main Gemini full-document pipeline.
 - `whisper_captioner/qwen_chat_service.py`: local subtitle post-processing web workspace for Qwen3-8B / Gemini chat, manual subtitle upload, and second-stage-only cleanup or article rewriting.
 
@@ -42,8 +42,10 @@ Recent maintenance focused on the controlled URL path and smaller-screen usabili
 
 ## Modes
 
-- `实时字幕 whisper.cpp small（SoundSource/Loopback）`: lowest-latency realtime mode for Loopback-routed Chrome or local player audio.
-- `实时字幕 whisper.cpp q5_0（large-v3-turbo）`: higher-quality realtime mode when you can tolerate a bit more latency.
+- `NUC faster-whisper large-v3（远程 CUDA）`: highest-performance remote inference via NUC RTX 3080 Ti.
+- `实时字幕 NUC large-v3（远程 CUDA，3s延迟）`: low-latency realtime mode offloaded to the NUC, with full session persistence.
+- `实时字幕 whisper.cpp small（SoundSource/Loopback）`: lowest-latency local realtime mode for Loopback-routed Chrome or local player audio.
+- `实时字幕 whisper.cpp q5_0（large-v3-turbo）`: higher-quality local realtime mode when you can tolerate a bit more latency.
 - `Qwen3-ASR 0.6B 4bit（默认）`: recommended MLX-Audio workflow for transcript-first transcription plus light normalization.
 - `Qwen3-ASR 1.7B 8bit（高质量）`: higher-quality MLX-Audio workflow when you want better transcript polish.
 - `MLX-Audio 5bit（whisper-large-v3-turbo-asr-5bit）`: experimental MLX-Audio backend for Whisper.
@@ -75,7 +77,6 @@ The cache key also includes the Whisper backend, so `mlx-audio`, `mlx-whisper`, 
 
 Known cache follow-ups:
 
-- YouTube Shorts URLs are not yet normalized to canonical `watch?v=` URLs.
 - `b23.tv` short links are not yet expanded before cache-key generation.
 - Native subtitle caches are still plain segment JSON files and do not have their own metadata/signature.
 
@@ -95,7 +96,7 @@ What it can do:
 - Attach any uploaded or historical subtitle file to a work conversation.
 - Chat with the LLM grounded on the attached subtitle content.
 - Run one-click `语句规整` or `转写成文稿` actions on the attached subtitle.
-- Switch between `Local Rapid-MLX Qwen3-8B`, `Gemini 2.5 Flash`, and `Gemini 2.5 Pro`.
+- Switch between `NUC Ollama Qwen3-14B`, `Local Rapid-MLX Qwen3-8B`, `Gemini 2.5 Flash`, and `Gemini 2.5 Pro`.
 
 Notes:
 
@@ -107,6 +108,26 @@ Sync controls:
 
 - `Sub -0.5s` / `Sub +0.5s`: adjust and persist subtitle offset for the current canonical video cache.
 - `Sync line`: align the currently displayed subtitle line to the controlled Chrome video's current time.
+
+## Hallucination Blocklist
+
+To suppress recurring obviously unrelated subtitle hallucinations, the app filters a small set of known bad phrases before they are written into raw caches or exported subtitles.
+
+- Built-in defaults cover several recurring phrases already observed in this project, such as `优优独播剧场——YoYo Television Series Exclusive`.
+- You can extend the filter without editing Python code by appending phrases to:
+  `~/Movies/WhisperCaptioner/hallucination_blocklist.txt`
+- Add one phrase per line.
+- Lines starting with `#` are treated as comments.
+
+This blocklist is intentionally a conservative text-layer safeguard. It does not change model decoding parameters; it only removes exact recurring garbage phrases after transcription and before cache/export persistence.
+
+## Runtime Artifacts
+
+Some third-party speech tools may emit transient sidecar files such as `fbank_lfr_cmvn_feature.json`.
+
+- These runtime artifacts are not treated as source files.
+- The repository ignores known generated artifacts.
+- Selected subprocesses are launched with `cwd=~/Movies/WhisperCaptioner` so those files land in the output area instead of polluting the source tree.
 
 ## Local Benchmark Notes
 
@@ -142,13 +163,35 @@ Results on this machine:
 - `mlx-community/Qwen3-ASR-1.7B-8bit`: `9.50s`
 - `SenseVoiceSmall via mlx-audio`: `20.43s`
 
-Practical reading:
+### NUC 3080 Ti Remote Inference Performance
 
-- `whisper.cpp large-v3-turbo-q5_0` still gives the most subtitle-like timestamps and the strongest overall balance.
-- `SenseVoice.cpp FP16` is the fastest high-quality non-whisper.cpp alternative tested so far.
-- `Qwen3-ASR-0.6B-4bit` is slower than whisper.cpp, but it produces the most naturally normalized transcript-style text among the tested paths.
-- `Qwen3-ASR-1.7B-8bit` improves transcript polish, but not enough to justify making it the default over `0.6B-4bit`.
-- `SenseVoice.cpp q8_0` is not currently worth using on this M2; the FP16 path is much faster.
+For short 5.5s mixed Chinese/English/Tech audio chunks (typical of realtime chunk size):
+
+- `NUC faster-whisper large-v3 CUDA`: `0.37s` (RTF `0.067x`) -> 🏆 Fastest, 15x faster than real-time, 100% accurate.
+- `Mac M2 SenseVoice.cpp FP16`: `0.46s` (RTF `0.083x`) -> Second fastest, but suffered from homophone errors on tech terms.
+- `Mac M2 whisper.cpp turbo-q5_0`: `2.43s` (RTF `0.438x`)
+
+**Conclusion**: The NUC backend completely outclasses local M2 inference in both speed and context-awareness (large-v3).
+
+## Remote NUC Inference
+
+The app natively integrates with an external Intel NUC equipped with an NVIDIA RTX 3080 Ti via LAN (e.g., `192.168.31.196`) to dramatically accelerate inference.
+
+- **NUC ASR**: Powered by `faster-whisper-server` (Docker) exposing an OpenAI-compatible `/v1/audio/transcriptions` endpoint on port `8000`.
+- **NUC LLM**: Powered by native `Ollama` exposing `/api/chat` on port `11434`. Models like `qwen3:14b` run 6.5x faster than local Rapid-MLX on the Mac.
+
+To use this, simply select a `nuc_asr` or `nuc_ollama` provider from the app UI dropdowns. The app implements automatic timeouts and fallbacks to ensure local Mac usability if the NUC is offline.
+
+## Realtime Session Persistence & Review
+
+Realtime Loopback capture (especially via NUC) now features a full "Two-Stage" persistence and correction pipeline:
+
+1. **Capture & Chunking**: Audio is captured in 3s chunks and transcribed immediately for low-latency floating captions.
+2. **Session Persistence**: Chunks are saved locally to `~/Movies/WhisperCaptioner/realtime/YYYYMMDD-HHMMSS/audio/`.
+3. **Review Tab**: A new `实时回顾` (Realtime Review) tab lists all historical sessions, allowing you to view the raw generated segments.
+4. **Offline Polish & Re-recognition**: 
+   - Use the **"LLM 校对"** (LLM Polish) button to trigger a background job (`RealtimePolishWorker`) that chunks segments into 30s semantic batches and sends them to the configured LLM (e.g., NUC Ollama Qwen3-14B) for high-quality contextual correction.
+   - Use the **"重新识别"** (Re-recognize) button to combine all saved 3s audio chunks into one `full-audio.wav` and run a full-context re-transcription against the NUC, fixing edge-case truncation issues.
 
 ## Realtime Captions With SoundSource
 
