@@ -158,6 +158,7 @@ def build_main_window_ui(window) -> None:
     window.overlay_less_opacity_button = QPushButton("更透明")
     window.overlay_reset_button = QPushButton("重置浮窗")
     window.clear_cache_button = QPushButton("删除当前视频缓存")
+    window.clear_local_audio_cache_button = QPushButton("删除本地音频缓存")
     window.open_cache_button = QPushButton("打开当前缓存")
     window.open_outputs_button = QPushButton("在 Finder 中定位文件")
     window.rewind_5_button = QPushButton("-5s")
@@ -249,6 +250,7 @@ def build_main_window_ui(window) -> None:
     file_card = QGroupBox("缓存与文件")
     file_layout = QVBoxLayout(file_card)
     file_layout.addWidget(window.clear_cache_button)
+    file_layout.addWidget(window.clear_local_audio_cache_button)
     file_layout.addWidget(window.open_cache_button)
     file_layout.addWidget(window.open_outputs_button)
 

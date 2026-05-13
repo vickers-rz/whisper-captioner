@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+import io
+import json
 import os
 import re
+import threading
+import time
+import uuid
+from pathlib import Path
 from typing import Any
+import wave
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 
 
 UPSTREAM_URL = os.environ.get(
@@ -18,29 +27,23 @@ SCHEDULER_URL = os.environ.get(
     "http://nuc-service-scheduler:8010",
 )
 UPSTREAM_MODEL = "Qwen/Qwen3-ASR-1.7B"
-GPU_MIN_FREE_MB = 1800
 QUEUE_CONCURRENCY = 1
 IDLE_STOP_SECONDS = int(os.environ.get("IDLE_STOP_SECONDS", "180"))
+RESULT_DIR = Path(os.environ.get("QWEN_ASR_RESULT_DIR", "/app/qwen-asr-results"))
+STAGING_DIR = Path(os.environ.get("QWEN_ASR_STAGING_DIR", "/app/qwen-asr-staging"))
+ADMISSION_RETRY_SECONDS = float(os.environ.get("QWEN_ADMISSION_RETRY_SECONDS", "5"))
+ADMISSION_MAX_WAIT_SECONDS = float(os.environ.get("QWEN_ADMISSION_MAX_WAIT_SECONDS", "1800"))
+MAX_DIRECT_UPLOAD_MB = float(os.environ.get("QWEN_MAX_DIRECT_UPLOAD_MB", "64"))
+CHUNK_SECONDS = float(os.environ.get("QWEN_CHUNK_SECONDS", "30"))
 
 app = FastAPI(title="NUC Qwen3-ASR 1.7B Proxy")
 semaphore = asyncio.Semaphore(QUEUE_CONCURRENCY)
 idle_stop_task: asyncio.Task | None = None
 idle_stop_lock = asyncio.Lock()
-
-
-async def _gpu_free_mb() -> int:
-    proc = await asyncio.create_subprocess_exec(
-        "nvidia-smi",
-        "--query-gpu=memory.free",
-        "--format=csv,noheader,nounits",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await proc.communicate()
-    try:
-        return int(stdout.decode("utf-8").strip().splitlines()[0])
-    except Exception:
-        return 0
+TASKS: dict[str, dict[str, Any]] = {}
+TASKS_LOCK = threading.Lock()
+ACTIVE_REQUESTS = 0
+CURRENT_REQUEST: dict[str, Any] | None = None
 
 
 async def _scheduler_post(path: str) -> None:
@@ -62,6 +65,56 @@ async def _scheduler_get(path: str) -> dict[str, Any]:
         if response.status_code >= 400:
             raise HTTPException(status_code=response.status_code, detail=response.text)
         return response.json()
+
+
+def _safe_name(value: str, fallback: str = "audio") -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|\s]+', "_", value).strip("._")
+    return cleaned[:120] or fallback
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f"{path.suffix}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _stage_task_dir(filename: str) -> tuple[str, Path]:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    task_id = f"{stamp}-{uuid.uuid4().hex[:8]}-{_safe_name(filename)}"
+    return task_id, STAGING_DIR / task_id
+
+
+def _task_set(task_id: str, **updates: Any) -> dict[str, Any]:
+    with TASKS_LOCK:
+        task = TASKS.setdefault(task_id, {})
+        task.update(updates)
+        return dict(task)
+
+
+def _task_snapshot(task_id: str) -> dict[str, Any]:
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+        return dict(task)
+
+
+async def _track_request(metadata: dict[str, Any]):
+    global ACTIVE_REQUESTS
+    global CURRENT_REQUEST
+    ACTIVE_REQUESTS += 1
+    CURRENT_REQUEST = {**metadata, "started_at": time.time()}
+    try:
+        yield
+    finally:
+        ACTIVE_REQUESTS = max(0, ACTIVE_REQUESTS - 1)
+        if ACTIVE_REQUESTS == 0:
+            CURRENT_REQUEST = None
 
 
 async def _cancel_idle_stop() -> None:
@@ -90,6 +143,36 @@ async def _schedule_idle_stop() -> None:
         idle_stop_task = asyncio.create_task(_worker())
 
 
+def _current_request_status() -> dict[str, Any] | None:
+    if not CURRENT_REQUEST:
+        return None
+    started_at = float(CURRENT_REQUEST.get("started_at", 0.0))
+    return {
+        **CURRENT_REQUEST,
+        "elapsed_seconds": max(0.0, time.time() - started_at),
+    }
+
+
+async def _wait_for_qwen_admission() -> None:
+    deadline = time.monotonic() + ADMISSION_MAX_WAIT_SECONDS
+    last_error: str | None = None
+    while True:
+        try:
+            await _scheduler_post("/admit/qwen")
+            await _scheduler_post("/ensure/qwen")
+            return
+        except HTTPException as exc:
+            last_error = str(exc.detail)
+            if exc.status_code not in {429, 503}:
+                raise
+            if time.monotonic() >= deadline:
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=f"Timed out waiting for Qwen admission: {last_error}",
+                ) from exc
+            await asyncio.sleep(ADMISSION_RETRY_SECONDS)
+
+
 def _pseudo_segments(text: str) -> list[dict[str, Any]]:
     clean = " ".join(text.split()).strip()
     if not clean:
@@ -106,6 +189,204 @@ def _clean_transcript(text: str) -> str:
     return clean.strip()
 
 
+def _repetition_hallucination_reason(text: str) -> str | None:
+    clean = re.sub(r"\s+", " ", text).strip()
+    if len(clean) < 160:
+        return None
+    parts = [
+        part.strip()
+        for part in re.split(r"[，,。！？!?；;、\s]+", clean)
+        if part.strip()
+    ]
+    if len(parts) < 12:
+        return None
+    counts = Counter(parts)
+    phrase, count = counts.most_common(1)[0]
+    ratio = count / len(parts)
+    if len(phrase) <= 24 and count >= 8 and ratio >= 0.6:
+        return (
+            f"dominant repeated short phrase filtered: phrase={phrase!r} "
+            f"count={count} total_parts={len(parts)} ratio={ratio:.3f}"
+        )
+    return None
+
+
+def _sanitize_chunk_text(text: str) -> tuple[str, str | None]:
+    clean = _clean_transcript(text)
+    reason = _repetition_hallucination_reason(clean)
+    if reason:
+        return "", reason
+    return clean, None
+
+
+def _pseudo_segments_for_text(text: str, duration: float, offset: float) -> list[dict[str, Any]]:
+    clean = re.sub(r"\s+", " ", text).strip()
+    if not clean:
+        return []
+    parts = [part.strip() for part in re.split(r"(?<=[。？！!?；;……])\s*", clean) if part.strip()]
+    if len(parts) <= 1:
+        return [{"start": offset, "end": offset + max(duration, 0.1), "text": clean}]
+    weights = [
+        max(1, len(re.sub(r"[，。！？!?；;、,（）()【】\[\]\s]", "", part)))
+        for part in parts
+    ]
+    total_weight = sum(weights) or len(parts)
+    segments: list[dict[str, Any]] = []
+    cursor = offset
+    for index, part in enumerate(parts):
+        seg_duration = duration * (weights[index] / total_weight)
+        end = offset + duration if index == len(parts) - 1 else cursor + seg_duration
+        segments.append({"start": cursor, "end": end, "text": part})
+        cursor = end
+    return segments
+
+
+def _wav_duration_seconds(audio_path: Path) -> float:
+    with wave.open(str(audio_path), "rb") as reader:
+        frame_rate = reader.getframerate()
+        if frame_rate <= 0:
+            return 0.0
+        return reader.getnframes() / frame_rate
+
+
+def _iter_wav_chunks(audio_path: Path, chunk_seconds: float):
+    with wave.open(str(audio_path), "rb") as reader:
+        params = reader.getparams()
+        frame_rate = reader.getframerate()
+        if frame_rate <= 0:
+            raise RuntimeError(f"Invalid WAV frame rate: {audio_path}")
+        frames_per_chunk = max(1, int(chunk_seconds * frame_rate))
+        total_frames = reader.getnframes()
+        start_frame = 0
+        chunk_index = 0
+        while start_frame < total_frames:
+            reader.setpos(start_frame)
+            frame_count = min(frames_per_chunk, total_frames - start_frame)
+            frames = reader.readframes(frame_count)
+            chunk_buffer = io.BytesIO()
+            with wave.open(chunk_buffer, "wb") as writer:
+                writer.setparams(params)
+                writer.writeframes(frames)
+            duration = frame_count / frame_rate
+            yield chunk_index, start_frame / frame_rate, duration, chunk_buffer.getvalue()
+            start_frame += frame_count
+            chunk_index += 1
+
+
+async def _post_upstream_bytes(
+    *,
+    audio_bytes: bytes,
+    filename: str,
+    language: str,
+) -> dict[str, Any]:
+    files = {
+        "file": (filename, audio_bytes, "audio/wav"),
+    }
+    data_payload = {
+        "model": UPSTREAM_MODEL,
+        "language": language,
+    }
+    async with httpx.AsyncClient(timeout=900) as client:
+        response = await client.post(UPSTREAM_URL, data=data_payload, files=files)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+        return response.json()
+
+
+async def _run_qwen_transcription(
+    *,
+    audio_path: Path,
+    filename: str,
+    model: str,
+    language: str,
+    response_format: str,
+    result_dir: Path,
+) -> dict[str, Any]:
+    total_duration = _wav_duration_seconds(audio_path)
+    metadata = {
+        "filename": filename,
+        "model": model,
+        "language": language,
+        "response_format": response_format,
+        "audio_path": str(audio_path),
+        "duration": total_duration,
+        "result_dir": str(result_dir),
+        "received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    _write_json(result_dir / "metadata.json", metadata)
+    await _cancel_idle_stop()
+    async with semaphore:
+        await _wait_for_qwen_admission()
+        try:
+            async for _ in _track_request({"filename": filename, "result_dir": str(result_dir)}):
+                if audio_path.stat().st_size <= MAX_DIRECT_UPLOAD_MB * 1024 * 1024:
+                    data = await _post_upstream_bytes(
+                        audio_bytes=audio_path.read_bytes(),
+                        filename=filename,
+                        language=language,
+                    )
+                    text, filtered_reason = _sanitize_chunk_text(data.get("text", ""))
+                    result = {
+                        "text": text,
+                        "segments": _pseudo_segments_for_text(text, total_duration, 0.0),
+                        "model": model,
+                        "duration": total_duration,
+                    }
+                    if filtered_reason:
+                        result["filtered_chunk_reason"] = filtered_reason
+                else:
+                    chunk_results: list[dict[str, Any]] = []
+                    chunk_texts: list[str] = []
+                    merged_segments: list[dict[str, Any]] = []
+                    for chunk_index, offset, duration, chunk_bytes in _iter_wav_chunks(audio_path, CHUNK_SECONDS):
+                        chunk_name = f"{Path(filename).stem}-chunk{chunk_index:04d}.wav"
+                        data = await _post_upstream_bytes(
+                            audio_bytes=chunk_bytes,
+                            filename=chunk_name,
+                            language=language,
+                        )
+                        raw_text = _clean_transcript(data.get("text", ""))
+                        text, filtered_reason = _sanitize_chunk_text(raw_text)
+                        if text:
+                            chunk_texts.append(text)
+                        chunk_record = {
+                            "chunk_index": chunk_index,
+                            "offset_seconds": offset,
+                            "duration_seconds": duration,
+                            "text": text,
+                        }
+                        if filtered_reason:
+                            chunk_record["filtered_reason"] = filtered_reason
+                            chunk_record["raw_text_preview"] = raw_text[:500]
+                        chunk_results.append(chunk_record)
+                        merged_segments.extend(_pseudo_segments_for_text(text, duration, offset))
+                    result = {
+                        "text": "\n".join(chunk_texts).strip(),
+                        "segments": merged_segments,
+                        "model": model,
+                        "duration": total_duration,
+                        "chunked": True,
+                        "chunk_seconds": CHUNK_SECONDS,
+                        "chunk_count": len(chunk_results),
+                    }
+                    _write_json(result_dir / "chunks.json", chunk_results)
+        except HTTPException as exc:
+            _write_json(
+                result_dir / "error.json",
+                {
+                    **metadata,
+                    "status_code": exc.status_code,
+                    "detail": exc.detail,
+                    "failed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                },
+            )
+            raise
+    _write_json(result_dir / "response.json", result)
+    _write_json(result_dir / "metadata.json", {**metadata, "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    await _schedule_idle_stop()
+    return result
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     scheduler = await _scheduler_get("/status-lite")
@@ -119,6 +400,15 @@ async def healthz() -> dict[str, str]:
     }
 
 
+@app.get("/busy")
+async def busy() -> dict[str, Any]:
+    return {
+        "active_requests": ACTIVE_REQUESTS,
+        "busy": ACTIVE_REQUESTS > 0,
+        "current_request": _current_request_status(),
+    }
+
+
 @app.post("/v1/audio/transcriptions")
 async def transcribe(
     file: UploadFile = File(...),
@@ -126,36 +416,129 @@ async def transcribe(
     language: str = Form("zh"),
     response_format: str = Form("verbose_json"),
 ) -> Any:
-    if semaphore.locked():
-        raise HTTPException(status_code=429, detail="NUC Qwen3-ASR 1.7B queue is full")
-    await _cancel_idle_stop()
-    await _scheduler_post("/admit/qwen")
-    await _scheduler_post("/ensure/qwen")
-    free_mb = await _gpu_free_mb()
-    if free_mb < GPU_MIN_FREE_MB:
-        raise HTTPException(status_code=503, detail=f"GPU free memory too low: {free_mb} MiB")
+    filename = file.filename or "audio.wav"
+    task_id, task_dir = _stage_task_dir(filename)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = task_dir / filename
+    audio_path.write_bytes(await file.read())
+    result_dir = RESULT_DIR / task_id
+    result = await _run_qwen_transcription(
+        audio_path=audio_path,
+        filename=filename,
+        model=model,
+        language=language,
+        response_format=response_format,
+        result_dir=result_dir,
+    )
+    if response_format == "text":
+        return result["text"]
+    return result
 
-    async with semaphore:
-        audio_bytes = await file.read()
-        files = {
-            "file": (file.filename or "audio.wav", audio_bytes, file.content_type or "audio/wav"),
-        }
-        data_payload = {
-            "model": UPSTREAM_MODEL,
-            "language": language,
-        }
-        async with httpx.AsyncClient(timeout=900) as client:
-            response = await client.post(UPSTREAM_URL, data=data_payload, files=files)
-            if response.status_code >= 400:
-                raise HTTPException(status_code=response.status_code, detail=response.text)
-            data = response.json()
-        text = _clean_transcript(data.get("text", ""))
-        await _schedule_idle_stop()
-        if response_format == "text":
-            return text
-        return {
-            "text": text,
-            "segments": _pseudo_segments(text),
-            "model": model,
-            "duration": 30.0,
-        }
+
+@app.post("/jobs/upload")
+async def upload_job(
+    file: UploadFile = File(...),
+    model: str = Form("qwen3-asr-1p7b"),
+    language: str = Form("zh"),
+    response_format: str = Form("verbose_json"),
+) -> dict[str, Any]:
+    filename = file.filename or "audio.wav"
+    task_id, task_dir = _stage_task_dir(filename)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = task_dir / filename
+    audio_path.write_bytes(await file.read())
+    result_dir = RESULT_DIR / task_id
+    task = _task_set(
+        task_id,
+        id=task_id,
+        status="queued",
+        filename=filename,
+        audio_path=str(audio_path),
+        model=model,
+        language=language,
+        response_format=response_format,
+        created_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        result_dir=str(result_dir),
+    )
+    _write_json(
+        task_dir / "upload.json",
+        {
+            "filename": filename,
+            "audio_path": str(audio_path),
+            "size_bytes": audio_path.stat().st_size,
+            "received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        },
+    )
+
+    async def runner() -> None:
+        _task_set(
+            task_id,
+            status="running",
+            started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        )
+        try:
+            result = await _run_qwen_transcription(
+                audio_path=audio_path,
+                filename=filename,
+                model=model,
+                language=language,
+                response_format=response_format,
+                result_dir=result_dir,
+            )
+            _task_set(
+                task_id,
+                status="completed",
+                updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                completed_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                response_path=str(result_dir / "response.json"),
+                metadata_path=str(result_dir / "metadata.json"),
+                result=result,
+            )
+        except HTTPException as exc:
+            _task_set(
+                task_id,
+                status="failed",
+                updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                failed_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                error={"status_code": exc.status_code, "detail": exc.detail},
+                error_path=str(result_dir / "error.json"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _task_set(
+                task_id,
+                status="failed",
+                updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                failed_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                error={"detail": str(exc)},
+            )
+
+    asyncio.create_task(runner())
+    return task
+
+
+class LocalFileTaskRequest(BaseModel):
+    audio_path: str
+    filename: str
+    model: str = "qwen3-asr-1p7b"
+    language: str = "zh"
+    response_format: str = "verbose_json"
+
+
+@app.get("/jobs/{task_id}")
+async def get_job(task_id: str) -> dict[str, Any]:
+    task = _task_snapshot(task_id)
+    result_dir = Path(task.get("result_dir", ""))
+    if task.get("status") == "completed":
+        response_path = result_dir / "response.json"
+        metadata_path = result_dir / "metadata.json"
+        if response_path.exists():
+            task["result"] = _read_json(response_path)
+        if metadata_path.exists():
+            task["metadata"] = _read_json(metadata_path)
+    elif task.get("status") == "failed":
+        error_path = result_dir / "error.json"
+        if error_path.exists():
+            task["error"] = _read_json(error_path)
+    return task

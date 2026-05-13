@@ -16,10 +16,12 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
+import uuid
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from PySide6.QtCore import QObject, QThread, Signal
 
@@ -32,11 +34,15 @@ from whisper_captioner.config import (
     FFMPEG,
     FFPROBE,
     GENERATED_DIR,
+    LOCAL_AUDIO_CACHE_DIR,
     MLX_AUDIO_STT,
     MLX_WHISPER,
     MLX_TERMS_SCRIPT,
     MODELS_DIR,
     NUC_OLLAMA_HOST,
+    NUC_REMOTE_ASR_ROOT,
+    NUC_SSH_PORT,
+    NUC_SSH_USER,
     OUTPUT_DIR,
     REALTIME_DIR,
     RAPIDMLX_8B_MODEL,
@@ -124,6 +130,66 @@ def _cleanup_temp_paths(paths: list[Path]) -> None:
     paths.clear()
 
 
+def _load_json_url(url: str, *, timeout: float) -> Any:
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _request_json_url(
+    url: str,
+    *,
+    payload: Optional[dict[str, Any]] = None,
+    timeout: float,
+    method: str = "GET",
+) -> Any:
+    import urllib.request
+
+    data = None
+    headers: dict[str, str] = {}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _nuc_ssh_base_command() -> list[str]:
+    return ["ssh", "-p", str(NUC_SSH_PORT), f"{NUC_SSH_USER}@{NUC_OLLAMA_HOST}"]
+
+
+def _nuc_scp_base_command() -> list[str]:
+    return ["scp", "-P", str(NUC_SSH_PORT)]
+
+
+def _local_audio_cache_key(source: str) -> str:
+    path = Path(source).expanduser().resolve()
+    stat = path.stat()
+    return cache_slug(str(path), stat.st_size, int(stat.st_mtime))
+
+
+def local_audio_cache_dir_for_source(source: str) -> Path:
+    return LOCAL_AUDIO_CACHE_DIR / _local_audio_cache_key(source)
+
+
+def _write_json_local(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f"{path.suffix}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _segments_from_verbose_result(data: dict[str, Any]) -> list[SubtitleSegment]:
+    segments: list[SubtitleSegment] = []
+    for seg in data.get("segments", []):
+        text = str(seg.get("text", "")).strip()
+        if text:
+            segments.append(SubtitleSegment(float(seg["start"]), float(seg["end"]), text))
+    return segments
+
+
 def _subchunk_label(chunk_index: int, part_index: int) -> str:
     return f"{chunk_index}.part{part_index}"
 
@@ -185,6 +251,8 @@ def _transcribe_via_nuc_asr(
     language: str = "zh",
     response_format: str = "verbose_json",
     timeout: int = 120,
+    status_signal: Signal | None = None,
+    heartbeat_interval: float = 10.0,
 ) -> list[SubtitleSegment]:
     """Send an audio file to the NUC faster-whisper-server and return segments."""
     import urllib.request
@@ -193,6 +261,7 @@ def _transcribe_via_nuc_asr(
     if not base_url:
         base_url = f"http://{NUC_OLLAMA_HOST}:8000"
     url = f"{base_url}/v1/audio/transcriptions"
+    busy_url = f"{base_url}/busy"
 
     boundary = uuid.uuid4().hex
     audio_data = audio_path.read_bytes()
@@ -222,8 +291,49 @@ def _transcribe_via_nuc_asr(
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    stop_heartbeat = threading.Event()
+
+    def emit_heartbeat() -> None:
+        next_emit = 0.0
+        while not stop_heartbeat.wait(heartbeat_interval):
+            if time.monotonic() < next_emit:
+                continue
+            try:
+                with urllib.request.urlopen(busy_url, timeout=5) as heartbeat_resp:
+                    heartbeat = json.loads(heartbeat_resp.read().decode("utf-8"))
+            except Exception as exc:
+                if status_signal:
+                    status_signal.emit(f"NUC ASR heartbeat unavailable: {exc}")
+                next_emit = time.monotonic() + heartbeat_interval
+                continue
+            if not status_signal:
+                continue
+            current = heartbeat.get("current_request") or {}
+            elapsed = current.get("elapsed_seconds")
+            heartbeat_filename = current.get("filename") or filename
+            if isinstance(elapsed, (int, float)):
+                status_signal.emit(
+                    f"NUC ASR heartbeat: busy={heartbeat.get('busy')} "
+                    f"active={heartbeat.get('active_requests')} elapsed={elapsed:.0f}s file={heartbeat_filename}"
+                )
+            else:
+                status_signal.emit(
+                    f"NUC ASR heartbeat: busy={heartbeat.get('busy')} "
+                    f"active={heartbeat.get('active_requests')}"
+                )
+            next_emit = time.monotonic() + heartbeat_interval
+
+    heartbeat_thread: threading.Thread | None = None
+    if status_signal:
+        heartbeat_thread = threading.Thread(target=emit_heartbeat, daemon=True)
+        heartbeat_thread.start()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    finally:
+        stop_heartbeat.set()
+        if heartbeat_thread:
+            heartbeat_thread.join(timeout=1)
 
     segments: list[SubtitleSegment] = []
     if response_format == "verbose_json":
@@ -969,6 +1079,164 @@ class QueueWorker(QObject):
         self._temp_paths.append(path)
         return path
 
+    def _prepare_local_audio_cache(self, source: str) -> Path:
+        source_path = Path(source).expanduser().resolve()
+        cache_dir = local_audio_cache_dir_for_source(source)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        wav = cache_dir / "audio-16k-mono.wav"
+        meta_path = cache_dir / "metadata.json"
+        source_stat = source_path.stat()
+        metadata = {
+            "source": str(source_path),
+            "size": source_stat.st_size,
+            "mtime": int(source_stat.st_mtime),
+            "wav": str(wav),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        if wav.exists():
+            self.status.emit(f"Reusing local audio cache: {wav}")
+            _write_json_local(meta_path, metadata)
+            return wav
+        self._run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-y",
+                "-i",
+                str(source_path),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(wav),
+            ],
+            "Preparing audio",
+        )
+        _write_json_local(meta_path, metadata)
+        return wav
+
+    def _transcribe_local_file_via_nuc_job(self, wav: Path, *, base_url: str) -> list[SubtitleSegment]:
+        import urllib.request
+
+        self.status.emit(f"Uploading cached WAV to NUC via HTTP: {wav.name}")
+        boundary = uuid.uuid4().hex
+        audio_data = wav.read_bytes()
+        body_parts = []
+        for field_name, field_value in [
+            ("model", "large-v3"),
+            ("language", "zh"),
+            ("response_format", "verbose_json"),
+        ]:
+            body_parts.append(
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{field_name}"\r\n\r\n'
+                f"{field_value}\r\n"
+            )
+        body_parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{wav.name}"\r\n'
+            f"Content-Type: audio/wav\r\n\r\n"
+        )
+        body = b"".join(part.encode("utf-8") for part in body_parts) + audio_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        req = urllib.request.Request(
+            f"{base_url}/jobs/upload",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            task = json.loads(resp.read().decode("utf-8"))
+        task_id = str(task.get("id") or task.get("task_id") or "")
+        if not task_id:
+            raise RuntimeError(f"NUC local-file upload job did not return task id: {task}")
+        return self._wait_for_nuc_job(task_id, base_url=base_url, filename=wav.name, busy_endpoint="/busy")
+
+    def _transcribe_local_file_via_nuc_qwen_job(self, wav: Path, *, base_url: str) -> list[SubtitleSegment]:
+        import urllib.request
+
+        self.status.emit(f"Uploading cached WAV to NUC Qwen ASR via HTTP: {wav.name}")
+        boundary = uuid.uuid4().hex
+        audio_data = wav.read_bytes()
+        body_parts = []
+        for field_name, field_value in [
+            ("model", "qwen3-asr-1p7b"),
+            ("language", "zh"),
+            ("response_format", "verbose_json"),
+        ]:
+            body_parts.append(
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{field_name}"\r\n\r\n'
+                f"{field_value}\r\n"
+            )
+        body_parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{wav.name}"\r\n'
+            f"Content-Type: audio/wav\r\n\r\n"
+        )
+        body = b"".join(part.encode("utf-8") for part in body_parts) + audio_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        req = urllib.request.Request(
+            f"{base_url}/jobs/upload",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            task = json.loads(resp.read().decode("utf-8"))
+        task_id = str(task.get("id") or task.get("task_id") or "")
+        if not task_id:
+            raise RuntimeError(f"NUC Qwen upload job did not return task id: {task}")
+        return self._wait_for_nuc_job(task_id, base_url=base_url, filename=wav.name, busy_endpoint=None)
+
+    def _wait_for_nuc_job(
+        self,
+        task_id: str,
+        *,
+        base_url: str,
+        filename: str,
+        busy_endpoint: str | None,
+    ) -> list[SubtitleSegment]:
+        started = time.monotonic()
+        last_status = ""
+        while not self._stop:
+            task = _load_json_url(f"{base_url}/jobs/{task_id}", timeout=20)
+            status = str(task.get("status") or "unknown")
+            result_dir = task.get("result_dir")
+            if status != last_status:
+                if result_dir:
+                    self.status.emit(f"NUC ASR job {task_id}: {status} ({result_dir})")
+                else:
+                    self.status.emit(f"NUC ASR job {task_id}: {status}")
+                last_status = status
+            if status == "completed":
+                result = task.get("result")
+                if not isinstance(result, dict):
+                    raise RuntimeError(f"NUC ASR job missing result payload: {task}")
+                self.status.emit(
+                    f"NUC ASR job completed in {time.monotonic() - started:.0f}s; result dir: {result.get('nuc_result_dir', result_dir)}"
+                )
+                return _segments_from_verbose_result(result)
+            if status == "failed":
+                raise RuntimeError(f"NUC ASR job failed: {task.get('error')}")
+            time.sleep(5)
+            if not busy_endpoint:
+                self.status.emit(
+                    f"NUC ASR job {task_id}: still {status} after {time.monotonic() - started:.0f}s"
+                )
+                continue
+            try:
+                busy = _load_json_url(f"{base_url}{busy_endpoint}", timeout=10)
+            except Exception as exc:
+                self.status.emit(f"NUC ASR heartbeat unavailable: {exc}")
+                continue
+            current = busy.get("current_request") or {}
+            elapsed = current.get("elapsed_seconds")
+            remote_name = current.get("filename") or filename
+            if isinstance(elapsed, (int, float)):
+                self.status.emit(
+                    f"NUC ASR heartbeat: busy={busy.get('busy')} active={busy.get('active_requests')} elapsed={elapsed:.0f}s file={remote_name}"
+                )
+        raise RuntimeError("Queue stopped")
+
     def _process(self, source: str) -> bool:
         if not self.mode.available:
             self.status.emit(f"Missing model: {self.mode.model}")
@@ -1007,21 +1275,7 @@ class QueueWorker(QObject):
                     self._track_temp_path(candidate)
                 wav = audio
             else:
-                self._run(
-                    [
-                        FFMPEG,
-                        "-hide_banner",
-                        "-y",
-                        "-i",
-                        source,
-                        "-ac",
-                        "1",
-                        "-ar",
-                        "16000",
-                        str(wav),
-                    ],
-                    "Preparing audio",
-                )
+                wav = self._prepare_local_audio_cache(source)
 
             if self.mode.backend == "mlx_audio":
                 if qwen3_asr_mode(self.mode):
@@ -1061,12 +1315,32 @@ class QueueWorker(QObject):
                 save_segments_as_srt(base.with_suffix(".srt"), segments)
             elif self.mode.backend == "nuc_asr":
                 self.status.emit("Transcribing with NUC remote ASR (faster-whisper CUDA)...")
-                segments = _transcribe_via_nuc_asr(wav, base_url=str(self.mode.model), timeout=300)
+                duration = _probe_audio_duration(wav)
+                timeout = max(900, int(duration * 0.25 + 300))
+                self.status.emit(f"NUC remote ASR timeout budget: {timeout}s for {duration:.1f}s audio")
+                if source.startswith(("http://", "https://")):
+                    segments = _transcribe_via_nuc_asr(
+                        wav,
+                        base_url=str(self.mode.model),
+                        timeout=timeout,
+                        status_signal=self.status,
+                    )
+                else:
+                    segments = self._transcribe_local_file_via_nuc_job(
+                        wav,
+                        base_url=str(self.mode.model),
+                    )
                 save_segments_as_txt(base.with_suffix(".txt"), segments)
                 save_segments_as_srt(base.with_suffix(".srt"), segments)
             elif self.mode.backend == "nuc_qwen3_asr_1p7b":
                 self.status.emit("Transcribing with NUC remote Qwen3-ASR 1.7B (high-quality offline)...")
-                segments = self._transcribe_nuc_qwen3_asr_1p7b_chunked(wav, base_url=str(self.mode.model))
+                if source.startswith(("http://", "https://")):
+                    segments = self._transcribe_nuc_qwen3_asr_1p7b_chunked(wav, base_url=str(self.mode.model))
+                else:
+                    segments = self._transcribe_local_file_via_nuc_qwen_job(
+                        wav,
+                        base_url=str(self.mode.model),
+                    )
                 save_segments_as_txt(base.with_suffix(".txt"), segments)
                 save_segments_as_srt(base.with_suffix(".srt"), segments)
             else:

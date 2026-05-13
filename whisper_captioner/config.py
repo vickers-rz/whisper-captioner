@@ -49,6 +49,10 @@ NUC_OLLAMA_HOST = "192.168.31.196"
 NUC_OLLAMA_PORT = "11434"
 NUC_ASR_PORT = "8000"
 NUC_QWEN3_ASR_PORT = "8001"
+NUC_SSH_USER = os.environ.get("WHISPER_CAPTIONER_NUC_SSH_USER", "jack")
+NUC_SSH_PORT = os.environ.get("WHISPER_CAPTIONER_NUC_SSH_PORT", "22")
+NUC_REMOTE_ASR_ROOT = os.environ.get("WHISPER_CAPTIONER_NUC_ASR_ROOT", "/srv/qwen3-asr-1p7b")
+LOCAL_AUDIO_CACHE_DIR = CACHE_DIR / "local-audio"
 
 MLX_TERMS_SCRIPT = Path(__file__).with_name("mlx_terms.py")
 

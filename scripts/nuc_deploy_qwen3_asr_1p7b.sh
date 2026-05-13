@@ -25,19 +25,21 @@ sudo docker run -d \
   --gpus all \
   --restart unless-stopped \
   --network "${NETWORK_NAME}" \
+  -p 127.0.0.1:8010:8010 \
   --add-host host.docker.internal:host-gateway \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "${SERVICE_DIR}:/app" \
   -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
   -e ASR_HEALTH_URL=http://host.docker.internal:8000/health \
   -e ASR_BUSY_URL=http://host.docker.internal:8000/busy \
+  -e ASR_BACKEND_HEALTH_URL=http://nuc-asr-backend:8000/health \
   python:3.11-slim \
   bash -lc "pip install --no-cache-dir fastapi uvicorn httpx docker && uvicorn scheduler:app --app-dir /app --host 0.0.0.0 --port 8010"
 
 sudo docker run -d \
   --name nuc-qwen3-asr-1p7b-vllm \
   --gpus all \
-  --restart unless-stopped \
+  --restart no \
   --network "${NETWORK_NAME}" \
   -p 8002:8000 \
   -e HF_ENDPOINT=https://hf-mirror.com \
@@ -46,7 +48,7 @@ sudo docker run -d \
   qwen-asr-serve "${MODEL}" \
   --host 0.0.0.0 \
   --port 8000 \
-  --gpu-memory-utilization 0.8 \
+  --gpu-memory-utilization 0.75 \
   --max-model-len "${MAX_MODEL_LEN}" \
   --max-num-seqs 1
 

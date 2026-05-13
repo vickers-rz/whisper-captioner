@@ -6,6 +6,7 @@ NETWORK_NAME="${NETWORK_NAME:-qwen3-asr-net}"
 ASR_BACKEND_CONTAINER="${ASR_BACKEND_CONTAINER:-nuc-asr-backend}"
 ASR_PROXY_CONTAINER="${ASR_PROXY_CONTAINER:-nuc-asr}"
 ASR_IMAGE="${ASR_IMAGE:-fedirz/faster-whisper-server:latest-cuda}"
+ASR_PROXY_IMAGE="${ASR_PROXY_IMAGE:-nuc-asr-busy-proxy:latest}"
 UPSTREAM_PROXY_PORT="${UPSTREAM_PROXY_PORT:-8000}"
 UPSTREAM_BACKEND_PORT="${UPSTREAM_BACKEND_PORT:-18000}"
 WHISPER_MODEL="${WHISPER_MODEL:-large-v3}"
@@ -21,6 +22,10 @@ fi
 if [[ "${SOURCE_PROXY}" != "${SERVICE_DIR}/asr_busy_proxy.py" ]]; then
   sudo cp "${SOURCE_PROXY}" "${SERVICE_DIR}/asr_busy_proxy.py"
 fi
+if [[ -f "${SOURCE_DIR}/nuc_asr_busy_proxy.Dockerfile" ]]; then
+  sudo cp "${SOURCE_DIR}/nuc_asr_busy_proxy.Dockerfile" "${SERVICE_DIR}/Dockerfile.asr-busy-proxy"
+fi
+sudo docker build -t "${ASR_PROXY_IMAGE}" -f "${SERVICE_DIR}/Dockerfile.asr-busy-proxy" "${SERVICE_DIR}"
 sudo docker network create "${NETWORK_NAME}" >/dev/null 2>&1 || true
 
 if sudo docker ps --format '{{.Names}}' | grep -qx "${ASR_PROXY_CONTAINER}"; then
@@ -41,7 +46,7 @@ fi
 sudo docker run -d \
   --name "${ASR_BACKEND_CONTAINER}" \
   --gpus all \
-  --restart unless-stopped \
+  --restart no \
   --network "${NETWORK_NAME}" \
   -p "${UPSTREAM_BACKEND_PORT}:8000" \
   -e WHISPER__DEVICE=cuda \
@@ -59,10 +64,13 @@ sudo docker run -d \
   --name "${ASR_PROXY_CONTAINER}" \
   --restart unless-stopped \
   --network host \
+  -e SCHEDULER_URL=http://127.0.0.1:8010 \
+  -e ASR_RESULT_DIR=/app/asr-results \
+  -e ASR_STAGING_DIR=/app/asr-staging \
   -e UPSTREAM_BASE_URL="http://127.0.0.1:${UPSTREAM_BACKEND_PORT}" \
   -e UPSTREAM_HEALTH_URL="http://127.0.0.1:${UPSTREAM_BACKEND_PORT}/health" \
   -v "${SERVICE_DIR}:/app" \
-  python:3.11-slim \
-  bash -lc "pip install --no-cache-dir fastapi uvicorn httpx python-multipart && uvicorn asr_busy_proxy:app --app-dir /app --host 0.0.0.0 --port ${UPSTREAM_PROXY_PORT}"
+  "${ASR_PROXY_IMAGE}" \
+  uvicorn asr_busy_proxy:app --app-dir /app --host 0.0.0.0 --port "${UPSTREAM_PROXY_PORT}"
 
 echo "NUC faster-whisper busy proxy is now exposed on :${UPSTREAM_PROXY_PORT}, backend on :${UPSTREAM_BACKEND_PORT}"

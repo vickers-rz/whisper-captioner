@@ -53,6 +53,7 @@ def build_dashboard_panel(window):
     file_card = QGroupBox("缓存与文件")
     file_layout = QVBoxLayout(file_card)
     file_layout.addWidget(window.clear_cache_button)
+    file_layout.addWidget(window.clear_local_audio_cache_button)
     file_layout.addWidget(window.open_cache_button)
     file_layout.addWidget(window.open_outputs_button)
 

@@ -30,12 +30,21 @@ The project has been split out of the original single-file prototype:
 - `whisper_captioner/mlx_terms.py`: local Rapid-MLX/MLX term extraction helper, currently not part of the main Gemini full-document pipeline.
 - `whisper_captioner/qwen_chat_service.py`: local subtitle post-processing web workspace for Qwen3-8B / Gemini chat, manual subtitle upload, and second-stage-only cleanup or article rewriting.
 
+Current architecture notes:
+
+- `app.py`, `workers.py`, and `qwen_chat_service.py` are the main growth hotspots.
+- New transcription backend logic should be routed toward a shared transcriber service rather than duplicated between queue and controlled-playback workers.
+- New NUC lifecycle or priority decisions should live in the scheduler layer, with proxies kept as thin job/admission clients.
+- New subtitle post-processing workspace features should avoid expanding the single-file web service further; split storage, asset indexing, prompts, and HTTP routing first.
+- See `ARCHITECTURE_AUDIT_v2026-05-07.md` for the current refactor map and 2026-05-14 architecture review update.
+
 Runtime layout:
 
 - `~/Movies/WhisperCaptioner/artifacts/generated/`: generated subtitle, transcript, and shared Markdown outputs grouped by source title.
 - `~/Movies/WhisperCaptioner/artifacts/logs/`: application logs.
 - `~/Movies/WhisperCaptioner/artifacts/notes/`: standalone note exports that are not tied to a generated subtitle folder.
 - `~/Movies/WhisperCaptioner/cache/`: per-source processing caches and final segment JSON.
+- `~/Movies/WhisperCaptioner/cache/local-audio/`: extracted `16 kHz / mono / wav` cache for local media files. The same source file is reused across retries until you manually clear it or the source file changes.
 - `~/Movies/WhisperCaptioner/qwen-chat/`: web workspace uploads, storage, and action exports.
 - `~/Movies/WhisperCaptioner/realtime/`: persisted realtime session audio and review manifests.
 - `~/Movies/whisper-captioner_APP_Resource/whisper-models/`: local Whisper model binaries.
@@ -213,6 +222,17 @@ Current NUC port map:
 - `:8002`: debug-accessible `Qwen3-ASR 1.7B` backend served by official `qwen-asr-serve`.
 - `:11434`: Ollama LLM API.
 
+### Local File Remote ASR Cache
+
+For local media files, the app now avoids repeating `ffmpeg` extraction on every retry:
+
+- The Mac first converts the source file once into `~/Movies/WhisperCaptioner/cache/local-audio/<cache-key>/audio-16k-mono.wav`.
+- Retries reuse that cached WAV instead of extracting audio again.
+- The UI now exposes `删除本地音频缓存`, so the cache can be cleared manually for the current local file.
+- A different source file naturally gets a different cache key because the key includes the resolved path, file size, and mtime.
+
+This applies to both `NUC faster-whisper large-v3（远程 CUDA）` and `NUC Qwen3-ASR 1.7B（远程高质量离线）` when the source is a local file.
+
 ### NUC Qwen3-ASR 1.7B Deployment
 
 For a higher-quality long-audio path that does not replace the stable realtime `faster-whisper` service:
@@ -228,8 +248,9 @@ This deploys:
 - a lightweight serializing proxy on port `8001`
 - single-concurrency admission with a GPU-free-memory guard and `faster-whisper` busy-awareness
 - automatic backend warm-start before a request and idle backend shutdown after the request window expires
+- persistent host-side staging/results directories under `/srv/qwen3-asr-1p7b/qwen-asr-staging` and `/srv/qwen3-asr-1p7b/qwen-asr-results`
 
-To make `Qwen` automatically yield while `:8000` is handling a realtime `faster-whisper` request, enable the ASR busy proxy on the NUC:
+To let the scheduler arbitrate between `Qwen` and `faster-whisper`, enable the ASR busy proxy on the NUC:
 
 ```bash
 bash /Users/vickers/whisper-captioner/scripts/nuc_enable_asr_busy_proxy.sh
@@ -243,10 +264,47 @@ This keeps `:8000` as the app-facing endpoint, but turns it into a tiny front pr
 
 Admission behavior:
 
-- When `:8000/busy` reports active requests, `:8001` rejects new `Qwen` work with HTTP `429` so realtime/default ASR wins.
+- The current scheduler priority is now `Qwen3-ASR 1.7B` first, then `faster-whisper`.
+- When a Qwen offline job is active, `faster-whisper` admission is deferred instead of competing for the same GPU window.
+- When Qwen is idle, `faster-whisper` starts normally.
+- The `:8001` proxy still retries Qwen admission internally for queued local-file jobs instead of immediately surfacing a transient `429` or `503` to the Mac app.
+- Direct one-shot requests to `:8001/v1/audio/transcriptions` can still fail fast under contention; the Mac app's local-file path now prefers `POST /jobs/upload` plus `GET /jobs/{id}` polling.
 - When the busy endpoint is unavailable, the scheduler falls back to GPU utilization as a conservative signal.
 - When free GPU memory is below `MIN_FREE_MB_TO_START_QWEN`, `:8001` rejects with HTTP `503`.
 - After a `Qwen` request finishes, the backend is stopped after the idle timeout so it does not sit on VRAM.
+
+Current large-file local-file flow for `NUC Qwen3-ASR 1.7B`:
+
+1. Mac extracts and caches a full `audio-16k-mono.wav` once.
+2. Mac uploads that full cached WAV to `http://<NUC>:8001/jobs/upload`.
+3. The proxy writes the original upload to `/srv/qwen3-asr-1p7b/qwen-asr-staging/<task-id>/`.
+4. If the WAV is small enough, the proxy sends it upstream directly.
+5. If the WAV is larger than the direct-upload threshold, the proxy splits it on the NUC into `30s` WAV chunks with Python `wave`, uploads those chunks serially to the Qwen backend, and merges the transcript on the NUC side.
+6. Before merge, the proxy filters obvious repetition-hallucination chunks, for example a long chunk dominated by one short phrase repeated hundreds of times in a low-information audio window.
+7. The proxy writes `metadata.json`, `response.json`, and `chunks.json` into `/srv/qwen3-asr-1p7b/qwen-asr-results/<task-id>/`. Failed jobs also write `error.json`.
+
+Validated on 2026-05-13:
+
+- synthetic test file: `test-huge.wav`
+- size on NUC: about `68 MB`
+- duration: `2200s` (`36m40s`)
+- task id: `20260513-143855-test-huge.wav`
+- result: completed successfully after NUC-side chunking
+- chunk count: `74`
+- elapsed wall time from saved metadata: about `4m34s`
+
+Useful inspection paths on the NUC:
+
+- faster-whisper staging/results: `/srv/qwen3-asr-1p7b/asr-staging`, `/srv/qwen3-asr-1p7b/asr-results`
+- faster-whisper home shortcuts: `/home/jack/whisper-captioner-asr-files/staging`, `/home/jack/whisper-captioner-asr-files/results`
+- Qwen staging/results: `/srv/qwen3-asr-1p7b/qwen-asr-staging`, `/srv/qwen3-asr-1p7b/qwen-asr-results`
+
+Current retention policy:
+
+- These staging/results files are kept until manually deleted.
+- There is currently no TTL or automatic pruning job.
+- For Qwen, the NUC currently persists JSON metadata/results; final `.srt` and `.txt` are still exported by the Mac app.
+- When a Qwen chunk is filtered as obvious repetition hallucination, `chunks.json` keeps the chunk entry and records `filtered_reason`; the merged transcript treats that chunk as empty instead of exporting the repeated garbage text.
 
 Validated coexistence check:
 
@@ -280,6 +338,11 @@ Notes:
 - If a container does not stop cleanly, the script escalates from `docker stop` to `docker kill`, but it does not remove containers.
 
 The first deploy may take a while because the official image is large and Docker needs to pull it before the backend can start.
+
+Implementation note:
+
+- The `faster-whisper` busy proxy already uses a baked image (`scripts/nuc_asr_busy_proxy.Dockerfile`) and no longer does runtime `pip install`.
+- The current `Qwen3-ASR 1.7B` deploy script still launches `python:3.11-slim` containers and installs proxy dependencies at container start. That works, but it is not yet the fixed-image version.
 
 Operational intent:
 

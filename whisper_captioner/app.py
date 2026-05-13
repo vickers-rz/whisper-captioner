@@ -60,6 +60,7 @@ from whisper_captioner.workers import (
     RollingPrefetchWorker,
     clean_title_for_filename,
     infer_source_title,
+    local_audio_cache_dir_for_source,
     source_output_dir,
 )
 from whisper_captioner.config import (
@@ -69,6 +70,7 @@ from whisper_captioner.config import (
     DEFAULT_SUBTITLE_OFFSET,
     FFMPEG,
     GENERATED_DIR,
+    LOCAL_AUDIO_CACHE_DIR,
     LOG_DIR,
     NOTES_DIR,
     WHISPER_STREAM,
@@ -189,6 +191,7 @@ class MainWindow(QMainWindow):
         
         # Initial status update
         self.clear_cache_button.clicked.connect(self.clear_current_video_cache)
+        self.clear_local_audio_cache_button.clicked.connect(self.clear_current_local_audio_cache)
         self.open_cache_button.clicked.connect(self.open_current_cache_in_finder)
         self.open_outputs_button.clicked.connect(self.reveal_current_outputs_in_finder)
         self.rewind_5_button.clicked.connect(self.rewind_5s)
@@ -641,6 +644,18 @@ class MainWindow(QMainWindow):
         job_key = cache_slug(canonical, mode.backend, mode.model_name, 30)
         return CACHE_DIR / job_key
 
+    def _resolved_local_audio_cache_dir(self) -> Optional[Path]:
+        source = self.url_input.text().strip()
+        if not source:
+            return None
+        path = Path(source).expanduser()
+        if not path.exists() or not path.is_file():
+            return None
+        try:
+            return local_audio_cache_dir_for_source(str(path))
+        except OSError:
+            return None
+
     def clear_current_video_cache(self) -> None:
         cache_dir = self._resolved_cache_dir_for_current_mode()
         if not cache_dir or not cache_dir.exists():
@@ -664,9 +679,30 @@ class MainWindow(QMainWindow):
         self.log(f"Deleted current video cache: {cache_dir}")
         self.overlay.set_caption("Current video cache deleted")
 
+    def clear_current_local_audio_cache(self) -> None:
+        cache_dir = self._resolved_local_audio_cache_dir()
+        if not cache_dir or not cache_dir.exists():
+            QMessageBox.information(self, "缓存", "当前本地文件还没有可删除的音频缓存。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除本地音频缓存",
+            f"确认删除当前本地文件的音频缓存吗？\n\n{cache_dir}",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        self.log(f"Deleted local audio cache: {cache_dir}")
+        self.overlay.set_caption("Local audio cache deleted")
+
     def open_current_cache_in_finder(self) -> None:
         cache_dir = self._resolved_cache_dir_for_current_mode()
         if not cache_dir or not cache_dir.exists():
+            local_audio_cache = self._resolved_local_audio_cache_dir()
+            if local_audio_cache and local_audio_cache.exists():
+                subprocess.run(["open", str(local_audio_cache)], check=False)
+                self.log(f"Opened local audio cache in Finder: {local_audio_cache}")
+                return
             QMessageBox.information(self, "缓存", "当前视频 + 当前模式还没有缓存。")
             return
         subprocess.run(["open", str(cache_dir)], check=False)

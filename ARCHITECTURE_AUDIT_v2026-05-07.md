@@ -212,6 +212,92 @@ Key observation:
 8. The NUC service layer now includes container lifecycle control. Normal Qwen idle cleanup uses stop/start semantics, but deploy/recreate scripts should continue to be reviewed carefully because they change service topology.
 9. The `:8000` proxy preserves the public endpoint but adds one more hop; health checks must verify both proxy and upstream backend.
 
+## Architecture Review Update 2026-05-14
+
+The project has continued to grow into a local captioning workstation with several distinct product surfaces:
+
+- desktop Qt orchestration
+- controlled browser playback
+- realtime Loopback capture
+- batch/local media transcription
+- remote NUC ASR scheduling
+- local subtitle post-processing web workspace
+
+The core runtime is functional, but the main architectural risk is now concentration of responsibility rather than missing features.
+
+### Current Hotspots
+
+1. `whisper_captioner/app.py` is the application shell and also the de facto application controller.
+   It owns widget wiring, worker lifecycle, playback state, subtitle sync state, cache actions, session review actions, and LLM task orchestration.
+   Any future feature that touches controlled playback or worker state is likely to modify this file.
+
+2. `whisper_captioner/workers.py` is both a worker module and a transcription pipeline module.
+   It contains realtime capture workers, queue workers, controlled URL processing, backend dispatch, local/remote ASR calls, chunk repair, cache reads/writes, and subtitle export.
+   `QueueWorker` and `RollingPrefetchWorker` still duplicate important backend decisions.
+
+3. NUC scheduling policy is split across the Mac app, `nuc_faster_whisper_busy_proxy.py`, `nuc_qwen3_asr_1p7b_proxy.py`, and `nuc_service_scheduler.py`.
+   The current intended priority is Qwen offline work first when active, with faster-whisper admitted when Qwen is idle.
+   That policy should become explicit in one scheduler-level state machine instead of being inferred from several endpoints.
+
+4. NUC job state is mostly in proxy memory even though result files are persisted.
+   If a proxy restarts during or after a long job, `/jobs/{task_id}` can lose the task record while result files remain on disk.
+   A disk-backed `task.json` record would make long local-file jobs much easier to recover and debug.
+
+5. `whisper_captioner/qwen_chat_service.py` is a single-file web application.
+   It combines HTTP routing, embedded HTML, provider settings, conversation storage, asset discovery, subtitle parsing, LLM calls, and exports.
+   The history asset scan reparses generated subtitle files on request and should eventually be indexed by path and mtime.
+
+6. Process execution and remote HTTP calls are not yet centralized.
+   `subprocess`, `urllib`, `httpx`, and hand-built multipart payloads appear in several layers.
+   This makes timeout, cancellation, logging, and error formatting inconsistent.
+
+### Recommended Extraction Order
+
+This order keeps behavior stable while shrinking the highest-risk files:
+
+1. Add `transcribers/` or `services/transcriber_router.py`.
+   Create one public function or class method shaped like:
+
+   ```text
+   transcribe(audio_path, mode, context) -> list[SubtitleSegment]
+   ```
+
+   Both `QueueWorker` and `RollingPrefetchWorker` should call this instead of branching on every backend independently.
+
+2. Add `services/nuc_client.py`.
+   Move NUC upload, job polling, busy heartbeat reads, response validation, and segment conversion into one client.
+   The desktop app and workers should not know the details of `/jobs/upload` multipart construction.
+
+3. Add `infra/process_runner.py`.
+   Centralize subprocess streaming, stop handling, throttled status output, cwd selection, and error context.
+   Existing worker methods can become thin wrappers first, then be removed.
+
+4. Add `controllers/controlled_playback.py`.
+   Move controlled URL state, subtitle index lookup, Chrome playback actions, subtitle offset persistence, and playback-time anchoring out of `MainWindow`.
+   The Qt window should own widgets; the controller should own playback semantics.
+
+5. Add disk-backed NUC task records.
+   Each proxy-created task should write `task.json` next to staging/result data.
+   `GET /jobs/{task_id}` should first check memory, then recover from disk.
+
+6. Split `qwen_chat_service.py`.
+   Suggested first split:
+
+   - `qwen_chat/http_handler.py`
+   - `qwen_chat/storage.py`
+   - `qwen_chat/assets.py`
+   - `qwen_chat/prompts.py`
+
+   Add an asset index cache keyed by resolved path, size, and mtime.
+
+### Near-Term Guardrails
+
+- Do not add new backend-specific branches directly to both `QueueWorker` and `RollingPrefetchWorker`.
+- Do not add new scheduler priority rules in a proxy if they belong in `nuc_service_scheduler.py`.
+- Do not add more request routes to `QwenChatServiceManager` without extracting routing or storage first.
+- Prefer new small service modules over growing `app.py` or `workers.py`.
+- When adding cache formats, include a signature/version and a recovery path for legacy files.
+
 ## Recommended Target Structure
 
 ```mermaid
