@@ -90,7 +90,7 @@ Current flow:
 4. If no valid final cache exists, download audio with `yt-dlp`.
 5. Split audio into 30-second chunks with `ffmpeg`.
 6. Transcribe each chunk with the currently selected backend and shift chunk-local timestamps onto the full-video timeline.
-7. Run Gemini 2.5 Flash once over the full transcript when enabled.
+7. Run full-document LLM proofreading when enabled and the selected provider is ready. The default configured provider is Gemini 2.5 Flash, but the pipeline uses the provider selected in the UI.
 8. Save `final-subtitles-current.json` plus exported `.srt` and `.txt`.
 9. Start Chrome at 0 seconds and render subtitles by polling the controlled video's `currentTime` without repeatedly stealing focus from the user.
 
@@ -171,7 +171,7 @@ Recommended defaults:
 
 - Default subtitles: `whisper.cpp large-v3-turbo-q5_0`.
 - Non-live video where delay is acceptable: `Controlled URL captions`.
-- Maximum accuracy batch work: `Delayed max accuracy (large-v3 q5_0)`.
+- Maximum accuracy batch work: `whisper.cpp 高精度 q5_0（large-v3）`.
 
 Backend benchmark note:
 
@@ -267,8 +267,8 @@ Admission behavior:
 - The current scheduler priority is now `Qwen3-ASR 1.7B` first, then `faster-whisper`.
 - When a Qwen offline job is active, `faster-whisper` admission is deferred instead of competing for the same GPU window.
 - When Qwen is idle, `faster-whisper` starts normally.
-- The `:8001` proxy still retries Qwen admission internally for queued local-file jobs instead of immediately surfacing a transient `429` or `503` to the Mac app.
-- Direct one-shot requests to `:8001/v1/audio/transcriptions` can still fail fast under contention; the Mac app's local-file path now prefers `POST /jobs/upload` plus `GET /jobs/{id}` polling.
+- The `:8001` proxy retries Qwen admission internally instead of immediately surfacing transient scheduler `429` or `503` responses.
+- The Mac app's local-file NUC paths prefer `POST /jobs/upload` plus `GET /jobs/{id}` polling, so long jobs can keep reporting progress even when the original upload request would otherwise be fragile.
 - When the busy endpoint is unavailable, the scheduler falls back to GPU utilization as a conservative signal.
 - When free GPU memory is below `MIN_FREE_MB_TO_START_QWEN`, `:8001` rejects with HTTP `503`.
 - After a `Qwen` request finishes, the backend is stopped after the idle timeout so it does not sit on VRAM.
@@ -278,7 +278,7 @@ Current large-file local-file flow for `NUC Qwen3-ASR 1.7B`:
 1. Mac extracts and caches a full `audio-16k-mono.wav` once.
 2. Mac uploads that full cached WAV to `http://<NUC>:8001/jobs/upload`.
 3. The proxy writes the original upload to `/srv/qwen3-asr-1p7b/qwen-asr-staging/<task-id>/`.
-4. If the WAV is small enough, the proxy sends it upstream directly.
+4. If the WAV is small enough, the proxy sends it upstream directly and spreads the returned text over the real WAV duration with approximate sentence-level timestamps.
 5. If the WAV is larger than the direct-upload threshold, the proxy splits it on the NUC into `30s` WAV chunks with Python `wave`, uploads those chunks serially to the Qwen backend, and merges the transcript on the NUC side.
 6. Before merge, the proxy filters obvious repetition-hallucination chunks, for example a long chunk dominated by one short phrase repeated hundreds of times in a low-information audio window.
 7. The proxy writes `metadata.json`, `response.json`, and `chunks.json` into `/srv/qwen3-asr-1p7b/qwen-asr-results/<task-id>/`. Failed jobs also write `error.json`.
@@ -288,7 +288,7 @@ Validated on 2026-05-13:
 - synthetic test file: `test-huge.wav`
 - size on NUC: about `68 MB`
 - duration: `2200s` (`36m40s`)
-- task id: `20260513-143855-test-huge.wav`
+- task id: `20260513-143855-test-huge.wav` in the original validation run. New task IDs include a short random suffix, for example `YYYYMMDD-HHMMSS-<8hex>-filename.wav`, to avoid collisions when multiple uploads start in the same second.
 - result: completed successfully after NUC-side chunking
 - chunk count: `74`
 - elapsed wall time from saved metadata: about `4m34s`
@@ -313,7 +313,7 @@ curl -fsS http://127.0.0.1:8000/busy
 curl -fsS http://127.0.0.1:8001/healthz
 ```
 
-During an active `:8000` transcription, `/busy` should report `active_requests: 1`, and a concurrent `:8001` transcription request should be deferred with HTTP `429`.
+During an active `:8000` transcription, `/busy` should report `active_requests: 1`. During an active Qwen job, the scheduler should defer new faster-whisper admission; Qwen requests themselves wait inside the `:8001` proxy until admission succeeds or the configured wait budget expires.
 
 ### NUC GPU Guard Helper
 
@@ -383,12 +383,12 @@ Chrome / video player
       -> Loopback virtual device
 ```
 
-In the app, select a realtime mode such as `Realtime small`, set the Loopback capture device ID, and click `实时字幕`.
-Use `列出音频输入设备` in Settings to inspect AVFoundation device IDs if Loopback is not device `0`.
+In the app, select a realtime mode such as `实时字幕 whisper.cpp small（SoundSource/Loopback）`, set the Loopback capture device ID, and click `实时字幕`.
+Use `列出音频输入设备` in Settings to inspect AVFoundation device IDs. Loopback is often device `0`, but the app can save whichever numeric capture ID is detected or entered.
 
 Current app behavior:
 
-- `实时字幕` will automatically switch to the `实时字幕 whisper.cpp small（SoundSource/Loopback）` mode if you are not already on a realtime mode.
+- `实时字幕` will automatically switch to `实时字幕 NUC large-v3（远程 CUDA，3s延迟）` when that mode exists in the mode list; if not, it falls back to `实时字幕 whisper.cpp small（SoundSource/Loopback）`.
 - `Loopback 输入` is the `whisper-stream -c` capture device ID.
 - The `?` help buttons next to realtime controls explain routing and capture ID usage directly in the UI.
 
@@ -411,7 +411,7 @@ Current app behavior:
 
 ## Requirements
 
-- Loopback input device: `Whisper Captions`, visible to AVFoundation as audio device `0`.
+- Loopback input device: usually named `Whisper Captions` or `Loopback` in AVFoundation. Device `0` is common on this setup, but the app should use the numeric ID reported by `列出音频输入设备`.
 - Whisper models in `~/Movies/whisper-captioner_APP_Resource/whisper-models`.
 - Hugging Face cache in `~/Movies/whisper-captioner_APP_Resource/huggingface-cache`.
 - `whisper-stream`, `whisper-cli`, `ffmpeg`, `ffprobe`, and `yt-dlp`.

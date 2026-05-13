@@ -29,6 +29,19 @@ For local files from the Mac app:
 
 This avoids repeating `ffmpeg` extraction on the Mac and avoids wasting GPU work when the Mac-side HTTP request times out.
 
+The Mac app now uses the proxy job endpoints for local-file NUC transcription:
+
+- upload: `POST /jobs/upload`
+- poll: `GET /jobs/{task_id}`
+
+Task IDs include a timestamp, a short random suffix, and the safe filename, for example:
+
+```text
+YYYYMMDD-HHMMSS-<8hex>-audio-16k-mono.wav
+```
+
+The random suffix avoids collisions when repeated uploads happen in the same second.
+
 ## NUC Paths
 
 ### faster-whisper
@@ -61,6 +74,9 @@ Each staging directory usually contains:
 
 - the uploaded WAV
 - `upload.json`
+
+Small Qwen uploads are sent upstream as a single WAV and the returned text is spread across the real WAV duration with approximate sentence-level timestamps.
+Large Qwen uploads are split into `30s` WAV chunks on the NUC side, then merged back into one response.
 
 ## Current Retention Policy
 
@@ -95,6 +111,8 @@ Verified on 2026-05-13:
 - chunking: enabled
 - chunk count: `74`
 - outcome: completed
+
+Newer task IDs include an 8-character random suffix, so current result directories no longer use only `timestamp-filename`.
 
 ## Known Current Boundaries
 

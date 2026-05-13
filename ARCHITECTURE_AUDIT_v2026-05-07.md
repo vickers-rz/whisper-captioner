@@ -21,7 +21,7 @@ This document captures the current code structure, the main runtime flows, and t
 
 ## Current Mainlines
 
-The project now has two primary runtime flows:
+The project now has three primary runtime flows:
 
 ### 1. Controlled URL Captions
 
@@ -53,9 +53,9 @@ The NUC now runs two ASR lanes with explicit scheduling:
 2. `:8000` is now a lightweight busy-aware proxy that exposes `/health`, `/busy`, and `/v1/audio/transcriptions`.
 3. The proxy forwards real `faster-whisper-server` work to the internal backend on `:18000`.
 4. The optional `Qwen3-ASR 1.7B` offline lane remains app-facing on `:8001`, with its backend on `:8002`.
-5. `nuc-service-scheduler` reads Docker state, GPU memory, and the `:8000/busy` signal before admitting `Qwen` work.
-6. If `faster-whisper` has active requests, `Qwen` admission returns HTTP `429` so the realtime/default lane keeps priority.
-7. If `Qwen` is admitted, the scheduler starts the backend on demand and the proxy schedules idle shutdown after the request window.
+5. `nuc-service-scheduler` reads Docker state, GPU memory, and ASR/Qwen busy signals before admitting work.
+6. The current scheduler priority is Qwen offline work first when active, then faster-whisper when Qwen is idle.
+7. The Qwen proxy waits internally for admission on transient scheduler `429` / `503` responses, starts the backend on demand, and schedules idle shutdown after the request window.
 
 ## Current Dependency Map
 
