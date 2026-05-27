@@ -3,7 +3,8 @@ set -u
 
 WHISPER_STREAM="${WHISPER_STREAM:-/opt/homebrew/bin/whisper-stream}"
 FFMPEG="${FFMPEG:-/opt/homebrew/bin/ffmpeg}"
-MODEL="${MODEL:-$HOME/Movies/whisper-captioner_APP_Resource/whisper-models/ggml-small.bin}"
+RESOURCE_DIR="${WHISPER_CAPTIONER_RESOURCE_DIR:-/Volumes/T7/MacBackup/Movies/whisper-captioner_APP_Resource}"
+MODEL="${MODEL:-$RESOURCE_DIR/whisper-models/ggml-small.bin}"
 
 RUN_PIDS=()
 TMP_FILES=()

@@ -6,10 +6,35 @@ from pathlib import Path
 
 HOME = Path.home()
 PROJECT_ROOT = Path(__file__).parent.parent
-OUTPUT_DIR = HOME / "Movies" / "WhisperCaptioner"
+
+
+def _env_path(name: str, default: Path) -> Path:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    return Path(raw).expanduser()
+
+
+def _first_existing_path(primary: Path, fallback: Path) -> Path:
+    return primary if primary.exists() else fallback
+
+
+DEFAULT_T7_MOVIES_DIR = Path("/Volumes/T7/MacBackup/Movies")
+LOCAL_MODELS_DIR = _env_path(
+    "WHISPER_CAPTIONER_LOCAL_MODELS_DIR",
+    HOME / "local-models" / "whisper-captioner",
+)
+
+OUTPUT_DIR = _env_path(
+    "WHISPER_CAPTIONER_OUTPUT_DIR",
+    DEFAULT_T7_MOVIES_DIR / "WhisperCaptioner",
+)
 ARTIFACTS_DIR = OUTPUT_DIR / "artifacts"
 GENERATED_DIR = ARTIFACTS_DIR / "generated"
-APP_RESOURCE_DIR = HOME / "Movies" / "whisper-captioner_APP_Resource"
+APP_RESOURCE_DIR = _env_path(
+    "WHISPER_CAPTIONER_RESOURCE_DIR",
+    DEFAULT_T7_MOVIES_DIR / "whisper-captioner_APP_Resource",
+)
 MODELS_DIR = APP_RESOURCE_DIR / "whisper-models"
 THIRD_PARTY_DIR = APP_RESOURCE_DIR / "third_party"
 HF_CACHE_DIR = APP_RESOURCE_DIR / "huggingface-cache"
@@ -25,15 +50,30 @@ REALTIME_POLISH_BATCH_SECONDS = 30.0
 
 WHISPER_STREAM = "/opt/homebrew/bin/whisper-stream"
 WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
-MLX_WHISPER = "/opt/anaconda3/envs/pyside6/bin/mlx_whisper"
-MLX_AUDIO_STT = "/opt/anaconda3/envs/pyside6/bin/mlx_audio.stt.generate"
+PYSIDE6_ENV_DIR = _env_path(
+    "WHISPER_CAPTIONER_PYSIDE6_ENV_DIR",
+    HOME / "miniforge3" / "envs" / "whishperapp_pyside6",
+)
+MLX_WHISPER = str(PYSIDE6_ENV_DIR / "bin" / "mlx_whisper")
+MLX_AUDIO_STT = str(PYSIDE6_ENV_DIR / "bin" / "mlx_audio.stt.generate")
 FFMPEG = "/opt/homebrew/bin/ffmpeg"
 YT_DLP = "/opt/homebrew/bin/yt-dlp"
 FFPROBE = "/opt/homebrew/bin/ffprobe"
-SENSE_VOICE_CPP_MAIN = str(THIRD_PARTY_DIR / "SenseVoice.cpp" / "build/bin/sense-voice-main")
-SENSE_VOICE_CPP_FP16_MODEL = str(
-    THIRD_PARTY_DIR / "SenseVoice.cpp" / "models/sense-voice-gguf/sense-voice-small-fp16.gguf"
+SENSE_VOICE_CPP_DIR = _env_path(
+    "WHISPER_CAPTIONER_SENSEVOICE_DIR",
+    LOCAL_MODELS_DIR / "SenseVoice.cpp",
 )
+T7_SENSE_VOICE_CPP_DIR = THIRD_PARTY_DIR / "SenseVoice.cpp"
+SENSE_VOICE_CPP_MAIN_PATH = _first_existing_path(
+    SENSE_VOICE_CPP_DIR / "build/bin/sense-voice-main",
+    T7_SENSE_VOICE_CPP_DIR / "build/bin/sense-voice-main",
+)
+SENSE_VOICE_CPP_FP16_MODEL_PATH = _first_existing_path(
+    SENSE_VOICE_CPP_DIR / "models/sense-voice-gguf/sense-voice-small-fp16.gguf",
+    T7_SENSE_VOICE_CPP_DIR / "models/sense-voice-gguf/sense-voice-small-fp16.gguf",
+)
+SENSE_VOICE_CPP_MAIN = str(SENSE_VOICE_CPP_MAIN_PATH)
+SENSE_VOICE_CPP_FP16_MODEL = str(SENSE_VOICE_CPP_FP16_MODEL_PATH)
 
 RAPIDMLX_PYTHON = "/opt/anaconda3/envs/rapidmlx/bin/python"
 RAPIDMLX_BIN = "/opt/anaconda3/envs/rapidmlx/bin/rapid-mlx"

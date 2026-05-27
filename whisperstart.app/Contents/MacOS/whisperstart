@@ -1,0 +1,40 @@
+#!/bin/zsh
+set -euo pipefail
+
+PROJECT_DIR="/Users/vickers/Documents/whisper-captioner"
+ENV_PYTHON="/Users/vickers/miniforge3/envs/whishperapp_pyside6/bin/python"
+APP_ENTRY="$PROJECT_DIR/whisper_captioner/app.py"
+LAUNCH_LOG_DIR="$HOME/Library/Logs/WhisperCaptioner"
+LOG_FILE="$LAUNCH_LOG_DIR/whisperstart-launch.log"
+
+export PATH="/opt/homebrew/bin:/Users/vickers/miniforge3/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export HF_HOME="${WHISPER_CAPTIONER_HF_HOME:-/Volumes/T7/MacBackup/Movies/whisper-captioner_APP_Resource/huggingface-cache}"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+
+mkdir -p "$LAUNCH_LOG_DIR"
+
+existing_pid="$(pgrep -f "$APP_ENTRY" | head -n 1 || true)"
+if [[ -n "$existing_pid" ]]; then
+  /usr/bin/osascript -e "tell application \"System Events\" to set frontmost of the first process whose unix id is $existing_pid to true" >/dev/null 2>&1 || true
+  exit 0
+fi
+
+if [[ ! -x "$ENV_PYTHON" ]]; then
+  /usr/bin/osascript -e 'display alert "Whisper Captioner failed to start" message "Python environment not found: /Users/vickers/miniforge3/envs/whishperapp_pyside6/bin/python"'
+  exit 1
+fi
+
+if [[ ! -f "$APP_ENTRY" ]]; then
+  /usr/bin/osascript -e 'display alert "Whisper Captioner failed to start" message "App entry not found: /Users/vickers/Documents/whisper-captioner/whisper_captioner/app.py"'
+  exit 1
+fi
+
+cd "$PROJECT_DIR"
+{
+  echo "[$(/bin/date '+%Y-%m-%d %H:%M:%S')] Launching Whisper Captioner"
+  echo "Project: $PROJECT_DIR"
+  echo "Python: $ENV_PYTHON"
+} >>"$LOG_FILE"
+
+exec "$ENV_PYTHON" "$APP_ENTRY" >>"$LOG_FILE" 2>&1

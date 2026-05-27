@@ -5,13 +5,13 @@ Local macOS caption helper for Loopback audio and controlled web-video subtitle 
 ## Run
 
 ```bash
-conda run -n pyside6 python /Users/vickers/whisper-captioner/whisper_captioner/app.py
+conda run -n whishperapp_pyside6 python /Users/vickers/Documents/whisper-captioner/whisper_captioner/app.py
 ```
 
 Or:
 
 ```bash
-bash /Users/vickers/whisper-captioner/run.sh
+bash /Users/vickers/Documents/whisper-captioner/run.sh
 ```
 
 ## Current Architecture
@@ -40,16 +40,30 @@ Current architecture notes:
 
 Runtime layout:
 
-- `~/Movies/WhisperCaptioner/artifacts/generated/`: generated subtitle, transcript, and shared Markdown outputs grouped by source title.
-- `~/Movies/WhisperCaptioner/artifacts/logs/`: application logs.
-- `~/Movies/WhisperCaptioner/artifacts/notes/`: standalone note exports that are not tied to a generated subtitle folder.
-- `~/Movies/WhisperCaptioner/cache/`: per-source processing caches and final segment JSON.
-- `~/Movies/WhisperCaptioner/cache/local-audio/`: extracted `16 kHz / mono / wav` cache for local media files. The same source file is reused across retries until you manually clear it or the source file changes.
-- `~/Movies/WhisperCaptioner/qwen-chat/`: web workspace uploads, storage, and action exports.
-- `~/Movies/WhisperCaptioner/realtime/`: persisted realtime session audio and review manifests.
-- `~/Movies/whisper-captioner_APP_Resource/whisper-models/`: local Whisper model binaries.
-- `~/Movies/whisper-captioner_APP_Resource/third_party/`: local third-party source checkouts and built binaries used by optional backends.
-- `~/Movies/whisper-captioner_APP_Resource/huggingface-cache/`: Hugging Face / MLX model cache used by `huggingface_hub`, `mlx-audio`, and related downloads.
+- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/artifacts/generated/`: generated subtitle, transcript, and shared Markdown outputs grouped by source title.
+- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/artifacts/logs/`: application logs.
+- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/artifacts/notes/`: standalone note exports that are not tied to a generated subtitle folder.
+- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/cache/`: per-source processing caches and final segment JSON.
+- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/cache/local-audio/`: extracted `16 kHz / mono / wav` cache for local media files. The same source file is reused across retries until you manually clear it or the source file changes.
+- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/qwen-chat/`: web workspace uploads, storage, and action exports.
+- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/realtime/`: persisted realtime session audio and review manifests.
+- `/Volumes/T7/MacBackup/Movies/whisper-captioner_APP_Resource/whisper-models/`: local Whisper model binaries that are not kept on the Mac SSD.
+- `/Volumes/T7/MacBackup/Movies/whisper-captioner_APP_Resource/third_party/`: T7 fallback for local third-party source checkouts and built binaries used by optional backends.
+- `/Volumes/T7/MacBackup/Movies/whisper-captioner_APP_Resource/huggingface-cache/`: Hugging Face / MLX model cache used by `huggingface_hub`, `mlx-audio`, and related downloads.
+- `~/local-models/whisper-captioner/SenseVoice.cpp/`: Mac SSD SenseVoice.cpp FP16 fast path. The app uses this copy first and falls back to the T7 SenseVoice.cpp tree if the SSD copy is missing.
+
+Path overrides:
+
+- `WHISPER_CAPTIONER_OUTPUT_DIR`: runtime output root; defaults to `/Volumes/T7/MacBackup/Movies/WhisperCaptioner`.
+- `WHISPER_CAPTIONER_RESOURCE_DIR`: model/resource root; defaults to `/Volumes/T7/MacBackup/Movies/whisper-captioner_APP_Resource`.
+- `WHISPER_CAPTIONER_LOCAL_MODELS_DIR`: Mac SSD local model root; defaults to `~/local-models/whisper-captioner`.
+- `WHISPER_CAPTIONER_SENSEVOICE_DIR`: SenseVoice.cpp SSD runtime root; defaults to `~/local-models/whisper-captioner/SenseVoice.cpp`.
+
+To prepare the SSD SenseVoice.cpp runtime:
+
+```bash
+bash scripts/migrate_local_sensevoice_runtime.sh
+```
 
 ## Current Stability Notes
 
@@ -238,7 +252,7 @@ This applies to both `NUC faster-whisper large-v3（远程 CUDA）` and `NUC Qwe
 For a higher-quality long-audio path that does not replace the stable realtime `faster-whisper` service:
 
 ```bash
-bash /Users/vickers/whisper-captioner/scripts/nuc_deploy_qwen3_asr_1p7b.sh
+bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_deploy_qwen3_asr_1p7b.sh
 ```
 
 This deploys:
@@ -253,7 +267,7 @@ This deploys:
 To let the scheduler arbitrate between `Qwen` and `faster-whisper`, enable the ASR busy proxy on the NUC:
 
 ```bash
-bash /Users/vickers/whisper-captioner/scripts/nuc_enable_asr_busy_proxy.sh
+bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_enable_asr_busy_proxy.sh
 ```
 
 This keeps `:8000` as the app-facing endpoint, but turns it into a tiny front proxy that:
@@ -320,12 +334,12 @@ During an active `:8000` transcription, `/busy` should report `active_requests: 
 When the NUC GPU gets pinned by `Qwen3-ASR 1.7B` or `faster-whisper`, use:
 
 ```bash
-bash /Users/vickers/whisper-captioner/scripts/nuc_gpu_memory_guard.sh status
-bash /Users/vickers/whisper-captioner/scripts/nuc_gpu_memory_guard.sh auto-clean
-bash /Users/vickers/whisper-captioner/scripts/nuc_gpu_memory_guard.sh prep-asr
-bash /Users/vickers/whisper-captioner/scripts/nuc_gpu_memory_guard.sh idle-watch
-bash /Users/vickers/whisper-captioner/scripts/nuc_gpu_memory_guard.sh unload-all
-bash /Users/vickers/whisper-captioner/scripts/nuc_gpu_memory_guard.sh start-qwen
+bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh status
+bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh auto-clean
+bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh prep-asr
+bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh idle-watch
+bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh unload-all
+bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh start-qwen
 ```
 
 Notes:
@@ -415,7 +429,7 @@ Current app behavior:
 - Whisper models in `~/Movies/whisper-captioner_APP_Resource/whisper-models`.
 - Hugging Face cache in `~/Movies/whisper-captioner_APP_Resource/huggingface-cache`.
 - `whisper-stream`, `whisper-cli`, `ffmpeg`, `ffprobe`, and `yt-dlp`.
-- Conda env `pyside6` for the GUI.
+- Conda env `whishperapp_pyside6` for the GUI.
 - Local SenseVoice.cpp checkout and GGUF model under `~/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp` if you want the `SenseVoice.cpp FP16` backend.
 
 ### SenseVoice.cpp Setup

@@ -5,7 +5,7 @@
 Claude 已经把原来的单文件原型拆成多个模块，当前代码可以通过 Python 编译检查：
 
 ```bash
-/opt/anaconda3/envs/pyside6/bin/python -m compileall -q /Users/vickers/whisper-captioner/whisper_captioner
+/Users/vickers/miniforge3/envs/whishperapp_pyside6/bin/python -m compileall -q /Users/vickers/Documents/whisper-captioner/whisper_captioner
 ```
 
 当前核心模块：

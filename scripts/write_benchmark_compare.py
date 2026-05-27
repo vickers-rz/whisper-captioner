@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +11,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from whisper_captioner.subtitle_io import parse_sense_voice_output, save_segments_as_srt, save_segments_as_txt
 
 
-COMPARE_DIR = Path("/Users/vickers/Movies/WhisperCaptioner/benchmark-30s-model-compare")
+OUTPUT_DIR = Path(os.environ.get("WHISPER_CAPTIONER_OUTPUT_DIR", "/Volumes/T7/MacBackup/Movies/WhisperCaptioner")).expanduser()
+COMPARE_DIR = OUTPUT_DIR / "benchmark-30s-model-compare"
 SENSE_STDOUT = COMPARE_DIR / "sensevoicecpp-fp16.stdout.txt"
 SENSE_TXT = COMPARE_DIR / "sensevoicecpp-fp16.txt"
 SENSE_SRT = COMPARE_DIR / "sensevoicecpp-fp16.srt"
