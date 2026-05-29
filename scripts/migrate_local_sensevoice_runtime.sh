@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SOURCE_DIR="${WHISPER_CAPTIONER_T7_SENSEVOICE_DIR:-/Volumes/T7/MacBackup/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp}"
-TARGET_DIR="${WHISPER_CAPTIONER_SENSEVOICE_DIR:-$HOME/local-models/whisper-captioner/SenseVoice.cpp}"
+SOURCE_DIR="${WHISPER_CAPTIONER_T7_SENSEVOICE_DIR:-/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp}"
+TARGET_DIR="${WHISPER_CAPTIONER_SENSEVOICE_DIR:-/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/local-models/SenseVoice.cpp}"
 OLD_RPATH="${WHISPER_CAPTIONER_OLD_SENSEVOICE_RPATH:-$HOME/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp/build/lib}"
 
 SOURCE_BIN="$SOURCE_DIR/build/bin/sense-voice-main"

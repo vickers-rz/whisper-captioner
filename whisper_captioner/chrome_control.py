@@ -19,7 +19,20 @@ VIDEO_PICKER_JS = (
 )
 
 
+def chrome_is_running() -> bool:
+    proc = subprocess.run(
+        ["/usr/bin/pgrep", "-x", "Google Chrome"],
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
 def run_chrome_script(script: str) -> str:
+    if not chrome_is_running():
+        return ""
     escaped = script.replace("\\", "\\\\").replace('"', '\\"')
     apple_script = (
         'tell application "Google Chrome"\n'
@@ -38,6 +51,8 @@ def run_chrome_script(script: str) -> str:
 
 
 def run_chrome_script_for_url(target_url: str, script: str, activate_tab: bool = True) -> str:
+    if not chrome_is_running():
+        return ""
     safe_url = target_url.replace("\\", "\\\\").replace('"', '\\"')
     escaped = script.replace("\\", "\\\\").replace('"', '\\"')
     activation = ""
@@ -195,6 +210,8 @@ def chrome_seek_url_relative(target_url: str, delta_seconds: float) -> Optional[
 
 
 def chrome_get_url() -> str:
+    if not chrome_is_running():
+        return ""
     apple_script = (
         'tell application "Google Chrome"\n'
         '  if not (exists window 1) then return ""\n'

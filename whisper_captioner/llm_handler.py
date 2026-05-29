@@ -74,8 +74,14 @@ def _llm_request(api_url: str, body: dict, headers: dict, timeout: int = 15) -> 
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace").strip()
+        if detail:
+            raise RuntimeError(f"HTTP {exc.code} {exc.reason}: {detail}") from exc
+        raise
 
 
 def _rapidmlx_models_url(port: str) -> str:

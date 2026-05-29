@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from whisper_captioner.subtitle_io import parse_sense_voice_output, save_segments_as_srt, save_segments_as_txt
 
 
-OUTPUT_DIR = Path(os.environ.get("WHISPER_CAPTIONER_OUTPUT_DIR", "/Volumes/T7/MacBackup/Movies/WhisperCaptioner")).expanduser()
+OUTPUT_DIR = Path(os.environ.get("WHISPER_CAPTIONER_OUTPUT_DIR", "/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner")).expanduser()
 COMPARE_DIR = OUTPUT_DIR / "benchmark-30s-model-compare"
 SENSE_STDOUT = COMPARE_DIR / "sensevoicecpp-fp16.stdout.txt"
 SENSE_TXT = COMPARE_DIR / "sensevoicecpp-fp16.txt"

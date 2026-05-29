@@ -40,26 +40,26 @@ Current architecture notes:
 
 Runtime layout:
 
-- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/artifacts/generated/`: generated subtitle, transcript, and shared Markdown outputs grouped by source title.
-- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/artifacts/logs/`: application logs.
-- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/artifacts/notes/`: standalone note exports that are not tied to a generated subtitle folder.
-- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/cache/`: per-source processing caches and final segment JSON.
-- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/cache/local-audio/`: extracted `16 kHz / mono / wav` cache for local media files. The same source file is reused across retries until you manually clear it or the source file changes.
-- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/qwen-chat/`: web workspace uploads, storage, and action exports.
-- `/Volumes/T7/MacBackup/Movies/WhisperCaptioner/realtime/`: persisted realtime session audio and review manifests.
-- `/Volumes/T7/MacBackup/Movies/whisper-captioner_APP_Resource/whisper-models/`: local Whisper model binaries that are not kept on the Mac SSD.
-- `/Volumes/T7/MacBackup/Movies/whisper-captioner_APP_Resource/third_party/`: T7 fallback for local third-party source checkouts and built binaries used by optional backends.
-- `/Volumes/T7/MacBackup/Movies/whisper-captioner_APP_Resource/huggingface-cache/`: Hugging Face / MLX model cache used by `huggingface_hub`, `mlx-audio`, and related downloads.
-- `~/local-models/whisper-captioner/SenseVoice.cpp/`: Mac SSD SenseVoice.cpp FP16 fast path. The app uses this copy first and falls back to the T7 SenseVoice.cpp tree if the SSD copy is missing.
+- `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/`: generated subtitle, transcript, and shared Markdown outputs grouped by source title.
+- `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/logs/`: application logs.
+- `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/notes/`: standalone note exports that are not tied to a generated subtitle folder.
+- `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/cache/`: per-source processing caches and final segment JSON.
+- `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/cache/local-audio/`: extracted `16 kHz / mono / wav` cache for local media files. The same source file is reused across retries until you manually clear it or the source file changes.
+- `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/qwen-chat/`: web workspace uploads, storage, and action exports.
+- `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/realtime/`: persisted realtime session audio and review manifests.
+- `/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/whisper-models/`: local Whisper model binaries.
+- `/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/third_party/`: local third-party source checkouts and built binaries used by optional backends.
+- `/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/huggingface-cache/`: Hugging Face / MLX model cache used by `huggingface_hub`, `mlx-audio`, and related downloads.
+- `/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/local-models/SenseVoice.cpp/`: default SenseVoice.cpp FP16 runtime path.
 
 Path overrides:
 
-- `WHISPER_CAPTIONER_OUTPUT_DIR`: runtime output root; defaults to `/Volumes/T7/MacBackup/Movies/WhisperCaptioner`.
-- `WHISPER_CAPTIONER_RESOURCE_DIR`: model/resource root; defaults to `/Volumes/T7/MacBackup/Movies/whisper-captioner_APP_Resource`.
-- `WHISPER_CAPTIONER_LOCAL_MODELS_DIR`: Mac SSD local model root; defaults to `~/local-models/whisper-captioner`.
-- `WHISPER_CAPTIONER_SENSEVOICE_DIR`: SenseVoice.cpp SSD runtime root; defaults to `~/local-models/whisper-captioner/SenseVoice.cpp`.
+- `WHISPER_CAPTIONER_OUTPUT_DIR`: runtime output root; defaults to `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner`.
+- `WHISPER_CAPTIONER_RESOURCE_DIR`: model/resource root; defaults to `/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource`.
+- `WHISPER_CAPTIONER_LOCAL_MODELS_DIR`: local model root; defaults to `/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/local-models`.
+- `WHISPER_CAPTIONER_SENSEVOICE_DIR`: SenseVoice.cpp runtime root; defaults to `/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/local-models/SenseVoice.cpp`.
 
-To prepare the SSD SenseVoice.cpp runtime:
+To prepare the local SenseVoice.cpp runtime:
 
 ```bash
 bash scripts/migrate_local_sensevoice_runtime.sh
@@ -128,7 +128,7 @@ The local Qwen web entry has been expanded into a subtitle post-processing works
 What it can do:
 
 - Upload third-party `.srt`, `.vtt`, or `.txt` files without running the transcription pipeline.
-- Scan previously generated subtitle files under `~/Movies/WhisperCaptioner/artifacts/generated/` and show them in a history sidebar.
+- Scan previously generated subtitle files under `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/` and show them in a history sidebar.
 - Attach any uploaded or historical subtitle file to a work conversation.
 - Chat with the LLM grounded on the attached subtitle content.
 - Run one-click `语句规整` or `转写成文稿` actions on the attached subtitle.
@@ -138,7 +138,7 @@ Notes:
 
 - Long subtitle payloads now show an explicit warning when they are likely beyond the more comfortable single-shot range for local Qwen3-8B.
 - When that warning appears, switch to `Gemini 2.5 Pro` if you have already configured its API key in the desktop app Settings pane.
-- Action exports are written under `~/Movies/WhisperCaptioner/qwen-chat/exports/`.
+- Action exports are written under `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/qwen-chat/exports/`.
 
 Sync controls:
 
@@ -151,7 +151,7 @@ To suppress recurring obviously unrelated subtitle hallucinations, the app filte
 
 - Built-in defaults cover several recurring phrases already observed in this project, such as `优优独播剧场——YoYo Television Series Exclusive`.
 - You can extend the filter without editing Python code by appending phrases to:
-  `~/Movies/WhisperCaptioner/hallucination_blocklist.txt`
+  `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/hallucination_blocklist.txt`
 - Add one phrase per line.
 - Lines starting with `#` are treated as comments.
 
@@ -163,16 +163,16 @@ Some third-party speech tools may emit transient sidecar files such as `fbank_lf
 
 - These runtime artifacts are not treated as source files.
 - The repository ignores known generated artifacts.
-- Selected subprocesses are launched with `cwd=~/Movies/WhisperCaptioner` so those files land in the output area instead of polluting the source tree.
+- Selected subprocesses are launched with `cwd=/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner` so those files land in the output area instead of polluting the source tree.
 
 ## Artifact Migration
 
-Generated subtitle and transcript outputs now default to `~/Movies/WhisperCaptioner/artifacts/generated/`.
+Generated subtitle and transcript outputs now default to `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/`.
 
 - New queue exports, controlled subtitle exports, and shared per-video Markdown copies are written there.
 - The web workspace scans this location directly for historical generated subtitle assets.
 - `hallucination_blocklist.txt`, `cache/`, `qwen-chat/`, and `realtime/` remain at the top level because they are runtime state, not exported deliverables.
-- Optional local models, third-party backends, and Hugging Face cache now live under `~/Movies/whisper-captioner_APP_Resource/`.
+- Optional local models, third-party backends, and Hugging Face cache now live under `/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/`.
 
 ## Local Benchmark Notes
 
@@ -240,7 +240,7 @@ Current NUC port map:
 
 For local media files, the app now avoids repeating `ffmpeg` extraction on every retry:
 
-- The Mac first converts the source file once into `~/Movies/WhisperCaptioner/cache/local-audio/<cache-key>/audio-16k-mono.wav`.
+- The Mac first converts the source file once into `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/cache/local-audio/<cache-key>/audio-16k-mono.wav`.
 - Retries reuse that cached WAV instead of extracting audio again.
 - The UI now exposes `删除本地音频缓存`, so the cache can be cleared manually for the current local file.
 - A different source file naturally gets a different cache key because the key includes the resolved path, file size, and mtime.
@@ -370,7 +370,7 @@ Operational intent:
 Realtime Loopback capture (especially via NUC) now features a full "Two-Stage" persistence and correction pipeline:
 
 1. **Capture & Chunking**: Audio is captured in 3s chunks and transcribed immediately for low-latency floating captions.
-2. **Session Persistence**: Chunks are saved locally to `~/Movies/WhisperCaptioner/realtime/YYYYMMDD-HHMMSS/audio/`.
+2. **Session Persistence**: Chunks are saved locally to `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/realtime/YYYYMMDD-HHMMSS/audio/`.
 3. **Review Tab**: A new `实时回顾` (Realtime Review) tab lists all historical sessions, allowing you to view the raw generated segments.
 4. **Offline Polish & Re-recognition**: 
    - Use the **"LLM 校对"** (LLM Polish) button to trigger a background job (`RealtimePolishWorker`) that chunks segments into 30s semantic batches and sends them to the configured LLM (e.g., NUC Ollama Qwen3-14B) for high-quality contextual correction.
@@ -426,11 +426,11 @@ Current app behavior:
 ## Requirements
 
 - Loopback input device: usually named `Whisper Captions` or `Loopback` in AVFoundation. Device `0` is common on this setup, but the app should use the numeric ID reported by `列出音频输入设备`.
-- Whisper models in `~/Movies/whisper-captioner_APP_Resource/whisper-models`.
-- Hugging Face cache in `~/Movies/whisper-captioner_APP_Resource/huggingface-cache`.
+- Whisper models in `/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/whisper-models`.
+- Hugging Face cache in `/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/huggingface-cache`.
 - `whisper-stream`, `whisper-cli`, `ffmpeg`, `ffprobe`, and `yt-dlp`.
 - Conda env `whishperapp_pyside6` for the GUI.
-- Local SenseVoice.cpp checkout and GGUF model under `~/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp` if you want the `SenseVoice.cpp FP16` backend.
+- Local SenseVoice.cpp checkout and GGUF model under `/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp` if you want the `SenseVoice.cpp FP16` backend.
 
 ### SenseVoice.cpp Setup
 
@@ -444,8 +444,8 @@ If you want the `SenseVoice.cpp FP16` backend, clone and build SenseVoice.cpp lo
 Recommended local path for this project:
 
 ```bash
-git clone https://github.com/lovemefan/SenseVoice.cpp ~/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp
-cd ~/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp
+git clone https://github.com/lovemefan/SenseVoice.cpp /Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp
+cd /Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/third_party/SenseVoice.cpp
 cmake -B build
 cmake --build build -j
 ```

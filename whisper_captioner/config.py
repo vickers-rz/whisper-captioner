@@ -19,10 +19,10 @@ def _first_existing_path(primary: Path, fallback: Path) -> Path:
     return primary if primary.exists() else fallback
 
 
-DEFAULT_T7_MOVIES_DIR = Path("/Volumes/T7/MacBackup/Movies")
+DEFAULT_T7_MOVIES_DIR = Path("/Volumes/T7_APFS/MacBackup/Movies")
 LOCAL_MODELS_DIR = _env_path(
     "WHISPER_CAPTIONER_LOCAL_MODELS_DIR",
-    HOME / "local-models" / "whisper-captioner",
+    DEFAULT_T7_MOVIES_DIR / "whisper-captioner_APP_Resource" / "local-models",
 )
 
 OUTPUT_DIR = _env_path(

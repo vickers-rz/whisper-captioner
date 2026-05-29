@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import threading
 import time
 import uuid
@@ -1538,14 +1539,28 @@ class QwenChatServiceManager:
         transcript_text = str(subtitle.get("transcript_text", ""))
         timestamped_text = str(subtitle.get("timestamped_text", ""))
         if action == "cleanup":
+            segments = [
+                SubtitleSegment(
+                    float(item["start"]),
+                    float(item["end"]),
+                    str(item["text"]),
+                )
+                for item in subtitle.get("segments", [])
+                if isinstance(item, dict) and "start" in item and "end" in item and "text" in item
+            ]
+            indexed_text = "\n".join(f"{index}: {segment.text}" for index, segment in enumerate(segments, 1))
             system_prompt = (
                 "你是一个严谨的中文字幕后处理助手。请基于用户提供的字幕内容做语句规整，"
                 "消除明显口癖、冗余停顿和标点混乱，使其更适合阅读，但不要改变原意，不要臆造新信息。"
+                "输出必须严格保持输入编号，一条输入对应一条输出，格式只能是“序号: 修正后的字幕”。"
             )
             prompt = (
-                "请对下面字幕做语句规整，输出整理后的完整文本。"
-                "如果原字幕按行分句已经较清晰，可以适度保留分段。\n\n"
-                f"{transcript_text}"
+                "请对下面字幕逐条做语句规整。要求：\n"
+                "1. 必须输出和输入相同数量的编号行。\n"
+                "2. 不要新增开场白、总结、解释或 Markdown。\n"
+                "3. 不要合并多条字幕，也不要把一条字幕拆成多条。\n"
+                "4. 输出格式只能是“序号: 修正后的字幕文本”。\n\n"
+                f"{indexed_text or transcript_text}"
             )
             return prompt, system_prompt
 
@@ -1595,14 +1610,48 @@ class QwenChatServiceManager:
             max_tokens=24000 if provider.key == "gemini_pro" else 16000,
         )
 
+    def _cleanup_segments_from_result(
+        self,
+        segments: list[SubtitleSegment],
+        result: str,
+    ) -> list[SubtitleSegment]:
+        numbered: dict[int, str] = {}
+        fallback_lines: list[str] = []
+        for line in result.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            match = re.match(r"^(\d+)\s*[:：.、]\s*(.+)$", line)
+            if match:
+                index = int(match.group(1)) - 1
+                if 0 <= index < len(segments):
+                    numbered[index] = match.group(2).strip()
+            elif not numbered:
+                fallback_lines.append(line)
+        if numbered:
+            return [
+                SubtitleSegment(segment.start, segment.end, numbered.get(index, segment.text))
+                for index, segment in enumerate(segments)
+            ]
+        return [
+            SubtitleSegment(
+                segment.start,
+                segment.end,
+                fallback_lines[index] if index < len(fallback_lines) else segment.text,
+            )
+            for index, segment in enumerate(segments)
+        ]
+
     def _export_action_result(self, convo: dict[str, Any], action: str, result: str) -> None:
         subtitle = convo.get("subtitle") or {}
         base_name = Path(str(subtitle.get("filename", "subtitle"))).stem
         stamp = time.strftime("%Y%m%d-%H%M%S")
         safe_action = "cleanup" if action == "cleanup" else "article"
-        out_dir = self.exports_dir / convo["id"]
+        export_stem = f"{base_name}-手规" if action == "cleanup" else f"{base_name}-{safe_action}-{stamp}"
+        source_path = Path(str(subtitle.get("path", ""))).expanduser()
+        out_dir = source_path.parent if source_path.exists() else self.exports_dir / convo["id"]
         out_dir.mkdir(parents=True, exist_ok=True)
-        txt_path = out_dir / f"{base_name}-{safe_action}-{stamp}.txt"
+        txt_path = out_dir / f"{export_stem}.txt"
         txt_path.write_text(result, encoding="utf-8")
 
         if action == "cleanup":
@@ -1616,14 +1665,9 @@ class QwenChatServiceManager:
                 if isinstance(item, dict) and "start" in item and "end" in item and "text" in item
             ]
             if segments:
-                cleaned_lines = [line.strip() for line in result.splitlines() if line.strip()]
-                if cleaned_lines:
-                    remapped: list[SubtitleSegment] = []
-                    for index, segment in enumerate(segments):
-                        text = cleaned_lines[index] if index < len(cleaned_lines) else segment.text
-                        remapped.append(SubtitleSegment(segment.start, segment.end, text))
-                    save_segments_as_srt(out_dir / f"{base_name}-{safe_action}-{stamp}.srt", remapped)
-                    save_segments_as_txt(out_dir / f"{base_name}-{safe_action}-{stamp}-plain.txt", remapped)
+                remapped = self._cleanup_segments_from_result(segments, result)
+                save_segments_as_srt(out_dir / f"{export_stem}.srt", remapped)
+                save_segments_as_txt(out_dir / f"{export_stem}-plain.txt", remapped)
 
     def _load_required_conversation(self, convo_id: str) -> dict[str, Any]:
         convo = self._load_conversation(convo_id)
