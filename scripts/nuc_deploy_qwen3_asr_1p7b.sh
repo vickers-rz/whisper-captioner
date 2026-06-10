@@ -8,6 +8,7 @@ QWEN_ASR_IMAGE="${QWEN_ASR_IMAGE:-qwenllm/qwen3-asr:latest}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 NETWORK_NAME="${NETWORK_NAME:-qwen3-asr-net}"
 SCHEDULER_CONTAINER="${SCHEDULER_CONTAINER:-nuc-service-scheduler}"
+ASR_IDLE_SECONDS="${ASR_IDLE_SECONDS:-180}"
 
 sudo mkdir -p "${SERVICE_DIR}"
 sudo cp "${SCRIPT_DIR}/nuc_qwen3_asr_1p7b_proxy.py" "${SERVICE_DIR}/proxy.py"
@@ -33,6 +34,7 @@ sudo docker run -d \
   -e ASR_HEALTH_URL=http://host.docker.internal:8000/health \
   -e ASR_BUSY_URL=http://host.docker.internal:8000/busy \
   -e ASR_BACKEND_HEALTH_URL=http://nuc-asr-backend:8000/health \
+  -e ASR_IDLE_SECONDS="${ASR_IDLE_SECONDS}" \
   python:3.11-slim \
   bash -lc "pip install --no-cache-dir fastapi uvicorn httpx docker && uvicorn scheduler:app --app-dir /app --host 0.0.0.0 --port 8010"
 

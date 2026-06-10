@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from typing import Any
@@ -7,7 +8,6 @@ from typing import Any
 import docker
 import httpx
 from fastapi import FastAPI, HTTPException
-import asyncio
 
 
 DOCKER_BASE_URL = os.environ.get("DOCKER_BASE_URL", "unix://var/run/docker.sock")
@@ -27,10 +27,13 @@ ASR_HEALTH_URL = os.environ.get("ASR_HEALTH_URL", "http://127.0.0.1:8000/health"
 ASR_BUSY_URL = os.environ.get("ASR_BUSY_URL", "http://127.0.0.1:8000/busy")
 ASR_BACKEND_HEALTH_URL = os.environ.get("ASR_BACKEND_HEALTH_URL", "http://nuc-asr-backend:8000/health")
 ASR_BACKEND_START_TIMEOUT = float(os.environ.get("ASR_BACKEND_START_TIMEOUT", "120"))
+ASR_IDLE_SECONDS = float(os.environ.get("ASR_IDLE_SECONDS", "180"))
 QWEN_BUSY_URL = os.environ.get("QWEN_BUSY_URL", "http://nuc-qwen3-asr-1p7b-proxy:8000/busy")
 
 app = FastAPI(title="NUC Service Scheduler")
 docker_client = docker.DockerClient(base_url=DOCKER_BASE_URL)
+_asr_idle_deadline: float | None = None
+_asr_idle_task: asyncio.Task[None] | None = None
 
 
 def _get_container(name: str):
@@ -49,31 +52,65 @@ def _container_status(name: str) -> str:
     return container.status
 
 
-def _gpu_snapshot() -> dict[str, int]:
+def _gpu_snapshot() -> dict[str, Any]:
     import subprocess
 
-    result = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-gpu=memory.used,memory.free,utilization.gpu",
-            "--format=csv,noheader,nounits",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.free,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "available": False,
+            "error": str(exc),
+            "memory_used_mb": -1,
+            "memory_free_mb": -1,
+            "gpu_utilization": -1,
+        }
     if result.returncode != 0 or not result.stdout.strip():
-        return {"memory_used_mb": -1, "memory_free_mb": -1, "gpu_utilization": -1}
+        return {
+            "available": False,
+            "error": result.stderr.strip() or f"nvidia-smi exited {result.returncode}",
+            "memory_used_mb": -1,
+            "memory_free_mb": -1,
+            "gpu_utilization": -1,
+        }
     try:
         used, free, util = [int(part.strip()) for part in result.stdout.strip().splitlines()[0].split(",")]
         return {
+            "available": True,
+            "error": None,
             "memory_used_mb": used,
             "memory_free_mb": free,
             "gpu_utilization": util,
         }
-    except Exception:
-        return {"memory_used_mb": -1, "memory_free_mb": -1, "gpu_utilization": -1}
+    except Exception as exc:
+        return {
+            "available": False,
+            "error": f"Could not parse nvidia-smi output: {exc}",
+            "memory_used_mb": -1,
+            "memory_free_mb": -1,
+            "gpu_utilization": -1,
+        }
+
+
+def _require_gpu_snapshot() -> dict[str, Any]:
+    snapshot = _gpu_snapshot()
+    if not snapshot.get("available"):
+        raise HTTPException(
+            status_code=503,
+            detail=f"GPU status unavailable: {snapshot.get('error') or 'unknown nvidia-smi error'}",
+        )
+    return snapshot
 
 
 async def _asr_health_ok() -> bool:
@@ -134,6 +171,24 @@ async def _wait_http_ready(url: str, timeout_seconds: float) -> None:
     raise HTTPException(status_code=503, detail=f"Timed out waiting for upstream readiness: {last_error or 'unknown error'}")
 
 
+async def _wait_for_gpu_memory_free(min_free_mb: int, timeout_seconds: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_snapshot: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        snapshot = _require_gpu_snapshot()
+        last_snapshot = snapshot
+        if snapshot["memory_free_mb"] >= min_free_mb:
+            return
+        await asyncio.sleep(1)
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Timed out waiting for GPU memory to free after stopping a container: "
+            f"last_snapshot={last_snapshot or {}}"
+        ),
+    )
+
+
 def _stop_container(name: str) -> dict[str, str]:
     container = _get_container(name)
     container.reload()
@@ -148,6 +203,44 @@ def _stop_container(name: str) -> dict[str, str]:
             return {"status": "killed", "container": name}
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=f"Could not stop or kill {name}: {exc}") from exc
+
+
+def _cancel_asr_idle_stop() -> None:
+    global _asr_idle_deadline
+    global _asr_idle_task
+    _asr_idle_deadline = None
+    if _asr_idle_task and not _asr_idle_task.done():
+        _asr_idle_task.cancel()
+    _asr_idle_task = None
+
+
+async def _schedule_asr_idle_stop() -> None:
+    global _asr_idle_deadline
+    global _asr_idle_task
+    _cancel_asr_idle_stop()
+    _asr_idle_deadline = time.monotonic() + ASR_IDLE_SECONDS
+
+    async def worker() -> None:
+        global _asr_idle_deadline
+        global _asr_idle_task
+        try:
+            while _asr_idle_deadline is not None:
+                remaining = _asr_idle_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(remaining, 5.0))
+            asr_busy = await _asr_busy_snapshot()
+            if asr_busy.get("active_requests", 0) > 0 or asr_busy.get("busy"):
+                return
+            try:
+                _stop_container(ASR_BACKEND_CONTAINER)
+            except HTTPException:
+                return
+        finally:
+            _asr_idle_deadline = None
+            _asr_idle_task = None
+
+    _asr_idle_task = asyncio.create_task(worker())
 
 
 @app.get("/healthz")
@@ -166,6 +259,12 @@ async def status() -> dict[str, Any]:
         "asr": _container_status(ASR_CONTAINER),
         "asr_backend": _container_status(ASR_BACKEND_CONTAINER),
         "asr_busy": asr_busy,
+        "asr_idle_seconds": ASR_IDLE_SECONDS,
+        "asr_idle_deadline_epoch": (
+            time.time() + max(0.0, _asr_idle_deadline - time.monotonic())
+            if _asr_idle_deadline
+            else None
+        ),
         "gpu": _gpu_snapshot(),
     }
 
@@ -181,17 +280,30 @@ async def status_lite() -> dict[str, Any]:
         "asr": _container_status(ASR_CONTAINER),
         "asr_backend": _container_status(ASR_BACKEND_CONTAINER),
         "asr_busy": asr_busy,
+        "asr_idle_seconds": ASR_IDLE_SECONDS,
     }
 
 
 @app.post("/admit/qwen")
 async def admit_qwen() -> dict[str, Any]:
-    gpu = _gpu_snapshot()
+    gpu = _require_gpu_snapshot()
     asr_running = _container_status(ASR_CONTAINER) == "running"
+    asr_backend_running = _container_status(ASR_BACKEND_CONTAINER) == "running"
+    qwen_backend_running = _container_status(QWEN_BACKEND_CONTAINER) == "running"
     asr_healthy = await _asr_health_ok() if asr_running else False
     asr_busy = await _asr_busy_snapshot() if asr_running else {"available": False, "active_requests": 0, "busy": False}
 
-    if gpu["memory_free_mb"] >= 0 and gpu["memory_free_mb"] < MIN_FREE_MB_TO_START_QWEN:
+    if asr_backend_running and asr_busy.get("busy"):
+        raise HTTPException(
+            status_code=429,
+            detail="faster-whisper currently has active requests; Qwen must wait",
+        )
+
+    if (
+        not qwen_backend_running
+        and not asr_backend_running
+        and gpu["memory_free_mb"] < MIN_FREE_MB_TO_START_QWEN
+    ):
         raise HTTPException(
             status_code=503,
             detail=f"GPU free memory too low for Qwen admission: {gpu['memory_free_mb']} MiB",
@@ -201,15 +313,18 @@ async def admit_qwen() -> dict[str, Any]:
         "status": "admitted",
         "gpu": gpu,
         "asr_running": asr_running,
+        "asr_backend_running": asr_backend_running,
         "asr_healthy": asr_healthy,
         "asr_busy": asr_busy,
+        "qwen_backend_running": qwen_backend_running,
         "priority": "qwen",
     }
 
 
 @app.post("/admit/asr")
 async def admit_asr() -> dict[str, Any]:
-    gpu = _gpu_snapshot()
+    _cancel_asr_idle_stop()
+    gpu = _require_gpu_snapshot()
     qwen_backend_running = _container_status(QWEN_BACKEND_CONTAINER) == "running"
     qwen_busy = await _qwen_busy_snapshot() if qwen_backend_running else {"available": False, "active_requests": 0, "busy": False}
 
@@ -240,26 +355,25 @@ async def admit_asr() -> dict[str, Any]:
         "gpu": gpu,
         "qwen_backend_running": qwen_backend_running,
         "qwen_busy": qwen_busy,
-        "priority": "qwen",
+        "priority": "realtime_asr",
     }
 
 
 @app.post("/ensure/qwen")
 async def ensure_qwen() -> dict[str, str]:
+    _cancel_asr_idle_stop()
     asr_running = _container_status(ASR_BACKEND_CONTAINER) == "running"
     asr_busy = await _asr_busy_snapshot() if asr_running else {"busy": False, "active_requests": 0}
-    gpu = _gpu_snapshot()
+    _require_gpu_snapshot()
 
-    # Qwen startup is more memory-hungry than admission alone can predict.
-    # If ASR is idle and free memory is already tight, release the ASR backend first.
-    if (
-        asr_running
-        and not asr_busy.get("busy")
-        and gpu["memory_free_mb"] >= 0
-        and gpu["memory_free_mb"] < 3200
-    ):
+    if asr_running and asr_busy.get("busy"):
+        raise HTTPException(
+            status_code=429,
+            detail="faster-whisper currently has active requests; Qwen must wait",
+        )
+    if asr_running:
         _stop_container(ASR_BACKEND_CONTAINER)
-        await asyncio.sleep(2)
+        await _wait_for_gpu_memory_free(MIN_FREE_MB_TO_START_QWEN, timeout_seconds=30)
 
     container = _get_container(QWEN_BACKEND_CONTAINER)
     container.reload()
@@ -274,6 +388,7 @@ async def ensure_qwen() -> dict[str, str]:
 
 @app.post("/ensure/asr")
 async def ensure_asr() -> dict[str, str]:
+    _cancel_asr_idle_stop()
     qwen_backend_running = _container_status(QWEN_BACKEND_CONTAINER) == "running"
     qwen_busy = await _qwen_busy_snapshot() if qwen_backend_running else {"busy": False, "active_requests": 0}
     if qwen_backend_running and qwen_busy.get("busy"):
@@ -282,15 +397,10 @@ async def ensure_asr() -> dict[str, str]:
             detail="Qwen3-ASR currently has active requests; faster-whisper must wait",
         )
 
-    gpu = _gpu_snapshot()
-    if (
-        qwen_backend_running
-        and not qwen_busy.get("busy")
-        and gpu["memory_free_mb"] >= 0
-        and gpu["memory_free_mb"] < MIN_FREE_MB_TO_START_QWEN
-    ):
+    _require_gpu_snapshot()
+    if qwen_backend_running:
         _stop_container(QWEN_BACKEND_CONTAINER)
-        await asyncio.sleep(2)
+        await _wait_for_gpu_memory_free(MIN_FREE_MB_TO_START_QWEN, timeout_seconds=30)
 
     container = _get_container(ASR_BACKEND_CONTAINER)
     container.reload()
@@ -314,6 +424,7 @@ async def stop_qwen() -> dict[str, Any]:
 
 @app.post("/stop/asr")
 async def stop_asr() -> dict[str, Any]:
+    _cancel_asr_idle_stop()
     result = {
         "proxy": _container_status(ASR_CONTAINER),
         "backend": _stop_container(ASR_BACKEND_CONTAINER),
@@ -323,9 +434,27 @@ async def stop_asr() -> dict[str, Any]:
 
 @app.post("/restart/asr")
 async def restart_asr() -> dict[str, str]:
+    _cancel_asr_idle_stop()
     container = _get_container(ASR_BACKEND_CONTAINER)
     try:
         container.restart(timeout=STOP_TIMEOUT_SECONDS)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Could not restart {ASR_BACKEND_CONTAINER}: {exc}") from exc
     return {"status": "restarted", "container": ASR_BACKEND_CONTAINER}
+
+
+@app.post("/release/asr")
+async def release_asr() -> dict[str, Any]:
+    asr_busy = await _asr_busy_snapshot()
+    if asr_busy.get("active_requests", 0) > 0 or asr_busy.get("busy"):
+        return {
+            "status": "busy",
+            "detail": "faster-whisper realtime still has active requests",
+            "asr_busy": asr_busy,
+        }
+    await _schedule_asr_idle_stop()
+    return {
+        "status": "idle_timer_started",
+        "idle_seconds": ASR_IDLE_SECONDS,
+        "asr_busy": asr_busy,
+    }

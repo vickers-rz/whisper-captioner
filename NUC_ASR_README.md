@@ -12,10 +12,29 @@ This file summarizes the current remote ASR layout used by `Whisper Captioner`.
 
 Current scheduler priority:
 
-- `Qwen3-ASR 1.7B` first
-- `faster-whisper` second
+- active `Qwen3-ASR 1.7B` work blocks new faster-whisper admission
+- otherwise faster-whisper is admitted as the `realtime_asr` lane
 
-That means active Qwen offline work now blocks new `faster-whisper` admission instead of yielding to it.
+Both GPU backends are cold-started on demand. The scheduler stops Qwen after its
+idle window and stops faster-whisper `180s` after the last request. The three
+lightweight containers (`:8000`, `:8001`, and `:8010`) remain running.
+The GPU backends are mutually exclusive. A channel switch waits for the current
+request to finish, stops the idle backend, confirms VRAM release, and only then
+starts the other backend.
+
+## Deployment
+
+Run deployment from the Git checkout on the Mac:
+
+```bash
+bash scripts/sync_nuc_runtime.sh --sync-only
+bash scripts/sync_nuc_runtime.sh --deploy
+```
+
+The default `--sync-only` mode verifies SHA-256 checksums and creates a timestamped
+backup under `/srv/qwen3-asr-1p7b/backups/`. `--deploy` also rebuilds all five
+containers. Neither mode deletes staging, results, or model caches. Do not edit
+the runtime aliases `proxy.py`, `scheduler.py`, or `asr_busy_proxy.py` manually.
 
 ## Local-file Transcription Flow
 
@@ -89,9 +108,16 @@ Large Qwen uploads are split into `30s` WAV chunks on the NUC side, then merged 
 ```bash
 curl -fsS http://127.0.0.1:8000/health
 curl -fsS http://127.0.0.1:8000/busy
+curl -fsS http://127.0.0.1:8000/v1/models
 curl -fsS http://127.0.0.1:8001/healthz
 curl -fsS http://127.0.0.1:8001/busy
+curl -fsS http://127.0.0.1:8010/status
 ```
+
+The `:8000` proxy deliberately returns HTTP 200 while its GPU backend is cold.
+Read the `/health` response's `upstream` field to determine whether the backend
+is loaded. Scheduler status includes `gpu.available` and `gpu.error`; both ASR
+lanes reject admission with HTTP 503 when NVML or `nvidia-smi` is unavailable.
 
 Useful GPU check:
 
@@ -120,3 +146,4 @@ Newer task IDs include an 8-character random suffix, so current result directori
 - A conservative repetition-hallucination filter now drops chunks dominated by one short repeated phrase instead of exporting that garbage into the final subtitle.
 - `faster-whisper` proxy already uses a baked image and does not install Python deps at runtime.
 - `Qwen3-ASR 1.7B` proxy still starts from `python:3.11-slim` and installs Python deps when the container starts. It works, but it is not yet the fixed-image version.
+- Staging and result directories have no automatic TTL and must be pruned manually.

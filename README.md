@@ -230,7 +230,7 @@ To use this, simply select a `nuc_asr` or `nuc_ollama` provider from the app UI 
 
 Current NUC port map:
 
-- `:8000`: app-facing realtime/default ASR lane; busy-aware proxy that also exposes `/health` and `/busy`.
+- `:8000`: app-facing realtime/default ASR lane; persistent proxy exposing `/health`, `/busy`, `/v1/models`, and transcription/job endpoints.
 - `:18000`: internal `faster-whisper-server` backend used by the `:8000` proxy.
 - `:8001`: app-facing `Qwen3-ASR 1.7B` high-quality offline proxy.
 - `:8002`: debug-accessible `Qwen3-ASR 1.7B` backend served by official `qwen-asr-serve`.
@@ -247,45 +247,51 @@ For local media files, the app now avoids repeating `ffmpeg` extraction on every
 
 This applies to both `NUC faster-whisper large-v3（远程 CUDA）` and `NUC Qwen3-ASR 1.7B（远程高质量离线）` when the source is a local file.
 
-### NUC Qwen3-ASR 1.7B Deployment
+### NUC Runtime Deployment
 
-For a higher-quality long-audio path that does not replace the stable realtime `faster-whisper` service:
+Use the checked-in sync script instead of editing anonymous copies under `/srv`:
 
 ```bash
-bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_deploy_qwen3_asr_1p7b.sh
+bash /Users/vickers/Documents/whisper-captioner/scripts/sync_nuc_runtime.sh --sync-only
+bash /Users/vickers/Documents/whisper-captioner/scripts/sync_nuc_runtime.sh --deploy
 ```
 
-This deploys:
+`--sync-only` is the default. It verifies SHA-256 checksums, backs up the current
+NUC sources and container definitions, and installs the candidate scripts without
+rebuilding services. `--deploy` additionally recreates the scheduler, proxies,
+and both GPU backends. It never deletes staging, results, or model caches.
+
+The deployed layout includes:
 
 - a local-only service scheduler sidecar that can start/stop the `Qwen3-ASR 1.7B` backend on demand
 - an official `qwen-asr-serve` backend on port `8002`
 - a lightweight serializing proxy on port `8001`
 - single-concurrency admission with a GPU-free-memory guard and `faster-whisper` busy-awareness
 - automatic backend warm-start before a request and idle backend shutdown after the request window expires
+- a `180s` faster-whisper idle timer started through `POST :8010/release/asr`
 - persistent host-side staging/results directories under `/srv/qwen3-asr-1p7b/qwen-asr-staging` and `/srv/qwen3-asr-1p7b/qwen-asr-results`
-
-To let the scheduler arbitrate between `Qwen` and `faster-whisper`, enable the ASR busy proxy on the NUC:
-
-```bash
-bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_enable_asr_busy_proxy.sh
-```
 
 This keeps `:8000` as the app-facing endpoint, but turns it into a tiny front proxy that:
 
 - counts active `faster-whisper` requests
 - exposes `/busy` for the scheduler
+- exposes an OpenAI-compatible static `/v1/models` response for client probing
 - forwards real transcription work to an internal backend on `:18000`
+- asks the scheduler to release the backend after the final active request
 
 Admission behavior:
 
-- The current scheduler priority is now `Qwen3-ASR 1.7B` first, then `faster-whisper`.
-- When a Qwen offline job is active, `faster-whisper` admission is deferred instead of competing for the same GPU window.
+- An active Qwen offline job blocks new faster-whisper admission.
+- The `realtime_asr` priority value identifies the admitted request lane; it does not preempt an active Qwen job.
+- The two GPU backends are mutually exclusive: channel switches stop the idle backend and wait for VRAM release before starting the other.
+- An already active faster-whisper request is allowed to finish before a queued Qwen job switches the GPU lane.
 - When Qwen is idle, `faster-whisper` starts normally.
 - The `:8001` proxy retries Qwen admission internally instead of immediately surfacing transient scheduler `429` or `503` responses.
 - The Mac app's local-file NUC paths prefer `POST /jobs/upload` plus `GET /jobs/{id}` polling, so long jobs can keep reporting progress even when the original upload request would otherwise be fragile.
 - When the busy endpoint is unavailable, the scheduler falls back to GPU utilization as a conservative signal.
-- When free GPU memory is below `MIN_FREE_MB_TO_START_QWEN`, `:8001` rejects with HTTP `503`.
+- When `nvidia-smi` is unavailable or free GPU memory is below the threshold, admission fails with HTTP `503`.
 - After a `Qwen` request finishes, the backend is stopped after the idle timeout so it does not sit on VRAM.
+- After the final faster-whisper request, its backend is stopped after `180s`; the `:8000` proxy remains available.
 
 Current large-file local-file flow for `NUC Qwen3-ASR 1.7B`:
 
@@ -324,10 +330,16 @@ Validated coexistence check:
 
 ```bash
 curl -fsS http://127.0.0.1:8000/busy
+curl -fsS http://127.0.0.1:8000/v1/models
 curl -fsS http://127.0.0.1:8001/healthz
+curl -fsS http://127.0.0.1:8010/status
 ```
 
-During an active `:8000` transcription, `/busy` should report `active_requests: 1`. During an active Qwen job, the scheduler should defer new faster-whisper admission; Qwen requests themselves wait inside the `:8001` proxy until admission succeeds or the configured wait budget expires.
+`GET :8000/health` reports proxy health with HTTP 200 even when the backend is
+intentionally cold. Inspect its `upstream` field to distinguish `healthy` from
+`stopped_or_unhealthy`. During an active `:8000` transcription, `/busy` should
+report `active_requests: 1`. During an active Qwen job, the scheduler defers new
+faster-whisper admission.
 
 ### NUC GPU Guard Helper
 
@@ -337,6 +349,7 @@ When the NUC GPU gets pinned by `Qwen3-ASR 1.7B` or `faster-whisper`, use:
 bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh status
 bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh auto-clean
 bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh prep-asr
+bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh release-asr
 bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh idle-watch
 bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh unload-all
 bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh start-qwen
@@ -345,8 +358,9 @@ bash /Users/vickers/Documents/whisper-captioner/scripts/nuc_gpu_memory_guard.sh 
 Notes:
 
 - `auto-clean` only stops the `Qwen3-ASR 1.7B` proxy/backend containers when free GPU memory drops below the threshold.
-- `prep-asr` first frees Qwen GPU occupancy if needed, then checks `faster-whisper` and restarts only `nuc-asr` if health is still bad.
-- `idle-watch` is the low-risk “use it and turn it off” helper: it proactively stops `Qwen3-ASR 1.7B` when left running, while leaving `faster-whisper` to its own built-in idle offload unless health is bad.
+- `prep-asr` first frees Qwen GPU occupancy if needed, then starts the faster-whisper backend through the scheduler.
+- `release-asr` starts the scheduler's faster-whisper idle timer.
+- `idle-watch` stops idle Qwen occupancy and nudges the scheduler's faster-whisper release timer.
 - `unload-all` stops both ASR lanes and frees GPU memory without deleting the containers.
 - `start-qwen` first tries `docker start` on the existing `Qwen3-ASR 1.7B` containers, and only falls back to redeploy if they no longer exist.
 - If a container does not stop cleanly, the script escalates from `docker stop` to `docker kill`, but it does not remove containers.

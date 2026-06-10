@@ -4,7 +4,6 @@ import asyncio
 import os
 import json
 import re
-import subprocess
 import threading
 import time
 import uuid
@@ -104,6 +103,7 @@ async def _track_active_requests(metadata: dict[str, Any]):
         ACTIVE_REQUESTS = max(0, ACTIVE_REQUESTS - 1)
         if ACTIVE_REQUESTS == 0:
             CURRENT_REQUEST = None
+            await _release_realtime_backend()
 
 
 def _current_request_status() -> dict[str, Any] | None:
@@ -135,6 +135,13 @@ async def _scheduler_post(path: str) -> None:
             raise HTTPException(status_code=response.status_code, detail=response.text)
 
 
+async def _release_realtime_backend() -> None:
+    try:
+        await _scheduler_post("/release/asr")
+    except Exception:
+        return
+
+
 async def _transcribe_local_file_to_result(
     *,
     audio_path: Path,
@@ -156,23 +163,6 @@ async def _transcribe_local_file_to_result(
         "result_dir": str(result_dir),
     }
     _write_json(result_dir / "metadata.json", metadata)
-    command = [
-        "curl",
-        "--fail",
-        "--silent",
-        "--show-error",
-        "-X",
-        "POST",
-        f"{UPSTREAM_BASE_URL}{TRANSCRIBE_PATH}",
-        "-F",
-        f"model={model}",
-        "-F",
-        f"language={language}",
-        "-F",
-        f"response_format={response_format}",
-        "-F",
-        f"file=@{audio_path};type=audio/wav",
-    ]
     async with _track_active_requests({
         "filename": filename,
         "model": model,
@@ -180,23 +170,36 @@ async def _transcribe_local_file_to_result(
         "result_dir": str(result_dir),
         "audio_path": str(audio_path),
     }):
-        proc = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        detail = (stderr or stdout).decode("utf-8", errors="ignore").strip() or f"curl exited {proc.returncode}"
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                with audio_path.open("rb") as audio_file:
+                    response = await client.post(
+                        f"{UPSTREAM_BASE_URL}{TRANSCRIBE_PATH}",
+                        data={
+                            "model": model,
+                            "language": language,
+                            "response_format": response_format,
+                        },
+                        files={"file": (filename, audio_file, "audio/wav")},
+                    )
+        except httpx.HTTPError as exc:
+            detail = str(exc)
+            _write_json(
+                result_dir / "error.json",
+                {**metadata, "error": detail, "failed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")},
+            )
+            raise HTTPException(status_code=503, detail=f"faster-whisper upstream request failed: {detail}") from exc
+    if response.status_code >= 400:
+        detail = response.text.strip() or f"HTTP {response.status_code}"
         _write_json(
             result_dir / "error.json",
             {**metadata, "error": detail, "failed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")},
         )
         raise HTTPException(status_code=503, detail=f"faster-whisper upstream error: {detail}")
     try:
-        result = json.loads(stdout.decode("utf-8"))
+        result = response.json()
     except json.JSONDecodeError as exc:
-        detail = stdout.decode("utf-8", errors="ignore")[:1000]
+        detail = response.text[:1000]
         _write_json(
             result_dir / "error.json",
             {**metadata, "error": f"invalid JSON from upstream: {detail}", "failed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")},
@@ -298,7 +301,7 @@ def _start_local_file_task(
     asyncio.create_task(runner())
 
 
-app = FastAPI(title="NUC faster-whisper Busy Proxy")
+app = FastAPI(title="NUC faster-whisper Realtime Proxy")
 
 
 @app.get("/health")
@@ -310,6 +313,21 @@ async def health() -> Any:
         "upstream": "healthy" if healthy else "stopped_or_unhealthy",
         "upstream_message": "ok" if healthy else body,
         "current_request": _current_request_status(),
+    }
+
+
+@app.get("/v1/models")
+async def models() -> dict[str, Any]:
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "large-v3",
+                "object": "model",
+                "created": 0,
+                "owned_by": "faster-whisper",
+            }
+        ],
     }
 
 

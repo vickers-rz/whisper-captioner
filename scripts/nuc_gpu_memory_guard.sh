@@ -11,9 +11,10 @@ SSH_OPTS=(
 QWEN_VLLM_CONTAINER="${QWEN_VLLM_CONTAINER:-nuc-qwen3-asr-1p7b-vllm}"
 QWEN_PROXY_CONTAINER="${QWEN_PROXY_CONTAINER:-nuc-qwen3-asr-1p7b-proxy}"
 ASR_CONTAINER="${ASR_CONTAINER:-nuc-asr}"
+ASR_BACKEND_CONTAINER="${ASR_BACKEND_CONTAINER:-nuc-asr-backend}"
 QWEN_SERVICE_DIR="${QWEN_SERVICE_DIR:-/srv/qwen3-asr-1p7b}"
 MIN_FREE_MB="${MIN_FREE_MB:-1800}"
-ASR_IDLE_SECONDS="${ASR_IDLE_SECONDS:-360}"
+ASR_IDLE_SECONDS="${ASR_IDLE_SECONDS:-180}"
 
 usage() {
   cat <<'EOF'
@@ -24,6 +25,7 @@ Usage:
   bash scripts/nuc_gpu_memory_guard.sh restart-asr
   bash scripts/nuc_gpu_memory_guard.sh auto-clean
   bash scripts/nuc_gpu_memory_guard.sh prep-asr
+  bash scripts/nuc_gpu_memory_guard.sh release-asr
   bash scripts/nuc_gpu_memory_guard.sh unload-all
   bash scripts/nuc_gpu_memory_guard.sh start-all
   bash scripts/nuc_gpu_memory_guard.sh idle-watch
@@ -32,7 +34,7 @@ Environment overrides:
   NUC_HOST=192.168.31.196
   NUC_USER=jack
   MIN_FREE_MB=1800
-  ASR_IDLE_SECONDS=360
+  ASR_IDLE_SECONDS=180
 
 Commands:
   status
@@ -54,6 +56,10 @@ Commands:
   prep-asr
     Unload Qwen if free GPU memory is below MIN_FREE_MB, then check faster-whisper
     health and restart only that service if needed.
+
+  release-asr
+    Ask the scheduler to start the realtime ASR idle timer. The backend stops
+    after ASR_IDLE_SECONDS when no request is active.
 
   unload-all
     Stop both Qwen3-ASR 1.7B and faster-whisper containers to release GPU memory.
@@ -107,7 +113,7 @@ status_cmd() {
     nvidia-smi --query-gpu=name,memory.used,memory.free,utilization.gpu --format=csv,noheader,nounits
     echo
     echo '=== Containers ==='
-    docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E '${QWEN_VLLM_CONTAINER}|${QWEN_PROXY_CONTAINER}|${ASR_CONTAINER}' || true
+    docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E '${QWEN_VLLM_CONTAINER}|${QWEN_PROXY_CONTAINER}|${ASR_CONTAINER}|${ASR_BACKEND_CONTAINER}' || true
     echo
     echo '=== Health ==='
     printf '8000 faster-whisper: '
@@ -162,11 +168,13 @@ start_qwen_cmd() {
 
 restart_asr_cmd() {
   remote_bash "
-    docker restart '${ASR_CONTAINER}' >/dev/null
-    echo 'Restarted ${ASR_CONTAINER}.'
-    sleep 2
-    printf '8000 faster-whisper: '
-    curl -fsS --max-time 10 http://127.0.0.1:8000/health >/dev/null && echo ok || echo fail
+    curl -fsS --max-time 180 -X POST http://127.0.0.1:8010/restart/asr
+  "
+}
+
+release_asr_cmd() {
+  remote_bash "
+    curl -fsS --max-time 10 -X POST http://127.0.0.1:8010/release/asr
   "
 }
 
@@ -192,21 +200,20 @@ auto_clean_cmd() {
 prep_asr_cmd() {
   auto_clean_cmd
   remote_bash "
-    if curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null; then
-      echo 'faster-whisper is already healthy.'
+    upstream=\$(curl -fsS --max-time 5 http://127.0.0.1:8000/health | python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"upstream\", \"unknown\"))')
+    if [ \"\${upstream}\" = healthy ]; then
+      echo 'faster-whisper backend is already healthy.'
       exit 0
     fi
-    echo 'faster-whisper health check failed; restarting only ${ASR_CONTAINER}.'
-    docker restart '${ASR_CONTAINER}' >/dev/null
-    sleep 2
-    printf '8000 faster-whisper: '
-    curl -fsS --max-time 10 http://127.0.0.1:8000/health >/dev/null && echo ok || echo fail
+    echo 'Starting faster-whisper backend through the scheduler.'
+    curl -fsS --max-time 180 -X POST http://127.0.0.1:8010/ensure/asr
   "
 }
 
 unload_all_cmd() {
   stop_or_kill "${QWEN_PROXY_CONTAINER}"
   stop_or_kill "${QWEN_VLLM_CONTAINER}"
+  stop_or_kill "${ASR_BACKEND_CONTAINER}"
   stop_or_kill "${ASR_CONTAINER}"
   remote_bash "
     echo 'Stopped Qwen3-ASR 1.7B and faster-whisper containers.'
@@ -218,6 +225,9 @@ start_all_cmd() {
   remote_bash "
     if docker ps -a --format '{{.Names}}' | grep -qx '${ASR_CONTAINER}'; then
       docker start '${ASR_CONTAINER}' >/dev/null 2>&1 || true
+    fi
+    if docker ps -a --format '{{.Names}}' | grep -qx '${ASR_BACKEND_CONTAINER}'; then
+      docker start '${ASR_BACKEND_CONTAINER}' >/dev/null 2>&1 || true
     fi
     printf '8000 faster-whisper: '
     curl -fsS --max-time 10 http://127.0.0.1:8000/health >/dev/null && echo ok || echo fail
@@ -246,10 +256,12 @@ idle_watch_cmd() {
     fi
 
     if docker ps --format '{{.Names}}' | grep -qx '${ASR_CONTAINER}'; then
-      echo 'faster-whisper container is present; relying on its internal idle offload window.'
+      echo 'faster-whisper realtime proxy is present; nudging scheduler idle release.'
       if ! curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null; then
-        echo 'faster-whisper health check failed; restarting it.'
+        echo 'faster-whisper proxy health check failed; restarting it.'
         docker restart '${ASR_CONTAINER}' >/dev/null
+      else
+        curl -fsS --max-time 5 -X POST http://127.0.0.1:8010/release/asr >/dev/null || true
       fi
     else
       echo 'faster-whisper container is not running.'
@@ -273,6 +285,7 @@ main() {
     restart-asr) restart_asr_cmd ;;
     auto-clean) auto_clean_cmd ;;
     prep-asr) prep_asr_cmd ;;
+    release-asr) release_asr_cmd ;;
     unload-all) unload_all_cmd ;;
     start-all) start_all_cmd ;;
     idle-watch) idle_watch_cmd ;;

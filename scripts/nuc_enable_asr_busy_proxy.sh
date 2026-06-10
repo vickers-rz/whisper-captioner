@@ -73,4 +73,4 @@ sudo docker run -d \
   "${ASR_PROXY_IMAGE}" \
   uvicorn asr_busy_proxy:app --app-dir /app --host 0.0.0.0 --port "${UPSTREAM_PROXY_PORT}"
 
-echo "NUC faster-whisper busy proxy is now exposed on :${UPSTREAM_PROXY_PORT}, backend on :${UPSTREAM_BACKEND_PORT}"
+echo "NUC faster-whisper realtime proxy is exposed on :${UPSTREAM_PROXY_PORT}, backend on :${UPSTREAM_BACKEND_PORT}"

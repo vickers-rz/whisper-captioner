@@ -647,7 +647,7 @@ class NUCRealtimeWorker(QObject):
         # Quick connectivity check
         try:
             import urllib.request
-            test_req = urllib.request.Request(f"{self.base_url}/v1/models", method="GET")
+            test_req = urllib.request.Request(f"{self.base_url}/health", method="GET")
             urllib.request.urlopen(test_req, timeout=3)
         except Exception as exc:
             self.status.emit(f"NUC ASR 不可达：{exc}")
