@@ -267,7 +267,7 @@ def main():
     for slug, info in manifest.items():
         mp4_path = Path(info["mp4"])
         json_path = Path(info["json"])
-        if json_path.exists() and mp4_path.exists():
+        if json_path.exists() and mp4_path.exists() and not info.get("srt_done"):
             pending.append((slug, mp4_path, json_path))
 
     pending.sort(key=lambda x: str(x[1]))
