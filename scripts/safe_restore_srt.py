@@ -25,7 +25,7 @@ GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/c
 GEMINI_MODEL = "gemini-2.5-flash"
 
 # 每个视频 ASR segments 发送给 Gemini 的最大行数
-LLM_BATCH_SIZE = 1500
+LLM_BATCH_SIZE = 100
 # 并发线程数
 MAX_CONCURRENT_WORKERS = 8
 
