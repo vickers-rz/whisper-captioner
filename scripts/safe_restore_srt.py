@@ -184,9 +184,44 @@ def restore_and_polish_video(mp4_path: Path, json_path: Path) -> tuple[bool, lis
     system_prompt = build_system_prompt_for_video(mp4_path.name)
     corrected_results = {}
 
+    def polish_with_retry(sub_batch: list, sub_idx: int, depth: int = 0) -> dict:
+        """递归微批量规整与对齐修复"""
+        expected = len(sub_batch)
+        corrected = polish_batch(sub_idx, sub_batch, system_prompt)
+        valid = len(corrected)
+        
+        # 1. 完美匹配直接返回
+        if valid == expected:
+            return corrected
+            
+        # 2. 微量行缺失限制在 3 行内，则自动用 ASR 文本填补对齐，允许写入
+        if 0 < expected - valid <= 3:
+            print(f"    💡 [微调修复] {mp4_path.name} 第 {sub_idx} 分批微量缺失 {expected - valid} 行。自动用 ASR 原文填补缺失行并保存。", flush=True)
+            for i in range(expected):
+                if i not in corrected:
+                    corrected[i] = sub_batch[i]["text"]
+            return corrected
+            
+        # 3. 严重丢行，且递归深度未超限（支持折半细化到 30 行以下的小 batch 重试）
+        if depth < 2 and expected > 30:
+            split_size = max(25, expected // 2)
+            print(f"    🔄 [细化重试] {mp4_path.name} 第 {sub_idx} 分批行数严重不匹配(丢行 {expected - valid})。自动将其细化为 {split_size} 行子分批进行重试...", flush=True)
+            sub_results = {}
+            sub_sub_idx = 0
+            for start in range(0, expected, split_size):
+                chunk = sub_batch[start : start + split_size]
+                chunk_corrected = polish_with_retry(chunk, f"{sub_idx}_{sub_sub_idx}", depth + 1)
+                for local_i, text in chunk_corrected.items():
+                    sub_results[start + local_i] = text
+                sub_sub_idx += 1
+            return sub_results
+            
+        # 4. 重试失败，且无 fallback 时抛出异常
+        raise RuntimeError(f"行数校验失败！预期 {expected} 行，实际仅匹配到 {valid} 行，重试亦未成功。")
+
     with ThreadPoolExecutor(max_workers=min(len(batches), 4)) as executor:
         future_to_batch = {
-            executor.submit(polish_batch, idx, batch, system_prompt): (idx, start_idx, batch)
+            executor.submit(polish_with_retry, batch, idx, 0): (idx, start_idx, batch)
             for idx, (start_idx, batch) in enumerate(batches)
         }
         for future in as_completed(future_to_batch):
@@ -194,23 +229,16 @@ def restore_and_polish_video(mp4_path: Path, json_path: Path) -> tuple[bool, lis
             try:
                 batch_corrected = future.result()
                 
-                # ── 🚨 严格对齐校验 🚨 ──
-                # 如果 LLM 返回行数与预期行数不一致，直接抛出异常，暴露真实错误
-                valid_count = len(batch_corrected)
-                expected_count = len(batch)
-                
-                if valid_count != expected_count:
-                    raise RuntimeError(
-                        f"行数校验失败！大模型回复行数严重不匹配（预期 {expected_count} 行，实际仅匹配到 {valid_count} 行）"
-                    )
-                
-                # 正常保存结果
-                for local_i, corrected_text in batch_corrected.items():
-                    corrected_results[start_idx + local_i] = corrected_text
+                # 再次双重确保数据数量对齐
+                for i in range(len(batch)):
+                    global_idx = start_idx + i
+                    if i in batch_corrected:
+                        corrected_results[global_idx] = batch_corrected[i]
+                    else:
+                        corrected_results[global_idx] = batch[i]["text"]
                             
             except Exception as e:
-                # 显式向上传递错误，直接标记此视频规整失败
-                return False, [], f"分批规整失败 (Batch {idx}): {e}"
+                return False, [], f"规整在第 {idx} 批崩溃: {e}"
 
     # 组装最终结果
     for i in range(len(result)):
