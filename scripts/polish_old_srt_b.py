@@ -24,7 +24,7 @@ GEMINI_API_KEY = "AIzaSyADl6hpoxdZUVdEqvLylzEwV7lvdr93Jdk"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 GEMINI_MODEL = "gemini-2.5-flash"
 
-LLM_BATCH_SIZE = 120
+LLM_BATCH_SIZE = 1500
 MAX_CONCURRENT_WORKERS = 8
 
 LLM_SYSTEM_PROMPT = (
