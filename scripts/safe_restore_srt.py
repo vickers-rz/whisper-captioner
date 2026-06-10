@@ -64,13 +64,16 @@ def parse_llm_lines(reply: str, expected_count: int) -> dict:
         
     return corrected
 
-def format_timestamp(ms: float) -> str:
-    total_seconds = int(ms // 1000)
-    milliseconds = int(ms % 1000)
-    seconds = total_seconds % 60
-    minutes = (total_seconds // 60) % 60
-    hours = total_seconds // 3600
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+def format_timestamp(seconds: float) -> str:
+    """将 ASR 的秒数(float)转换为 SRT 标准的时分秒毫秒格式"""
+    millis_total = max(0, int(round(seconds * 1000)))
+    millis = millis_total % 1000
+    total_seconds = millis_total // 1000
+    secs = total_seconds % 60
+    minutes_total = total_seconds // 60
+    minutes = minutes_total % 60
+    hours = minutes_total // 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 def save_srt(srt_path: Path, segments: list) -> None:
     """保存为标准 SRT"""
