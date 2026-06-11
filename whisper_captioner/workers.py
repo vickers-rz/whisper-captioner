@@ -325,9 +325,16 @@ def nuc_qwen3_asr_1p7b_mode(mode: CaptionMode) -> bool:
     return mode.backend == "nuc_qwen3_asr_1p7b"
 
 
+def _nuc_asr_model_for_mode(mode: CaptionMode) -> str:
+    if mode.key == "nuc_asr_turbo":
+        return "deepdml/faster-whisper-large-v3-turbo-ct2"
+    return "large-v3"
+
+
 def _transcribe_via_nuc_asr(
     audio_path: Path,
     base_url: str = "",
+    model: str = "large-v3",
     language: str = "zh",
     response_format: str = "verbose_json",
     timeout: int = 120,
@@ -348,7 +355,7 @@ def _transcribe_via_nuc_asr(
     filename = audio_path.name
 
     body_parts = []
-    for field_name, field_value in [("model", "large-v3"), ("language", language), ("response_format", response_format)]:
+    for field_name, field_value in [("model", model), ("language", language), ("response_format", response_format)]:
         body_parts.append(
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="{field_name}"\r\n\r\n'
@@ -1245,7 +1252,13 @@ class QueueWorker(QObject):
         self.status.emit(f"Reusing prepared WAV: {path}")
         return path
 
-    def _transcribe_local_file_via_nuc_job(self, wav: Path, *, base_url: str) -> list[SubtitleSegment]:
+    def _transcribe_local_file_via_nuc_job(
+        self,
+        wav: Path,
+        *,
+        base_url: str,
+        model: str = "large-v3",
+    ) -> list[SubtitleSegment]:
         import urllib.request
 
         self.status.emit(f"Uploading cached WAV to NUC via HTTP: {wav.name}")
@@ -1253,7 +1266,7 @@ class QueueWorker(QObject):
         audio_data = wav.read_bytes()
         body_parts = []
         for field_name, field_value in [
-            ("model", "large-v3"),
+            ("model", model),
             ("language", "zh"),
             ("response_format", "verbose_json"),
         ]:
@@ -1484,7 +1497,10 @@ class QueueWorker(QObject):
                 save_segments_as_srt(base.with_suffix(".srt"), segments)
             elif self.mode.backend == "nuc_asr":
                 self._used_nuc_asr = True
-                self.status.emit("Transcribing with NUC remote ASR (faster-whisper CUDA)...")
+                nuc_asr_model = _nuc_asr_model_for_mode(self.mode)
+                self.status.emit(
+                    f"Transcribing with NUC remote ASR (faster-whisper CUDA, {nuc_asr_model})..."
+                )
                 duration = _probe_audio_duration(wav)
                 timeout = max(900, int(duration * 0.25 + 300))
                 self.status.emit(f"NUC remote ASR timeout budget: {timeout}s for {duration:.1f}s audio")
@@ -1492,6 +1508,7 @@ class QueueWorker(QObject):
                     segments = _transcribe_via_nuc_asr(
                         wav,
                         base_url=str(self.mode.model),
+                        model=nuc_asr_model,
                         timeout=timeout,
                         status_signal=self.status,
                     )
@@ -1499,6 +1516,7 @@ class QueueWorker(QObject):
                     segments = self._transcribe_local_file_via_nuc_job(
                         wav,
                         base_url=str(self.mode.model),
+                        model=nuc_asr_model,
                     )
                 save_segments_as_txt(base.with_suffix(".txt"), segments)
                 save_segments_as_srt(base.with_suffix(".srt"), segments)
@@ -2584,14 +2602,21 @@ class RollingPrefetchWorker(QObject):
             return srt_path
         if self.mode.backend == "nuc_asr":
             self._used_nuc_asr = True
-            self.status.emit(f"Transcribing chunk {chunk_label} with NUC remote ASR...")
+            nuc_asr_model = _nuc_asr_model_for_mode(self.mode)
+            self.status.emit(
+                f"Transcribing chunk {chunk_label} with NUC remote ASR ({nuc_asr_model})..."
+            )
             request_wav, vad_offset = self._prepare_remote_vad_chunk(chunk_wav, chunk_label)
             if request_wav is None:
                 segments = []
             else:
                 segments = [
                     SubtitleSegment(segment.start + vad_offset, segment.end + vad_offset, segment.text)
-                    for segment in _transcribe_via_nuc_asr(request_wav, base_url=str(self.mode.model))
+                    for segment in _transcribe_via_nuc_asr(
+                        request_wav,
+                        base_url=str(self.mode.model),
+                        model=nuc_asr_model,
+                    )
                 ]
             srt_path = chunk_out.with_suffix(".srt")
             save_segments_as_srt(srt_path, segments)

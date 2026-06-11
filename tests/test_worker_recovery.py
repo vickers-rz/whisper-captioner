@@ -8,11 +8,21 @@ from whisper_captioner.models import MODES, SubtitleSegment
 from whisper_captioner.workers import (
     QueueRunConfig,
     QueueWorker,
+    _nuc_asr_model_for_mode,
     parse_silencedetect_voice_window,
 )
 
 
 class WorkerRecoveryTest(unittest.TestCase):
+    def test_nuc_asr_turbo_and_quality_modes_select_distinct_models(self):
+        turbo = next(mode for mode in MODES if mode.key == "nuc_asr_turbo")
+        quality = next(mode for mode in MODES if mode.key == "nuc_asr")
+        self.assertEqual(
+            _nuc_asr_model_for_mode(turbo),
+            "deepdml/faster-whisper-large-v3-turbo-ct2",
+        )
+        self.assertEqual(_nuc_asr_model_for_mode(quality), "large-v3")
+
     def test_vad_trims_silent_edges_with_guards(self):
         output = """
         [silencedetect] silence_start: 0

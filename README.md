@@ -77,7 +77,8 @@ Recent maintenance focused on the controlled URL path and smaller-screen usabili
 
 ## Modes
 
-- `NUC faster-whisper large-v3（远程 CUDA）`: highest-performance remote inference via NUC RTX 3080 Ti.
+- `NUC faster-whisper large-v3-turbo（远程 CUDA，快速）`: fastest remote batch option.
+- `NUC faster-whisper large-v3（远程 CUDA，高质量）`: slower remote option that preserves the fuller large-v3 transcript.
 - `NUC Qwen3-ASR 1.7B（远程高质量离线）`: remote high-quality offline mode for long audio, queued on the NUC and kept separate from realtime ASR.
 - `实时字幕 NUC large-v3（远程 CUDA，3s延迟）`: low-latency realtime mode offloaded to the NUC, with full session persistence.
 - `实时字幕 whisper.cpp small（SoundSource/Loopback）`: lowest-latency local realtime mode for Loopback-routed Chrome or local player audio.
@@ -324,9 +325,11 @@ Current large-file local-file flow for `NUC Qwen3-ASR 1.7B`:
 2. Mac uploads that full cached WAV to `http://<NUC>:8001/jobs/upload`.
 3. The proxy writes the original upload to `/srv/qwen3-asr-1p7b/qwen-asr-staging/<task-id>/`.
 4. If the WAV is small enough, the proxy sends it upstream directly and spreads the returned text over the real WAV duration with approximate sentence-level timestamps.
-5. If the WAV is larger than the direct-upload threshold, the proxy splits it on the NUC into `30s` WAV chunks with Python `wave`, uploads those chunks serially to the Qwen backend, and merges the transcript on the NUC side.
-6. Before merge, the proxy filters obvious repetition-hallucination chunks, for example a long chunk dominated by one short phrase repeated hundreds of times in a low-information audio window.
-7. The proxy writes `metadata.json`, `response.json`, and `chunks.json` into `/srv/qwen3-asr-1p7b/qwen-asr-results/<task-id>/`. Failed jobs also write `error.json`.
+5. If the WAV is larger than the direct-upload threshold, the proxy creates `30s` nominal chunks with `2s` context on each available edge.
+6. Adjacent text is merged using fuzzy Chinese prefix/suffix matching. Long overlaps tolerate up to two insertions, deletions, or substitutions without relying on Qwen's pseudo timestamps.
+7. An empty result from a non-silent chunk is retried as two overlapping half chunks. Silence remains a legal empty result.
+8. Before merge, the proxy filters obvious repetition-hallucination chunks, for example a long chunk dominated by one short phrase repeated hundreds of times in a low-information audio window.
+9. The proxy writes `metadata.json`, `response.json`, and `chunks.json` into `/srv/qwen3-asr-1p7b/qwen-asr-results/<task-id>/`. Failed jobs also write `error.json`.
 
 Validated on 2026-05-13:
 
@@ -350,6 +353,18 @@ Current retention policy:
 - There is currently no TTL or automatic pruning job.
 - For Qwen, the NUC currently persists JSON metadata/results; final `.srt` and `.txt` are still exported by the Mac app.
 - When a Qwen chunk is filtered as obvious repetition hallucination, `chunks.json` keeps the chunk entry and records `filtered_reason`; the merged transcript treats that chunk as empty instead of exporting the repeated garbage text.
+- `chunks.json` also records request context windows, detected dBFS, overlap characters/errors, novel text, and empty-result retry diagnostics.
+
+### NUC ASR Optimization Benchmark (2026-06-11)
+
+The same `227.718s` Chinese WAV was sent through the NUC app-facing proxy:
+
+- `deepdml/faster-whisper-large-v3-turbo-ct2`, warm: `3.68s`, 57 segments.
+- `large-v3`, warm/cached: `15.54s`, 84 segments.
+- Turbo was about `4.2x` faster, but emitted less text on this sample, so both modes remain available.
+- The first Turbo request took `82.01s` because it downloaded and loaded the `1.6 GB` model. That one-time cost is not representative of warm inference.
+
+The scheduler and faster-whisper model TTL are both `900s`, so an active work session avoids the previous 3-5 minute reload cycle while still returning the GPU to the cold baseline afterward.
 
 Validated coexistence check:
 

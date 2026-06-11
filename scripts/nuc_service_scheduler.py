@@ -27,7 +27,7 @@ ASR_HEALTH_URL = os.environ.get("ASR_HEALTH_URL", "http://127.0.0.1:8000/health"
 ASR_BUSY_URL = os.environ.get("ASR_BUSY_URL", "http://127.0.0.1:8000/busy")
 ASR_BACKEND_HEALTH_URL = os.environ.get("ASR_BACKEND_HEALTH_URL", "http://nuc-asr-backend:8000/health")
 ASR_BACKEND_START_TIMEOUT = float(os.environ.get("ASR_BACKEND_START_TIMEOUT", "120"))
-ASR_IDLE_SECONDS = float(os.environ.get("ASR_IDLE_SECONDS", "180"))
+ASR_IDLE_SECONDS = float(os.environ.get("ASR_IDLE_SECONDS", "900"))
 QWEN_BUSY_URL = os.environ.get("QWEN_BUSY_URL", "http://nuc-qwen3-asr-1p7b-proxy:8000/busy")
 
 app = FastAPI(title="NUC Service Scheduler")

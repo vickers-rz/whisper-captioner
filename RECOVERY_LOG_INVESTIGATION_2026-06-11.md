@@ -214,3 +214,13 @@ The NUC runtime is a mixed source and must not be treated as one authoritative s
 
 Therefore the recovery uses the pre-sync backup and runtime artifacts as evidence for interfaces,
 while keeping reconstructed Mac-side concurrency, VAD, and adaptive splitting behind feature flags.
+
+## 2026-06-11 NUC ASR Optimization
+
+- Restored safe large-file Qwen chunking with 30-second nominal windows and 2 seconds of context on each available edge.
+- Added fuzzy Chinese prefix/suffix deduplication with up to two edit errors for sufficiently long overlaps.
+- Added a two-half retry when Qwen returns empty text for a non-silent chunk; true silence remains empty.
+- Added a separate NUC faster-whisper Turbo mode while retaining large-v3 as the high-quality mode.
+- Aligned scheduler idle shutdown and faster-whisper model TTL to 900 seconds.
+- A 227.718-second WAV completed in 3.68 seconds with warm Turbo versus 15.54 seconds with large-v3. Turbo produced fewer characters, so it was not made a silent replacement for the quality mode.
+- A forced chunk-path Qwen test completed in 94.52 seconds including backend cold start and produced eight overlapped chunks. Runtime diagnostics confirmed 32/34-second request windows and fuzzy boundary matches with up to two edit errors.

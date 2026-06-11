@@ -98,7 +98,7 @@ install -m 0644 "${stage}/nuc_qwen3_asr_1p7b_proxy.py" "${service_dir}/nuc_qwen3
 install -m 0644 "${stage}/nuc_service_scheduler.py" "${service_dir}/nuc_service_scheduler.py"
 
 if [[ "${mode}" = deploy ]]; then
-  SERVICE_DIR="${service_dir}" ASR_IDLE_SECONDS=180 bash "${service_dir}/nuc_deploy_qwen3_asr_1p7b.sh"
+  SERVICE_DIR="${service_dir}" ASR_IDLE_SECONDS=900 bash "${service_dir}/nuc_deploy_qwen3_asr_1p7b.sh"
   SERVICE_DIR="${service_dir}" bash "${service_dir}/nuc_enable_asr_busy_proxy.sh"
 fi
 

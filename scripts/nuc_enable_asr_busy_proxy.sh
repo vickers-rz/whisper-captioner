@@ -9,8 +9,9 @@ ASR_IMAGE="${ASR_IMAGE:-fedirz/faster-whisper-server:latest-cuda}"
 ASR_PROXY_IMAGE="${ASR_PROXY_IMAGE:-nuc-asr-busy-proxy:latest}"
 UPSTREAM_PROXY_PORT="${UPSTREAM_PROXY_PORT:-8000}"
 UPSTREAM_BACKEND_PORT="${UPSTREAM_BACKEND_PORT:-18000}"
-WHISPER_MODEL="${WHISPER_MODEL:-large-v3}"
+WHISPER_MODEL="${WHISPER_MODEL:-deepdml/faster-whisper-large-v3-turbo-ct2}"
 WHISPER_COMPUTE_TYPE="${WHISPER_COMPUTE_TYPE:-int8}"
+WHISPER_TTL_SECONDS="${WHISPER_TTL_SECONDS:-900}"
 
 sudo mkdir -p "${SERVICE_DIR}"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,6 +53,7 @@ sudo docker run -d \
   -e WHISPER__DEVICE=cuda \
   -e WHISPER__COMPUTE_TYPE="${WHISPER_COMPUTE_TYPE}" \
   -e WHISPER__MODEL="${WHISPER_MODEL}" \
+  -e WHISPER__TTL="${WHISPER_TTL_SECONDS}" \
   -e WHISPER__INFERENCE_DEVICE=auto \
   -e UVICORN_HOST=0.0.0.0 \
   -e UVICORN_PORT=8000 \
