@@ -2251,6 +2251,7 @@ class RollingPrefetchWorker(QObject):
         self.proc: Optional[subprocess.Popen[str]] = None
         self._temp_paths: list[Path] = []
         self._used_nuc_asr = False
+        self._has_emitted_segments = False
 
     def run(self) -> None:
         try:
@@ -2279,10 +2280,20 @@ class RollingPrefetchWorker(QObject):
         self._temp_paths.append(path)
         return path
 
+    def _emit_incremental_segments(self, segments: list[SubtitleSegment]) -> None:
+        if not segments:
+            return
+        if self._has_emitted_segments:
+            self.more_segments.emit(segments)
+        else:
+            self.first_segments.emit(segments)
+            self._has_emitted_segments = True
+
     # ---- internal pipeline ----
 
     def _do_rolling_prefetch(self) -> None:
         self._temp_paths = []
+        self._has_emitted_segments = False
         try:
             if not self.mode.available:
                 raise RuntimeError(f"Missing model: {self.mode.model}")
@@ -2464,6 +2475,8 @@ class RollingPrefetchWorker(QObject):
                 else:
                     self.status.emit(f"Chunk {chunk_index}: no speech detected")
 
+                self._emit_incremental_segments(segments)
+
                 self.progress.emit(chunk_index + 1, num_chunks)
                 offset += remaining  # Use actual chunk duration, not fixed chunk_seconds
                 chunk_index += 1
@@ -2476,7 +2489,7 @@ class RollingPrefetchWorker(QObject):
                     self._export_subtitles(all_raw_segments, raw_output_base)
                     self.status.emit(f"Raw subtitles written: {raw_output_base.with_suffix('.srt')}")
                 final_segments = self._run_full_document_polish(job_cache_dir, output_base)
-                if final_segments:
+                if final_segments and not self._has_emitted_segments:
                     self.first_segments.emit(final_segments)
                 self.all_done.emit()
                 self.status.emit("All chunks transcribed")

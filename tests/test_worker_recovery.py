@@ -8,12 +8,27 @@ from whisper_captioner.models import MODES, SubtitleSegment
 from whisper_captioner.workers import (
     QueueRunConfig,
     QueueWorker,
+    RollingPrefetchWorker,
     _nuc_asr_model_for_mode,
     parse_silencedetect_voice_window,
 )
 
 
 class WorkerRecoveryTest(unittest.TestCase):
+    def test_rolling_worker_emits_first_chunk_then_appends(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        worker = RollingPrefetchWorker("https://example.com/video", mode)
+        first = []
+        more = []
+        worker.first_segments.connect(first.append)
+        worker.more_segments.connect(more.append)
+
+        worker._emit_incremental_segments([SubtitleSegment(0, 1, "first")])
+        worker._emit_incremental_segments([SubtitleSegment(30, 31, "second")])
+
+        self.assertEqual([[segment.text for segment in batch] for batch in first], [["first"]])
+        self.assertEqual([[segment.text for segment in batch] for batch in more], [["second"]])
+
     def test_nuc_asr_turbo_and_quality_modes_select_distinct_models(self):
         turbo = next(mode for mode in MODES if mode.key == "nuc_asr_turbo")
         quality = next(mode for mode in MODES if mode.key == "nuc_asr")
