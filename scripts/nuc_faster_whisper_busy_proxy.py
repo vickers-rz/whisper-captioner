@@ -125,7 +125,7 @@ async def _get_upstream_health() -> tuple[bool, str]:
             return False, str(exc)
 
 
-async def _scheduler_post(path: str) -> None:
+async def _scheduler_post(path: str) -> Any:
     async with httpx.AsyncClient(timeout=180) as client:
         try:
             response = await client.post(f"{SCHEDULER_URL}{path}")
@@ -133,6 +133,10 @@ async def _scheduler_post(path: str) -> None:
             raise HTTPException(status_code=503, detail=f"scheduler unavailable: {exc}") from exc
         if response.status_code >= 400:
             raise HTTPException(status_code=response.status_code, detail=response.text)
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {"status": "ok", "detail": response.text}
 
 
 async def _release_realtime_backend() -> None:
@@ -341,6 +345,12 @@ async def busy() -> dict[str, Any]:
         "upstream_message": message if not healthy else "ok",
         "current_request": _current_request_status(),
     }
+
+
+@app.post("/release/asr")
+async def release_asr() -> Any:
+    """Expose only the scheduler's safe idle-release operation to Mac clients."""
+    return await _scheduler_post("/release/asr")
 
 
 @app.post(TRANSCRIBE_PATH)

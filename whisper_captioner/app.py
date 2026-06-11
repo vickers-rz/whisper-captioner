@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import os
 import re
 import subprocess
 import shutil
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import unquote, urlparse
 
-from PySide6.QtCore import QSettings, QThread, QTimer
+from PySide6.QtCore import QSettings, QThread, QTimer, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSystemTrayIcon,
+    QTableWidgetItem,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from whisper_captioner.cache import cache_slug, canonical_media_url, validate_url_for_yt_dlp
+from whisper_captioner.asr_history import ASRHistoryEntry, ASRHistoryStore
 from whisper_captioner.chrome_control import (
     chrome_current_time,
     chrome_current_time_url,
@@ -54,6 +57,7 @@ from whisper_captioner.workers import (
     LLMTextWorker,
     NUCRealtimeWorker,
     QueueWorker,
+    QueueRunConfig,
     RealtimeWorker,
     RealtimePolishWorker,
     RealtimeReRecognizeWorker,
@@ -145,6 +149,7 @@ class MainWindow(QMainWindow):
         self._status_summary = "就绪"
         self._current_progress: tuple[int, int] | None = None
         self.qwen_chat_service = QwenChatServiceManager()
+        self.asr_history = ASRHistoryStore()
 
         self._log_flush_timer = QTimer(self)
         self._log_flush_timer.setInterval(120)
@@ -178,6 +183,26 @@ class MainWindow(QMainWindow):
         self.overlay_more_opacity_button.clicked.connect(lambda: self.overlay.adjust_opacity(0.05))
         self.overlay_less_opacity_button.clicked.connect(lambda: self.overlay.adjust_opacity(-0.05))
         self.overlay_reset_button.clicked.connect(self.overlay._reset_position)
+        self.history_refresh_button.clicked.connect(self.refresh_asr_history)
+        self.history_search_input.textChanged.connect(self.refresh_asr_history)
+        self.history_status_combo.currentIndexChanged.connect(self.refresh_asr_history)
+        self.history_load_button.clicked.connect(self.load_history_source)
+        self.history_restore_model_button.clicked.connect(self.restore_history_model)
+        self.history_rerun_button.clicked.connect(self.rerun_history_entry)
+        self.history_open_cache_button.clicked.connect(self.open_history_cache)
+        self.history_open_output_button.clicked.connect(self.open_history_output)
+        self.history_delete_button.clicked.connect(self.delete_history_entry)
+        for widget in (
+            self.qwen_parallel_checkbox,
+            self.qwen_replicas_spin,
+            self.qwen_chunk_seconds_spin,
+            self.adaptive_split_checkbox,
+            self.remote_vad_checkbox,
+        ):
+            if hasattr(widget, "toggled"):
+                widget.toggled.connect(self._save_asr_runtime_settings)
+            else:
+                widget.valueChanged.connect(self._save_asr_runtime_settings)
 
         # Realtime Session UI Connections
         self.session_list.itemSelectionChanged.connect(self._on_session_selected)
@@ -212,10 +237,15 @@ class MainWindow(QMainWindow):
         self.overlay.forward_5_requested.connect(self.forward_5s)
         self.overlay.forward_requested.connect(self.forward_10s)
         self._load_settings()
+        self.refresh_asr_history()
         self._init_log_file()
 
     def _load_settings(self) -> None:
         settings = QSettings("WhisperCaptioner", "App")
+        if settings.value("asr/recovery_defaults_version", 0, type=int) < 1:
+            settings.setValue("asr/qwen_parallel_enabled", True)
+            settings.setValue("asr/qwen_replicas", 2)
+            settings.setValue("asr/recovery_defaults_version", 1)
         saved_mode = str(settings.value("mode/key", "hq_turbo"))
         if saved_mode == "nuc_qwen3_asr_7b":
             saved_mode = "nuc_qwen3_asr_1p7b"
@@ -234,6 +264,19 @@ class MainWindow(QMainWindow):
         if log_idx >= 0:
             self.log_level_combo.setCurrentIndex(log_idx)
         self.capture_id_input.setText(str(settings.value("audio/capture_id", 0, type=int)))
+        self.qwen_parallel_checkbox.setChecked(
+            settings.value("asr/qwen_parallel_enabled", True, type=bool)
+        )
+        self.qwen_replicas_spin.setValue(settings.value("asr/qwen_replicas", 2, type=int))
+        self.qwen_chunk_seconds_spin.setValue(
+            settings.value("asr/qwen_chunk_seconds", 45, type=int)
+        )
+        self.adaptive_split_checkbox.setChecked(
+            settings.value("asr/adaptive_split_enabled", False, type=bool)
+        )
+        self.remote_vad_checkbox.setChecked(
+            settings.value("asr/remote_vad_enabled", False, type=bool)
+        )
         self._on_log_level_changed()
         self._on_llm_provider_changed()
 
@@ -270,6 +313,35 @@ class MainWindow(QMainWindow):
     def _save_capture_id(self, *_args) -> None:
         settings = QSettings("WhisperCaptioner", "App")
         settings.setValue("audio/capture_id", self._capture_id())
+
+    def _save_asr_runtime_settings(self, *_args) -> None:
+        settings = QSettings("WhisperCaptioner", "App")
+        settings.setValue("asr/qwen_parallel_enabled", self.qwen_parallel_checkbox.isChecked())
+        settings.setValue("asr/qwen_replicas", self.qwen_replicas_spin.value())
+        settings.setValue("asr/qwen_chunk_seconds", self.qwen_chunk_seconds_spin.value())
+        settings.setValue("asr/adaptive_split_enabled", self.adaptive_split_checkbox.isChecked())
+        settings.setValue("asr/remote_vad_enabled", self.remote_vad_checkbox.isChecked())
+
+    def _queue_run_config(self, prepared_wavs: dict[str, str] | None = None) -> QueueRunConfig:
+        overrides = {"prepared_wavs": prepared_wavs}
+        environment_keys = {
+            "qwen_parallel_enabled": "WHISPER_CAPTIONER_QWEN_PARALLEL",
+            "qwen_replicas": "WHISPER_CAPTIONER_QWEN_REPLICAS",
+            "qwen_chunk_seconds": "WHISPER_CAPTIONER_QWEN_CHUNK_SECONDS",
+            "adaptive_split_enabled": "WHISPER_CAPTIONER_ADAPTIVE_SPLIT",
+            "remote_vad_enabled": "WHISPER_CAPTIONER_REMOTE_VAD",
+        }
+        ui_values = {
+            "qwen_parallel_enabled": self.qwen_parallel_checkbox.isChecked(),
+            "qwen_replicas": self.qwen_replicas_spin.value(),
+            "qwen_chunk_seconds": float(self.qwen_chunk_seconds_spin.value()),
+            "adaptive_split_enabled": self.adaptive_split_checkbox.isChecked(),
+            "remote_vad_enabled": self.remote_vad_checkbox.isChecked(),
+        }
+        for field_name, value in ui_values.items():
+            if environment_keys[field_name] not in os.environ:
+                overrides[field_name] = value
+        return QueueRunConfig.from_environment(**overrides)
 
     def _capture_id(self) -> int:
         text = self.capture_id_input.text().strip()
@@ -1289,6 +1361,102 @@ class MainWindow(QMainWindow):
         self.queue.addItem(QListWidgetItem(text))
         self.url_input.clear()
 
+    def refresh_asr_history(self, *_args) -> None:
+        if not hasattr(self, "history_table"):
+            return
+        query = self.history_search_input.text().strip().lower()
+        status_filter = str(self.history_status_combo.currentData() or "")
+        entries = self.asr_history.list_entries()
+        visible = [
+            entry
+            for entry in entries
+            if (not query or query in f"{entry.title} {entry.source}".lower())
+            and (not status_filter or entry.status == status_filter)
+        ]
+        self.history_table.setRowCount(len(visible))
+        for row, entry in enumerate(visible):
+            source_item = QTableWidgetItem(entry.source)
+            source_item.setData(Qt.ItemDataRole.UserRole, entry.id)
+            values = (
+                entry.title,
+                source_item,
+                entry.last_mode_label or entry.last_mode_key,
+                entry.status,
+                "存在" if entry.audio_cache_exists else "缺失",
+                "存在" if entry.subtitle_cache_dir and Path(entry.subtitle_cache_dir).exists() else "缺失",
+                "存在" if entry.output_base and any(
+                    Path(entry.output_base).with_suffix(suffix).exists() for suffix in (".srt", ".txt")
+                ) else "缺失",
+                entry.updated_at,
+            )
+            for column, value in enumerate(values):
+                self.history_table.setItem(
+                    row,
+                    column,
+                    value if isinstance(value, QTableWidgetItem) else QTableWidgetItem(str(value)),
+                )
+        self.history_table.resizeColumnsToContents()
+
+    def _selected_history_entry(self) -> ASRHistoryEntry | None:
+        row = self.history_table.currentRow()
+        if row < 0:
+            return None
+        item = self.history_table.item(row, 1)
+        return self.asr_history.get(str(item.data(Qt.ItemDataRole.UserRole))) if item else None
+
+    def load_history_source(self) -> None:
+        entry = self._selected_history_entry()
+        if entry:
+            self.url_input.setText(entry.source)
+
+    def restore_history_model(self) -> None:
+        entry = self._selected_history_entry()
+        if not entry:
+            return
+        index = self.mode_combo.findData(entry.last_mode_key)
+        if index >= 0:
+            self.mode_combo.setCurrentIndex(index)
+
+    def rerun_history_entry(self) -> None:
+        entry = self._selected_history_entry()
+        if not entry:
+            return
+        prepared = {}
+        if entry.audio_cache_exists:
+            prepared[entry.source] = entry.audio_cache_wav
+        elif entry.kind == "file" and not Path(entry.source).exists():
+            QMessageBox.warning(self, "无法重跑", "原文件和缓存 WAV 都不存在。")
+            return
+        self.url_input.setText(entry.source)
+        self._start_queue_items([entry.source], self.current_mode(), prepared)
+
+    def open_history_cache(self) -> None:
+        entry = self._selected_history_entry()
+        if entry and entry.audio_cache_wav:
+            path = Path(entry.audio_cache_wav).parent
+            if path.exists():
+                subprocess.run(["open", str(path)], check=False)
+
+    def open_history_output(self) -> None:
+        entry = self._selected_history_entry()
+        if entry and entry.output_base:
+            path = Path(entry.output_base).parent
+            if path.exists():
+                subprocess.run(["open", str(path)], check=False)
+
+    def delete_history_entry(self) -> None:
+        entry = self._selected_history_entry()
+        if not entry:
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除历史记录",
+            "只删除历史记录，不删除 WAV、字幕缓存或输出文件。继续吗？",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.asr_history.delete(entry.id)
+            self.refresh_asr_history()
+
     @staticmethod
     def _normalize_source_input(source: str) -> str:
         source = source.strip().strip("\"'")
@@ -1322,14 +1490,26 @@ class MainWindow(QMainWindow):
         ]
         if not items:
             return
+        self._start_queue_items(items, mode)
+
+    def _start_queue_items(
+        self,
+        items: list[str],
+        mode: CaptionMode,
+        prepared_wavs: dict[str, str] | None = None,
+    ) -> None:
+        if self.queue_thread:
+            self.log("Queue is already running")
+            return
         self.queue_thread = QThread()
-        self.queue_worker = QueueWorker(items, mode)
+        self.queue_worker = QueueWorker(items, mode, self._queue_run_config(prepared_wavs))
         self.queue_worker.moveToThread(self.queue_thread)
         self.queue_thread.started.connect(self.queue_worker.run)
         self.queue_worker.status.connect(self.log)
         self.queue_worker.caption.connect(self.overlay.set_caption)
         self.queue_worker.output_ready.connect(self._load_queue_output)
         self.queue_worker.finished_item.connect(self._mark_item)
+        self.queue_worker.chunk_progress.connect(self._update_queue_chunk_progress)
         self.queue_worker.finished.connect(self.queue_thread.quit)
         self.queue_thread.finished.connect(self._clear_queue)
         self.progress_bar.setVisible(True)
@@ -1360,23 +1540,23 @@ class MainWindow(QMainWindow):
         if not mode.available:
             QMessageBox.warning(self, "模型缺失", f"当前所选模式不可用：{mode.label}")
             return
-        self.queue_thread = QThread()
-        self.queue_worker = QueueWorker([str(path)], mode)
-        self.queue_worker.moveToThread(self.queue_thread)
-        self.queue_thread.started.connect(self.queue_worker.run)
-        self.queue_worker.status.connect(self.log)
-        self.queue_worker.caption.connect(self.overlay.set_caption)
-        self.queue_worker.output_ready.connect(self._load_queue_output)
-        self.queue_worker.finished_item.connect(self._mark_item)
-        self.queue_worker.finished.connect(self.queue_thread.quit)
-        self.queue_thread.finished.connect(self._clear_queue)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(0)
         self.url_input.setText(str(path))
         self.overlay.show()
         self.overlay.set_caption("正在处理本地文件。")
         self._set_status_summary(f"本地转写中 | 模式 {mode.label} | {path.name}")
-        self.queue_thread.start()
+        self._start_queue_items([str(path)], mode)
+
+    def _update_queue_chunk_progress(self, progress: object) -> None:
+        if not isinstance(progress, dict):
+            return
+        done = int(progress.get("done", 0))
+        total = max(1, int(progress.get("total", 1)))
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(done)
+        self.progress_bar.setFormat(
+            f"Chunk %v / %m | inflight {progress.get('inflight', 0)} | splits {progress.get('splits', 0)}"
+        )
 
     def start_controlled_url(self) -> None:
         if self.controlled_thread:
@@ -1453,6 +1633,7 @@ class MainWindow(QMainWindow):
             source, mode,
             llm_provider=llm_provider, llm_api_key=llm_api_key,
             llm_api_url=llm_api_url, llm_model_id=llm_model_id,
+            remote_vad_enabled=self._queue_run_config().remote_vad_enabled,
         )
         self.controlled_worker.moveToThread(self.controlled_thread)
         self.controlled_thread.started.connect(self.controlled_worker.run)
@@ -1716,6 +1897,7 @@ class MainWindow(QMainWindow):
         self._current_progress = None
         self._set_status_summary("队列任务已结束")
         self.log("Queue worker finished")
+        self.refresh_asr_history()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.hide()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
@@ -10,8 +11,10 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QSizePolicy,
     QTabWidget,
+    QTableWidget,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
@@ -185,6 +188,15 @@ def build_main_window_ui(window) -> None:
     window.llm_custom_url_input.setPlaceholderText("自定义 API URL（用于自定义模式）")
     window.llm_custom_model_input = QLineEdit()
     window.llm_custom_model_input.setPlaceholderText("自定义模型 ID（用于自定义模式）")
+    window.qwen_parallel_checkbox = QCheckBox("启用 Qwen3-ASR 多副本并发")
+    window.qwen_replicas_spin = QSpinBox()
+    window.qwen_replicas_spin.setRange(1, 4)
+    window.qwen_replicas_spin.setValue(2)
+    window.qwen_chunk_seconds_spin = QSpinBox()
+    window.qwen_chunk_seconds_spin.setRange(10, 180)
+    window.qwen_chunk_seconds_spin.setValue(45)
+    window.adaptive_split_checkbox = QCheckBox("启用自适应慢块拆分")
+    window.remote_vad_checkbox = QCheckBox("启用远端分块 VAD 预裁边")
 
     root = QWidget()
     root_layout = QVBoxLayout(root)
@@ -277,6 +289,45 @@ def build_main_window_ui(window) -> None:
     analysis_tab = build_analysis_panel(window)
     transcript_tab = build_transcript_panel(window)
 
+    history_tab = QWidget()
+    history_layout = QVBoxLayout(history_tab)
+    history_filter_row = QHBoxLayout()
+    window.history_search_input = QLineEdit()
+    window.history_search_input.setPlaceholderText("搜索标题或来源")
+    window.history_status_combo = QComboBox()
+    window.history_status_combo.addItem("全部状态", "")
+    for status in ("running", "ready", "failed", "audio_cache_pruned"):
+        window.history_status_combo.addItem(status, status)
+    window.history_refresh_button = QPushButton("刷新")
+    history_filter_row.addWidget(window.history_search_input)
+    history_filter_row.addWidget(window.history_status_combo)
+    history_filter_row.addWidget(window.history_refresh_button)
+    history_layout.addLayout(history_filter_row)
+    window.history_table = QTableWidget(0, 8)
+    window.history_table.setHorizontalHeaderLabels(
+        ["标题", "来源", "模型", "状态", "WAV", "字幕缓存", "输出", "更新时间"]
+    )
+    window.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    window.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    history_layout.addWidget(window.history_table)
+    history_actions = QHBoxLayout()
+    window.history_load_button = QPushButton("载入来源")
+    window.history_restore_model_button = QPushButton("恢复历史模型")
+    window.history_rerun_button = QPushButton("用当前模型重跑")
+    window.history_open_cache_button = QPushButton("打开缓存目录")
+    window.history_open_output_button = QPushButton("打开输出目录")
+    window.history_delete_button = QPushButton("删除记录")
+    for button in (
+        window.history_load_button,
+        window.history_restore_model_button,
+        window.history_rerun_button,
+        window.history_open_cache_button,
+        window.history_open_output_button,
+        window.history_delete_button,
+    ):
+        history_actions.addWidget(button)
+    history_layout.addLayout(history_actions)
+
     settings_tab = QWidget()
     settings_layout = QVBoxLayout(settings_tab)
     llm_layout = QVBoxLayout(window.llm_group)
@@ -300,11 +351,24 @@ def build_main_window_ui(window) -> None:
     )
     audio_route_layout.addWidget(window.list_audio_devices_button)
     settings_layout.addWidget(audio_route_card)
+    asr_runtime_card = QGroupBox("ASR 运行配置")
+    asr_runtime_layout = QVBoxLayout(asr_runtime_card)
+    asr_runtime_layout.addWidget(window.qwen_parallel_checkbox)
+    replicas_row = QHBoxLayout()
+    replicas_row.addWidget(QLabel("Qwen 副本数"))
+    replicas_row.addWidget(window.qwen_replicas_spin)
+    replicas_row.addWidget(QLabel("Root chunk 秒数"))
+    replicas_row.addWidget(window.qwen_chunk_seconds_spin)
+    asr_runtime_layout.addLayout(replicas_row)
+    asr_runtime_layout.addWidget(window.adaptive_split_checkbox)
+    asr_runtime_layout.addWidget(window.remote_vad_checkbox)
+    settings_layout.addWidget(asr_runtime_card)
     settings_layout.addStretch()
 
     tabs.addTab(queue_tab, "队列")
     tabs.addTab(analysis_tab, "分析")
     tabs.addTab(transcript_tab, "全文字幕")
+    tabs.addTab(history_tab, "ASR 历史")
     tabs.addTab(build_realtime_review_panel(window), "实时回顾")
     tabs.addTab(settings_tab, "设置")
     root_layout.addWidget(tabs)

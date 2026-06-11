@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
+import os
 import re
 import shlex
 import shutil
@@ -19,12 +21,15 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Optional
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from whisper_captioner.asr_history import ASRHistoryStore, audio_cache_key_for_url
 from whisper_captioner.cache import cache_slug, canonical_media_url
 from whisper_captioner.config import (
     BUFFER_PAUSE_MARGIN,
@@ -89,6 +94,81 @@ from whisper_captioner.subtitle_io import (
 
 TIMESTAMP_RE = re.compile(r"^\[[^\]]+\]\s*(.*)$")
 PROGRESS_LINE_RE = re.compile(r"\b(\d{1,3}(?:\.\d+)?)%")
+SILENCE_START_RE = re.compile(r"silence_start:\s*([0-9.]+)")
+SILENCE_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
+ADAPTIVE_SPLIT_MULTIPLIER = 1.5
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True)
+class QueueRunConfig:
+    prepared_wavs: dict[str, str] | None = None
+    qwen_replicas: int = 2
+    qwen_chunk_seconds: float = 45.0
+    qwen_parallel_enabled: bool = True
+    adaptive_split_enabled: bool = False
+    remote_vad_enabled: bool = False
+
+    @classmethod
+    def from_environment(cls, **overrides: Any) -> "QueueRunConfig":
+        values: dict[str, Any] = {
+            "qwen_replicas": max(1, min(4, int(os.environ.get("WHISPER_CAPTIONER_QWEN_REPLICAS", "2")))),
+            "qwen_chunk_seconds": max(
+                10.0, float(os.environ.get("WHISPER_CAPTIONER_QWEN_CHUNK_SECONDS", "45"))
+            ),
+            "qwen_parallel_enabled": _env_bool("WHISPER_CAPTIONER_QWEN_PARALLEL", True),
+            "adaptive_split_enabled": _env_bool("WHISPER_CAPTIONER_ADAPTIVE_SPLIT", False),
+            "remote_vad_enabled": _env_bool("WHISPER_CAPTIONER_REMOTE_VAD", False),
+        }
+        values.update(overrides)
+        return cls(**values)
+
+
+@dataclass(frozen=True)
+class VoiceWindow:
+    start: float
+    duration: float
+
+
+def parse_silencedetect_voice_window(
+    output: str,
+    duration: float,
+    *,
+    leading_guard: float = 0.10,
+    trailing_guard: float = 0.15,
+) -> VoiceWindow | None:
+    silences: list[tuple[float, float]] = []
+    active_start: float | None = None
+    for line in output.splitlines():
+        start_match = SILENCE_START_RE.search(line)
+        if start_match:
+            active_start = float(start_match.group(1))
+        end_match = SILENCE_END_RE.search(line)
+        if end_match:
+            silences.append((active_start if active_start is not None else 0.0, float(end_match.group(1))))
+            active_start = None
+    if active_start is not None:
+        silences.append((active_start, duration))
+    voice_ranges: list[tuple[float, float]] = []
+    cursor = 0.0
+    for silence_start, silence_end in sorted(silences):
+        if silence_start > cursor:
+            voice_ranges.append((cursor, silence_start))
+        cursor = max(cursor, silence_end)
+    if cursor < duration:
+        voice_ranges.append((cursor, duration))
+    stable = [(start, end) for start, end in voice_ranges if end - start >= 0.10]
+    if not stable:
+        return None
+    start = max(0.0, stable[0][0] - leading_guard)
+    end = min(duration, stable[-1][1] + trailing_guard)
+    return VoiceWindow(start, max(0.0, end - start))
 
 
 def clean_title_for_filename(title: str, fallback: str = "item") -> str:
@@ -1051,29 +1131,69 @@ class QueueWorker(QObject):
     caption = Signal(str)
     output_ready = Signal(str, str)  # (source, output_base)
     finished_item = Signal(str, bool)
+    chunk_progress = Signal(object)
     finished = Signal()
 
-    def __init__(self, items: list[str], mode: CaptionMode) -> None:
+    def __init__(
+        self,
+        items: list[str],
+        mode: CaptionMode,
+        config: QueueRunConfig | None = None,
+    ) -> None:
         super().__init__()
         self.items = items
         self.mode = mode
+        self.config = config or QueueRunConfig.from_environment()
         self._stop = False
         self.proc: Optional[subprocess.Popen[str]] = None
         self._temp_paths: list[Path] = []
+        self._process_lock = threading.RLock()
+        self._active_processes: set[subprocess.Popen[str]] = set()
+        self._used_nuc_asr = False
+        self.history = ASRHistoryStore()
 
     def run(self) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        for source in self.items:
-            if self._stop:
-                break
-            ok = self._process(source)
-            self.finished_item.emit(source, ok)
-        self.finished.emit()
+        try:
+            for source in self.items:
+                if self._stop:
+                    break
+                ok = self._process(source)
+                self.finished_item.emit(source, ok)
+        finally:
+            if self._used_nuc_asr:
+                self._release_nuc_asr()
+            self.finished.emit()
 
     def stop(self) -> None:
         self._stop = True
-        _terminate_process(self.proc)
+        with self._process_lock:
+            active = list(self._active_processes)
+        for proc in active:
+            _terminate_process(proc)
         self.proc = None
+
+    def _register_process(self, proc: subprocess.Popen[str]) -> None:
+        with self._process_lock:
+            self._active_processes.add(proc)
+            self.proc = proc
+
+    def _unregister_process(self, proc: subprocess.Popen[str]) -> None:
+        with self._process_lock:
+            self._active_processes.discard(proc)
+            if self.proc is proc:
+                self.proc = next(iter(self._active_processes), None)
+
+    def _release_nuc_asr(self) -> None:
+        try:
+            result = _request_json_url(
+                f"{self.mode.model}/release/asr",
+                timeout=10,
+                method="POST",
+            )
+            self.status.emit(f"NUC ASR release: {result.get('status', result)}")
+        except Exception as exc:
+            self.status.emit(f"NUC ASR release unavailable: {exc}")
 
     def _track_temp_path(self, path: Path) -> Path:
         self._temp_paths.append(path)
@@ -1114,6 +1234,16 @@ class QueueWorker(QObject):
         )
         _write_json_local(meta_path, metadata)
         return wav
+
+    def _prepared_wav(self, source: str) -> Path | None:
+        prepared = (self.config.prepared_wavs or {}).get(source)
+        if not prepared:
+            return None
+        path = Path(prepared).expanduser()
+        if not path.exists() or not path.is_file():
+            raise RuntimeError(f"Prepared WAV no longer exists: {path}")
+        self.status.emit(f"Reusing prepared WAV: {path}")
+        return path
 
     def _transcribe_local_file_via_nuc_job(self, wav: Path, *, base_url: str) -> list[SubtitleSegment]:
         import urllib.request
@@ -1249,9 +1379,19 @@ class QueueWorker(QObject):
         base = output_dir / f"{safe_name}-{stamp}"
         self._temp_paths = []
         wav = self._track_temp_path(Path(tempfile.gettempdir()) / f"whisper-captioner-{stamp}.wav")
+        self.history.upsert(
+            source,
+            title=source_title,
+            last_mode_key=self.mode.key,
+            last_mode_label=self.mode.label,
+            status="running",
+        )
 
         try:
-            if source.startswith(("http://", "https://")):
+            prepared_wav = self._prepared_wav(source)
+            if prepared_wav:
+                wav = prepared_wav
+            elif source.startswith(("http://", "https://")):
                 downloaded = Path(tempfile.gettempdir()) / f"whisper-captioner-{stamp}.%(ext)s"
                 self._run(
                     [
@@ -1273,7 +1413,36 @@ class QueueWorker(QObject):
                     raise RuntimeError("yt-dlp did not produce an audio file")
                 for candidate in candidates:
                     self._track_temp_path(candidate)
-                wav = audio
+                cache_dir = LOCAL_AUDIO_CACHE_DIR / audio_cache_key_for_url(source)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cached_wav = cache_dir / "audio-16k-mono.wav"
+                if not cached_wav.exists():
+                    self._run(
+                        [
+                            FFMPEG,
+                            "-hide_banner",
+                            "-y",
+                            "-i",
+                            str(audio),
+                            "-ac",
+                            "1",
+                            "-ar",
+                            "16000",
+                            str(cached_wav),
+                        ],
+                        "Preparing URL audio cache",
+                    )
+                _write_json_local(
+                    cache_dir / "metadata.json",
+                    {
+                        "kind": "url",
+                        "source": source,
+                        "identity": canonical_media_url(source),
+                        "wav": str(cached_wav),
+                        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                )
+                wav = cached_wav
             else:
                 wav = self._prepare_local_audio_cache(source)
 
@@ -1314,6 +1483,7 @@ class QueueWorker(QObject):
                 save_segments_as_txt(base.with_suffix(".txt"), segments)
                 save_segments_as_srt(base.with_suffix(".srt"), segments)
             elif self.mode.backend == "nuc_asr":
+                self._used_nuc_asr = True
                 self.status.emit("Transcribing with NUC remote ASR (faster-whisper CUDA)...")
                 duration = _probe_audio_duration(wav)
                 timeout = max(900, int(duration * 0.25 + 300))
@@ -1360,59 +1530,260 @@ class QueueWorker(QObject):
                 self.caption.emit(txt.read_text(encoding="utf-8", errors="ignore")[-1200:])
             self.output_ready.emit(source, str(base))
             self.status.emit(f"Done: {base}")
+            self.history.upsert(
+                source,
+                title=source_title,
+                audio_cache_key=wav.parent.name if wav.parent.parent == LOCAL_AUDIO_CACHE_DIR else "",
+                audio_cache_wav=str(wav) if wav.exists() else "",
+                last_mode_key=self.mode.key,
+                last_mode_label=self.mode.label,
+                output_base=str(base),
+                status="ready",
+            )
             return True
         except Exception as exc:
             self.status.emit(f"Failed {source}: {exc}")
+            self.history.upsert(
+                source,
+                title=source_title,
+                last_mode_key=self.mode.key,
+                last_mode_label=self.mode.label,
+                status="failed",
+            )
             return False
         finally:
             _cleanup_temp_paths(self._temp_paths)
 
     def _transcribe_local_qwen3_asr_chunked(self, wav: Path) -> list[SubtitleSegment]:
         duration = self._get_duration(wav)
-        chunk_seconds = 30.0
-        all_segments: list[SubtitleSegment] = []
-        offset = 0.0
-        chunk_index = 0
-        while offset < duration and not self._stop:
-            remaining = min(chunk_seconds, duration - offset)
-            chunk_wav = self._track_temp_path(Path(tempfile.gettempdir()) / f"{wav.stem}-qwen3-chunk{chunk_index}.wav")
-            chunk_out = Path(tempfile.gettempdir()) / f"{wav.stem}-qwen3-chunk{chunk_index}"
-            self._track_temp_path(chunk_out.with_suffix(".txt"))
-            self._run(
-                [
-                    FFMPEG,
-                    "-hide_banner",
-                    "-y",
-                    "-ss", str(offset),
-                    "-t", str(remaining),
-                    "-i", str(wav),
-                    "-ac", "1",
-                    "-ar", "16000",
-                    str(chunk_wav),
-                ],
-                f"Preparing Qwen3-ASR chunk {chunk_index}",
+        chunk_seconds = self.config.qwen_chunk_seconds
+        tasks = [
+            {
+                "label": str(index),
+                "start": start,
+                "duration": min(chunk_seconds, duration - start),
+                "root": True,
+                "split": False,
+            }
+            for index, start in enumerate(index * chunk_seconds for index in range(math.ceil(duration / chunk_seconds)))
+            if start < duration
+        ]
+        replicas = self.config.qwen_replicas if self.config.qwen_parallel_enabled else 1
+        pending = list(tasks)
+        futures: dict[Future, dict[str, Any]] = {}
+        started: dict[Future, float] = {}
+        cancel_events: dict[Future, threading.Event] = {}
+        process_by_future: dict[Future, subprocess.Popen[str]] = {}
+        results: list[SubtitleSegment] = []
+        successful_root_times: list[float] = []
+        done = 0
+        total = len(tasks)
+        splits = 0
+
+        def submit(executor: ThreadPoolExecutor, task: dict[str, Any]) -> None:
+            cancel_event = threading.Event()
+            holder: dict[str, Any] = {}
+            future = executor.submit(self._run_qwen_chunk_task, wav, task, cancel_event, holder)
+            futures[future] = task
+            started[future] = time.monotonic()
+            cancel_events[future] = cancel_event
+            holder["future"] = future
+            holder["processes"] = process_by_future
+
+        with ThreadPoolExecutor(max_workers=replicas, thread_name_prefix="qwen-asr") as executor:
+            while (pending or futures) and not self._stop:
+                while pending and len(futures) < replicas:
+                    submit(executor, pending.pop(0))
+                threshold = None
+                if len(successful_root_times) >= 3:
+                    threshold = max(10.0, min(successful_root_times[:3]) * ADAPTIVE_SPLIT_MULTIPLIER)
+                if self.config.adaptive_split_enabled and threshold:
+                    now = time.monotonic()
+                    for future, task in list(futures.items()):
+                        if not task["root"] or task["split"] or future.done():
+                            continue
+                        if now - started[future] <= threshold:
+                            continue
+                        task["split"] = True
+                        cancel_events[future].set()
+                        _terminate_process(process_by_future.get(future), timeout=1.0)
+                        half = task["duration"] / 2.0
+                        pending.extend(
+                            [
+                                {
+                                    "label": f"{task['label']}a",
+                                    "start": task["start"],
+                                    "duration": half,
+                                    "root": False,
+                                    "split": False,
+                                },
+                                {
+                                    "label": f"{task['label']}b",
+                                    "start": task["start"] + half,
+                                    "duration": task["duration"] - half,
+                                    "root": False,
+                                    "split": False,
+                                },
+                            ]
+                        )
+                        total += 1
+                        splits += 1
+                        self.status.emit(
+                            f"Adaptive split {task['label']} at {threshold:.1f}s into two child chunks"
+                        )
+                completed, _ = wait(list(futures), timeout=0.2, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    task = futures.pop(future)
+                    elapsed = time.monotonic() - started.pop(future)
+                    cancel_events.pop(future, None)
+                    process_by_future.pop(future, None)
+                    if task["split"]:
+                        try:
+                            future.result()
+                        except Exception:
+                            pass
+                        continue
+                    try:
+                        chunk_segments = future.result()
+                    except Exception as first_error:
+                        if self._stop:
+                            raise RuntimeError("Queue stopped") from first_error
+                        self.status.emit(f"Qwen3-ASR chunk {task['label']} failed; retrying once: {first_error}")
+                        try:
+                            chunk_segments = self._run_qwen_chunk_task(
+                                wav, task, threading.Event(), {"processes": {}}
+                            )
+                        except Exception as retry_error:
+                            for event in cancel_events.values():
+                                event.set()
+                            for active_proc in list(process_by_future.values()):
+                                _terminate_process(active_proc, timeout=1.0)
+                            pending.clear()
+                            for active_future in futures:
+                                active_future.cancel()
+                            raise RuntimeError(
+                                f"Qwen3-ASR chunk {task['label']} failed after retry: {retry_error}"
+                            ) from retry_error
+                    results.extend(chunk_segments)
+                    done += 1
+                    if task["root"]:
+                        successful_root_times.append(elapsed)
+                    self.chunk_progress.emit(
+                        {
+                            "done": done,
+                            "total": total,
+                            "finished": done == total,
+                            "inflight": len(futures),
+                            "splits": splits,
+                        }
+                    )
+        if self._stop:
+            raise RuntimeError("Queue stopped")
+        return sorted(results, key=lambda segment: (segment.start, segment.end))
+
+    def _run_qwen_chunk_task(
+        self,
+        wav: Path,
+        task: dict[str, Any],
+        cancel_event: threading.Event,
+        holder: dict[str, Any],
+    ) -> list[SubtitleSegment]:
+        label = task["label"]
+        token = uuid.uuid4().hex
+        chunk_wav = Path(tempfile.gettempdir()) / f"{wav.stem}-qwen3-{label}-{token}.wav"
+        chunk_out = Path(tempfile.gettempdir()) / f"{wav.stem}-qwen3-{label}-{token}"
+        with self._process_lock:
+            self._temp_paths.extend([chunk_wav, chunk_out.with_suffix(".txt")])
+        self._run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-y",
+                "-ss",
+                str(task["start"]),
+                "-t",
+                str(task["duration"]),
+                "-i",
+                str(wav),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(chunk_wav),
+            ],
+            f"Preparing Qwen3-ASR chunk {label}",
+        )
+        if cancel_event.is_set() or self._stop:
+            raise RuntimeError("Chunk cancelled")
+        cmd = [
+            MLX_AUDIO_STT,
+            "--model",
+            str(self.mode.model),
+            "--audio",
+            str(chunk_wav),
+            "--output-path",
+            str(chunk_out),
+            "--format",
+            "txt",
+            "--language",
+            "zh",
+            "--chunk-duration",
+            str(max(1, int(task["duration"]))),
+        ]
+        self.status.emit(f"Transcribing Qwen3-ASR chunk {label}")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(OUTPUT_DIR),
+        )
+        self._register_process(proc)
+        output_lines: list[str] = []
+
+        def consume_output() -> None:
+            if not proc.stdout:
+                return
+            for line in proc.stdout:
+                output_lines.append(line.rstrip())
+
+        output_thread = threading.Thread(target=consume_output, daemon=True)
+        output_thread.start()
+        future = holder.get("future")
+        if future is not None:
+            holder["processes"][future] = proc
+        try:
+            deadline = time.monotonic() + max(120.0, float(task["duration"]) * 20.0)
+            while proc.poll() is None:
+                if self._stop or cancel_event.wait(0.1):
+                    _terminate_process(proc, timeout=1.0)
+                    raise RuntimeError("Chunk cancelled")
+                if time.monotonic() >= deadline:
+                    _terminate_process(proc, timeout=1.0)
+                    raise TimeoutError(
+                        f"Qwen3-ASR chunk {label} timed out after "
+                        f"{max(120.0, float(task['duration']) * 20.0):.0f}s"
+                    )
+            output_thread.join(timeout=2)
+            output = "\n".join(output_lines)
+            if proc.returncode != 0:
+                raise RuntimeError(f"worker exited with code {proc.returncode}: {output[-1000:]}")
+        finally:
+            self._unregister_process(proc)
+        chunk_txt = chunk_out.with_suffix(".txt")
+        chunk_text = (
+            chunk_txt.read_text(encoding="utf-8", errors="ignore").strip()
+            if chunk_txt.exists()
+            else output.strip()
+        )
+        return [
+            SubtitleSegment(
+                segment.start + task["start"],
+                segment.end + task["start"],
+                segment.text,
             )
-            output_text = self._run_capture(
-                [
-                    MLX_AUDIO_STT,
-                    "--model", str(self.mode.model),
-                    "--audio", str(chunk_wav),
-                    "--output-path", str(chunk_out),
-                    "--format", "txt",
-                    "--language", "zh",
-                    "--chunk-duration", str(max(1, int(remaining))),
-                ],
-                f"Transcribing Qwen3-ASR chunk {chunk_index}",
-            )
-            chunk_txt = chunk_out.with_suffix(".txt")
-            chunk_text = chunk_txt.read_text(encoding="utf-8", errors="ignore").strip() if chunk_txt.exists() else output_text
-            all_segments.extend(
-                SubtitleSegment(segment.start + offset, segment.end + offset, segment.text)
-                for segment in pseudo_timestamp_qwen3_text(chunk_text, remaining)
-            )
-            offset += remaining
-            chunk_index += 1
-        return all_segments
+            for segment in pseudo_timestamp_qwen3_text(chunk_text, task["duration"])
+        ]
 
     def _transcribe_nuc_qwen3_asr_1p7b_chunked(self, wav: Path, base_url: str) -> list[SubtitleSegment]:
         duration = self._get_duration(wav)
@@ -1440,7 +1811,30 @@ class QueueWorker(QObject):
                 ],
                 f"Preparing NUC Qwen3-ASR 1.7B chunk {chunk_index}",
             )
-            raw_segments = _transcribe_via_nuc_qwen3_asr_1p7b(chunk_wav, base_url=base_url, timeout=900)
+            request_wav = chunk_wav
+            vad_offset = 0.0
+            request_duration = remaining
+            if self.config.remote_vad_enabled:
+                vad_result = self._prepare_vad_window(chunk_wav, remaining, str(chunk_index))
+                if vad_result is None:
+                    self.status.emit(
+                        f"Chunk {chunk_index}: no stable voice window detected, skipping NUC Qwen3-ASR request"
+                    )
+                    offset += chunk_seconds
+                    chunk_index += 1
+                    continue
+                request_wav, vad_offset, request_duration = vad_result
+            raw_segments = _transcribe_via_nuc_qwen3_asr_1p7b(
+                request_wav, base_url=base_url, timeout=900
+            )
+            raw_segments = [
+                SubtitleSegment(
+                    segment.start + vad_offset,
+                    segment.end + vad_offset,
+                    segment.text,
+                )
+                for segment in raw_segments
+            ]
             trimmed = self._trim_overlap_segments(
                 raw_segments,
                 leading_trim=leading_trim,
@@ -1454,6 +1848,63 @@ class QueueWorker(QObject):
             offset += chunk_seconds
             chunk_index += 1
         return self._merge_near_duplicate_segments(all_segments)
+
+    def _prepare_vad_window(
+        self,
+        chunk_wav: Path,
+        duration: float,
+        label: str,
+    ) -> tuple[Path, float, float] | None:
+        try:
+            output = self._run_capture(
+                [
+                    FFMPEG,
+                    "-hide_banner",
+                    "-i",
+                    str(chunk_wav),
+                    "-af",
+                    "silencedetect=noise=-35dB:d=0.3",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                f"Detecting speech window for chunk {label}",
+            )
+            window = parse_silencedetect_voice_window(output, duration)
+            if window is None:
+                return None
+            if window.start <= 0.001 and window.duration >= duration - 0.001:
+                return chunk_wav, 0.0, duration
+            trimmed = self._track_temp_path(
+                Path(tempfile.gettempdir()) / f"{chunk_wav.stem}-vad-{uuid.uuid4().hex}.wav"
+            )
+            self._run(
+                [
+                    FFMPEG,
+                    "-hide_banner",
+                    "-y",
+                    "-ss",
+                    str(window.start),
+                    "-t",
+                    str(window.duration),
+                    "-i",
+                    str(chunk_wav),
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    str(trimmed),
+                ],
+                f"Trimming speech window for chunk {label}",
+            )
+            self.status.emit(
+                f"Chunk {label}: VAD trimmed {window.start:.2f}s leading, "
+                f"{max(0.0, duration - window.start - window.duration):.2f}s trailing"
+            )
+            return trimmed, window.start, window.duration
+        except Exception as exc:
+            self.status.emit(f"Chunk {label}: VAD failed, using full chunk: {exc}")
+            return chunk_wav, 0.0, duration
 
     def _transcribe_local_sense_voice_cpp_chunked(self, wav: Path) -> list[SubtitleSegment]:
         duration = self._get_duration(wav)
@@ -1608,40 +2059,42 @@ class QueueWorker(QObject):
 
     def _run(self, cmd: list[str], label: str) -> None:
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
-        self.proc = subprocess.Popen(
+        proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(OUTPUT_DIR)
         )
+        self._register_process(proc)
         try:
             output_lines = _stream_process_output(
-                self.proc,
+                proc,
                 status_signal=self.status,
                 stop_flag=lambda: self._stop,
                 stop_message="Queue stopped",
             )
-            if self.proc.wait() != 0:
+            if proc.wait() != 0:
                 error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
                 raise RuntimeError(f"command failed: {cmd[0]}\n\nOutput:\n{error_context}")
         finally:
-            self.proc = None
+            self._unregister_process(proc)
 
     def _run_capture(self, cmd: list[str], label: str) -> str:
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
-        self.proc = subprocess.Popen(
+        proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(OUTPUT_DIR)
         )
+        self._register_process(proc)
         try:
             output_lines = _stream_process_output(
-                self.proc,
+                proc,
                 status_signal=self.status,
                 stop_flag=lambda: self._stop,
                 stop_message="Queue stopped",
             )
-            if self.proc.wait() != 0:
+            if proc.wait() != 0:
                 error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
                 raise RuntimeError(f"command failed: {cmd[0]}\n\nOutput:\n{error_context}")
             return "\n".join(output_lines)
         finally:
-            self.proc = None
+            self._unregister_process(proc)
 
 
 class LLMTextWorker(QObject):
@@ -1719,6 +2172,7 @@ class RollingPrefetchWorker(QObject):
         self, url: str, mode: CaptionMode, chunk_seconds: int = 30,
         llm_provider: Optional[LLMProvider] = None, llm_api_key: str = "",
         llm_api_url: str = "", llm_model_id: str = "",
+        remote_vad_enabled: bool | None = None,
     ) -> None:
         super().__init__()
         self.url = url
@@ -1728,9 +2182,15 @@ class RollingPrefetchWorker(QObject):
         self.llm_api_key = llm_api_key
         self.llm_api_url = llm_api_url
         self.llm_model_id = llm_model_id
+        self.remote_vad_enabled = (
+            _env_bool("WHISPER_CAPTIONER_REMOTE_VAD", False)
+            if remote_vad_enabled is None
+            else remote_vad_enabled
+        )
         self._stop = False
         self.proc: Optional[subprocess.Popen[str]] = None
         self._temp_paths: list[Path] = []
+        self._used_nuc_asr = False
 
     def run(self) -> None:
         try:
@@ -1738,6 +2198,16 @@ class RollingPrefetchWorker(QObject):
         except Exception as exc:
             self.status.emit(f"Rolling prefetch failed: {exc}")
         finally:
+            if self._used_nuc_asr:
+                try:
+                    result = _request_json_url(
+                        f"{self.mode.model}/release/asr",
+                        timeout=10,
+                        method="POST",
+                    )
+                    self.status.emit(f"NUC ASR release: {result.get('status', result)}")
+                except Exception as exc:
+                    self.status.emit(f"NUC ASR release unavailable: {exc}")
             self.finished.emit()
 
     def stop(self) -> None:
@@ -2071,14 +2541,31 @@ class RollingPrefetchWorker(QObject):
             save_segments_as_srt(srt_path, segments)
             return srt_path
         if self.mode.backend == "nuc_asr":
+            self._used_nuc_asr = True
             self.status.emit(f"Transcribing chunk {chunk_label} with NUC remote ASR...")
-            segments = _transcribe_via_nuc_asr(chunk_wav, base_url=str(self.mode.model))
+            request_wav, vad_offset = self._prepare_remote_vad_chunk(chunk_wav, chunk_label)
+            if request_wav is None:
+                segments = []
+            else:
+                segments = [
+                    SubtitleSegment(segment.start + vad_offset, segment.end + vad_offset, segment.text)
+                    for segment in _transcribe_via_nuc_asr(request_wav, base_url=str(self.mode.model))
+                ]
             srt_path = chunk_out.with_suffix(".srt")
             save_segments_as_srt(srt_path, segments)
             return srt_path
         if self.mode.backend == "nuc_qwen3_asr_1p7b":
             self.status.emit(f"Transcribing chunk {chunk_label} with NUC remote Qwen3-ASR 1.7B...")
-            segments = _transcribe_via_nuc_qwen3_asr_1p7b(chunk_wav, base_url=str(self.mode.model))
+            request_wav, vad_offset = self._prepare_remote_vad_chunk(chunk_wav, chunk_label)
+            if request_wav is None:
+                segments = []
+            else:
+                segments = [
+                    SubtitleSegment(segment.start + vad_offset, segment.end + vad_offset, segment.text)
+                    for segment in _transcribe_via_nuc_qwen3_asr_1p7b(
+                        request_wav, base_url=str(self.mode.model)
+                    )
+                ]
             segments = self._trim_overlap_segments(
                 segments,
                 leading_trim=0.0,
@@ -2101,6 +2588,64 @@ class RollingPrefetchWorker(QObject):
             f"Transcribing chunk {chunk_label}",
         )
         return chunk_out.with_suffix(".srt")
+
+    def _prepare_remote_vad_chunk(
+        self,
+        chunk_wav: Path,
+        chunk_label: int | str,
+    ) -> tuple[Path | None, float]:
+        if not self.remote_vad_enabled:
+            return chunk_wav, 0.0
+        try:
+            duration = _probe_audio_duration(chunk_wav)
+            output = self._run_cmd_capture(
+                [
+                    FFMPEG,
+                    "-hide_banner",
+                    "-i",
+                    str(chunk_wav),
+                    "-af",
+                    "silencedetect=noise=-35dB:d=0.3",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                f"Detecting speech window for chunk {chunk_label}",
+            )
+            window = parse_silencedetect_voice_window(output, duration)
+            if window is None:
+                self.status.emit(
+                    f"Chunk {chunk_label}: no stable voice window detected, skipping remote ASR request"
+                )
+                return None, 0.0
+            if window.start <= 0.001 and window.duration >= duration - 0.001:
+                return chunk_wav, 0.0
+            trimmed = self._track_temp_path(
+                chunk_wav.with_name(f"{chunk_wav.stem}-vad-{uuid.uuid4().hex}.wav")
+            )
+            self._run_cmd(
+                [
+                    FFMPEG,
+                    "-hide_banner",
+                    "-y",
+                    "-ss",
+                    str(window.start),
+                    "-t",
+                    str(window.duration),
+                    "-i",
+                    str(chunk_wav),
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    str(trimmed),
+                ],
+                f"Trimming speech window for chunk {chunk_label}",
+            )
+            return trimmed, window.start
+        except Exception as exc:
+            self.status.emit(f"Chunk {chunk_label}: VAD failed, using full chunk: {exc}")
+            return chunk_wav, 0.0
 
     def _repair_sparse_chunk_with_subchunks(
         self,
