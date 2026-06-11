@@ -293,6 +293,30 @@ Admission behavior:
 - When `nvidia-smi` is unavailable or free GPU memory is below the threshold, admission fails with HTTP `503`.
 - After a `Qwen` request finishes, the backend is stopped after the idle timeout so it does not sit on VRAM.
 - After the final faster-whisper request, its backend is stopped after `180s`; the `:8000` proxy remains available.
+- Queue and controlled-caption workers call `POST :8000/release/asr` after actually using NUC
+  faster-whisper. The ASR proxy forwards only this safe operation to the localhost-only scheduler;
+  busy, offline, and timeout responses are logged without changing completed results.
+
+### ASR history and recovered chunk processing
+
+The **ASR 历史** tab is backed by `CACHE_DIR / "asr-history.json"`. It supports cached-WAV
+reruns when the original file is missing, atomic writes, corrupt-file preservation, and old output
+path migration. Deleting a history row never deletes its WAV, subtitle cache, or output files.
+
+Recovered Qwen3-ASR controls include 1-4 local process replicas, a default `45s` root chunk,
+one-level adaptive splitting (`max(10.0, fastest_of_first_3 * 1.5)`), and FFmpeg remote-chunk
+VAD (`-35dB`, `0.3s`). Two-replica local Qwen processing is enabled by default after machine
+acceptance; adaptive splitting and remote VAD remain disabled by default.
+
+Environment variables override `QSettings`:
+
+```text
+WHISPER_CAPTIONER_QWEN_PARALLEL=1
+WHISPER_CAPTIONER_QWEN_REPLICAS=2
+WHISPER_CAPTIONER_QWEN_CHUNK_SECONDS=45
+WHISPER_CAPTIONER_ADAPTIVE_SPLIT=0
+WHISPER_CAPTIONER_REMOTE_VAD=0
+```
 
 Current large-file local-file flow for `NUC Qwen3-ASR 1.7B`:
 
