@@ -18,8 +18,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─── 配置与全局变量 ───────────────────────────────────────────────────────────
 
-STAGING_DIR = Path("~/Documents/temp/batch_asr_staging").expanduser()
-MANIFEST_PATH = STAGING_DIR / "manifest.json"
+OSRT_ROOT = Path.home() / "Movies" / "OSRT"
+MANIFEST_PATH = OSRT_ROOT / "manifest.json"
+
+FALLBACK_THRESHOLD = 0.80
 
 GEMINI_API_KEY = "AIzaSyADl6hpoxdZUVdEqvLylzEwV7lvdr93Jdk"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
@@ -33,8 +35,13 @@ MAX_CONCURRENT_WORKERS = 8
 # LLM 提示词 (参考 whisper_captioner 原版提示词进行规整，不带 timestamps 干扰)
 LLM_SYSTEM_PROMPT = (
     "You are a Chinese subtitle corrector. Your task is to proofread and improve subtitle text "
-    "while preserving original meaning. The subtitle index and the corrected text should be in format: "
-    "\"序号: 修正后的文本\". Only output corrected lines, no explanations."
+    "while preserving original meaning.\n\n"
+    "CRITICAL RULES — VIOLATION WILL CAUSE SYSTEM FAILURE:\n"
+    "1. You MUST return EXACTLY the same number of lines as the input. No more, no less.\n"
+    "2. NEVER summarize, merge, or delete any line. Every input line must produce exactly one output line.\n"
+    "3. Output format is strictly: \"序号: 规整后的文本\" — one line per entry.\n"
+    "4. If you cannot correct a line, output it unchanged.\n"
+    "5. Do NOT add any explanation, header, or footer text."
 )
 
 _LLM_LINE_RE = re.compile(r"^(\d+):\s*(.+)$")
@@ -51,7 +58,10 @@ def load_manifest():
 
 def save_manifest(manifest):
     try:
-        MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        OSRT_ROOT.mkdir(parents=True, exist_ok=True)
+        tmp = MANIFEST_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(MANIFEST_PATH)
     except Exception as e:
         print(f"  ⚠ 写入 manifest 失败: {e}", flush=True)
 
@@ -122,7 +132,10 @@ def polish_batch(batch_idx: int, batch: list, total_segments: int, system_prompt
             with urllib.request.urlopen(req, timeout=90) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             reply = data["choices"][0]["message"]["content"]
-            return parse_llm_lines(reply, len(batch))
+            parsed = parse_llm_lines(reply, len(batch))
+            if len(parsed) < len(batch) * FALLBACK_THRESHOLD:
+                raise ValueError(f"返回行数({len(parsed)})低于阈值(需>={int(len(batch)*FALLBACK_THRESHOLD)})，疑似总结行为")
+            return parsed
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace").strip()
             print(f"      ⚠ Gemini API HTTP {exc.code} (Batch {batch_idx}, 尝试 {attempt+1}): {detail[:150]}", flush=True)
@@ -171,8 +184,13 @@ def build_system_prompt_for_video(mp4_name: str) -> str:
     
     custom_prompt = (
         "You are a Chinese subtitle corrector. Your task is to proofread and improve subtitle text "
-        "while preserving original meaning. The subtitle index and the corrected text should be in format: "
-        "\"序号: 修正后的文本\". Only output corrected lines, no explanations.\n"
+        "while preserving original meaning.\n\n"
+        "CRITICAL RULES — VIOLATION WILL CAUSE SYSTEM FAILURE:\n"
+        "1. You MUST return EXACTLY the same number of lines as the input. No more, no less.\n"
+        "2. NEVER summarize, merge, or delete any line. Every input line must produce exactly one output line.\n"
+        "3. Output format is strictly: \"序号: 规整后的文本\" — one line per entry.\n"
+        "4. If you cannot correct a line, output it unchanged.\n"
+        "5. Do NOT add any explanation, header, or footer text.\n\n"
         "Important: This video is about AI and software development. Correct phonetically misrecognized terms "
         f"and output them in their standard form. Key terms expected in this video include: [{terms_str}]."
     )
@@ -241,10 +259,12 @@ def main():
                 time.sleep(5)
                 continue
 
-            # 筛选已完成 ASR（即 json 存在），但是未标记 srt_done 的项目
+            # 筛选已完成 ASR（即 json 存在），但是未标记 polished_done 的项目
             pending = []
             for slug, info in manifest.items():
-                if info.get("srt_done"):
+                if info.get("polished_done"):
+                    continue
+                if not info.get("asr_done"):
                     continue
                 json_path = Path(info["json"])
                 if json_path.exists():
@@ -266,7 +286,7 @@ def main():
 
                     for future in as_completed(future_to_video):
                         slug, mp4_path = future_to_video[future]
-                        srt_path = mp4_path.with_suffix(".srt")
+                        srt_path = mp4_path.with_suffix(".polished.srt")
                         try:
                             success, polished, err_msg = future.result()
                             if success:
@@ -275,7 +295,7 @@ def main():
                                 # 重新载入以防止并发覆写其他项
                                 cur_manifest = load_manifest()
                                 if slug in cur_manifest:
-                                    cur_manifest[slug]["srt_done"] = True
+                                    cur_manifest[slug]["polished_done"] = True
                                     save_manifest(cur_manifest)
                                 print(f"  ✓ 【规整完成】 SRT 生成成功: {mp4_path.name}", flush=True)
                             else:

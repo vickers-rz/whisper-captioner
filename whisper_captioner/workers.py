@@ -114,6 +114,8 @@ class QueueRunConfig:
     qwen_parallel_enabled: bool = True
     adaptive_split_enabled: bool = False
     remote_vad_enabled: bool = False
+    cpp_threads: int = 6
+    cpp_flash_attn: bool = True
 
     @classmethod
     def from_environment(cls, **overrides: Any) -> "QueueRunConfig":
@@ -125,9 +127,20 @@ class QueueRunConfig:
             "qwen_parallel_enabled": _env_bool("WHISPER_CAPTIONER_QWEN_PARALLEL", True),
             "adaptive_split_enabled": _env_bool("WHISPER_CAPTIONER_ADAPTIVE_SPLIT", False),
             "remote_vad_enabled": _env_bool("WHISPER_CAPTIONER_REMOTE_VAD", False),
+            "cpp_threads": max(
+                1, min(8, int(os.environ.get("WHISPER_CAPTIONER_CPP_THREADS", "6")))
+            ),
+            "cpp_flash_attn": _env_bool("WHISPER_CAPTIONER_CPP_FLASH_ATTN", True),
         }
         values.update(overrides)
         return cls(**values)
+
+    def cpp_args(self) -> list[str]:
+        return [
+            "-t",
+            str(self.cpp_threads),
+            "--flash-attn" if self.cpp_flash_attn else "--no-flash-attn",
+        ]
 
 
 @dataclass(frozen=True)
@@ -1537,7 +1550,7 @@ class QueueWorker(QObject):
                         WHISPER_CLI,
                         "-m", str(self.mode.model),
                         "-f", str(wav),
-                        "-t", "8",
+                        *self.config.cpp_args(),
                         *self.mode.args,
                         "-of", str(base),
                     ],
@@ -2378,9 +2391,16 @@ class RollingPrefetchWorker(QObject):
 
             native_segments, native_kind = self._load_or_fetch_native_subtitles(job_cache_dir)
             if native_kind == "zh":
+                native_output_base = self._native_output_base()
+                self._export_subtitles(native_segments, native_output_base)
+                self.status.emit(
+                    f"Native subtitles written: {native_output_base.with_suffix('.srt')}"
+                )
                 self.native_subtitles_detected.emit(
                     native_segments,
-                    "检测到视频自带中文字幕，已加载。跳过 Whisper 和 LLM 识别以节省资源。"
+                    "检测到视频自带中文字幕，已下载、保存并载入。"
+                    f"\n\n字幕文件：{native_output_base.with_suffix('.srt')}"
+                    "\n\n已跳过 Whisper 和 LLM 识别以节省资源。"
                 )
                 return
 
@@ -2722,7 +2742,7 @@ class RollingPrefetchWorker(QObject):
                 WHISPER_CLI,
                 "-m", str(self.mode.model),
                 "-f", str(chunk_wav),
-                "-t", "8",
+                *self.run_config.cpp_args(),
                 "-l", "zh",
                 "-osrt",
                 "-of", str(chunk_out),
@@ -2935,6 +2955,10 @@ class RollingPrefetchWorker(QObject):
         title = clean_title_for_filename(self._source_title())
         return source_output_dir(GENERATED_DIR, title) / f"{title}-{self._output_variant_suffix()}-LLM优化字幕"
 
+    def _native_output_base(self) -> Path:
+        title = clean_title_for_filename(self._source_title())
+        return source_output_dir(GENERATED_DIR, title) / f"{title}-视频原生中文字幕"
+
     def _output_variant_suffix(self) -> str:
         parts = [clean_title_for_filename(self.mode.key, fallback="mode")]
         if self.llm_provider:
@@ -3047,29 +3071,43 @@ class RollingPrefetchWorker(QObject):
             subs_dir = job_cache_dir / f"native-subs-{cache_name}"
             subs_dir.mkdir(parents=True, exist_ok=True)
             out_template = subs_dir / "native.%(ext)s"
-            try:
-                self._run_cmd(
-                    [
-                        YT_DLP,
-                        "--skip-download",
-                        "--write-subs",
-                        "--sub-langs",
-                        lang_expr,
-                        "--sub-format",
-                        "srt/vtt/best",
-                        "--cookies-from-browser",
-                        "chrome",
-                        "-o",
-                        str(out_template),
-                        self.url,
-                    ],
-                    f"Fetching native subtitles ({lang_expr})",
+            for subtitle_kind, write_flag in (
+                ("manual", "--write-subs"),
+                ("automatic", "--write-auto-subs"),
+            ):
+                try:
+                    self._run_cmd(
+                        [
+                            YT_DLP,
+                            "--skip-download",
+                            write_flag,
+                            "--sub-langs",
+                            lang_expr,
+                            "--sub-format",
+                            "srt/vtt/best",
+                            "--cookies-from-browser",
+                            "chrome",
+                            "-o",
+                            str(out_template),
+                            self.url,
+                        ],
+                        f"Fetching {subtitle_kind} native subtitles ({lang_expr})",
+                    )
+                except Exception as exc:
+                    self.status.emit(
+                        f"No {subtitle_kind} native subtitles fetched for "
+                        f"{lang_expr} ({cache_name}, {subs_dir.name}): {exc}"
+                    )
+                subtitle_files = sorted(
+                    p for p in subs_dir.glob("native.*")
+                    if p.suffix.lower() in {".srt", ".vtt"}
                 )
-            except Exception as exc:
-                self.status.emit(
-                    f"No native subtitles fetched for {lang_expr} ({cache_name}, {subs_dir.name}): {exc}"
-                )
-                continue
+                if subtitle_files:
+                    self.status.emit(
+                        f"Downloaded {subtitle_kind} native subtitles: "
+                        f"{', '.join(path.name for path in subtitle_files)}"
+                    )
+                    break
 
             subtitle_files = sorted(
                 p for p in subs_dir.glob("native.*") if p.suffix.lower() in {".srt", ".vtt"}

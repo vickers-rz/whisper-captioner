@@ -31,6 +31,54 @@ class WorkerRecoveryTest(unittest.TestCase):
         self.assertEqual([[segment.text for segment in batch] for batch in first], [["first"]])
         self.assertEqual([[segment.text for segment in batch] for batch in more], [["second"]])
 
+    def test_native_subtitles_prefer_manual_then_fall_back_to_automatic(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        worker = RollingPrefetchWorker("https://example.com/video", mode)
+        commands = []
+
+        def fake_run(command, _label):
+            commands.append(command)
+            if "--write-auto-subs" in command:
+                output_template = Path(command[command.index("-o") + 1])
+                subtitle_path = Path(str(output_template).replace("%(ext)s", "zh-Hans.vtt"))
+                subtitle_path.write_text(
+                    "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n测试字幕\n",
+                    encoding="utf-8",
+                )
+
+        worker._run_cmd = fake_run
+        with tempfile.TemporaryDirectory() as directory:
+            segments, kind = worker._load_or_fetch_native_subtitles(Path(directory))
+
+        self.assertEqual(kind, "zh")
+        self.assertEqual([segment.text for segment in segments], ["测试字幕"])
+        self.assertIn("--write-subs", commands[0])
+        self.assertIn("--write-auto-subs", commands[1])
+
+    def test_controlled_native_subtitles_are_exported_and_emitted(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        worker = RollingPrefetchWorker("https://example.com/video", mode)
+        segments = [SubtitleSegment(1.0, 2.0, "原生字幕")]
+        emitted = []
+        worker.native_subtitles_detected.connect(
+            lambda found, message: emitted.append((found, message))
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_base = Path(directory) / "native-output"
+            with (
+                patch.object(worker, "_load_or_fetch_native_subtitles", return_value=(segments, "zh")),
+                patch.object(worker, "_native_output_base", return_value=output_base),
+                patch("whisper_captioner.workers.CACHE_DIR", Path(directory) / "cache"),
+            ):
+                worker._do_rolling_prefetch()
+
+            self.assertTrue(output_base.with_suffix(".srt").exists())
+            self.assertTrue(output_base.with_suffix(".txt").exists())
+
+        self.assertEqual(emitted[0][0], segments)
+        self.assertIn("已下载、保存并载入", emitted[0][1])
+
     def test_controlled_qwen_parallel_buffers_out_of_order_results(self):
         mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
         config = QueueRunConfig(
@@ -121,6 +169,8 @@ class WorkerRecoveryTest(unittest.TestCase):
                 "WHISPER_CAPTIONER_QWEN_CHUNK_SECONDS": "5",
                 "WHISPER_CAPTIONER_QWEN_PARALLEL": "1",
                 "WHISPER_CAPTIONER_ADAPTIVE_SPLIT": "true",
+                "WHISPER_CAPTIONER_CPP_THREADS": "12",
+                "WHISPER_CAPTIONER_CPP_FLASH_ATTN": "false",
             },
             clear=False,
         ):
@@ -129,6 +179,42 @@ class WorkerRecoveryTest(unittest.TestCase):
         self.assertEqual(config.qwen_chunk_seconds, 10.0)
         self.assertTrue(config.qwen_parallel_enabled)
         self.assertTrue(config.adaptive_split_enabled)
+        self.assertEqual(config.cpp_threads, 8)
+        self.assertFalse(config.cpp_flash_attn)
+
+    def test_cpp_runtime_args_use_selected_threads_and_flash_attention(self):
+        enabled = QueueRunConfig(cpp_threads=6, cpp_flash_attn=True)
+        disabled = QueueRunConfig(cpp_threads=4, cpp_flash_attn=False)
+        self.assertEqual(enabled.cpp_args(), ["-t", "6", "--flash-attn"])
+        self.assertEqual(disabled.cpp_args(), ["-t", "4", "--no-flash-attn"])
+
+    def test_queue_cpp_command_uses_runtime_config(self):
+        mode = next(mode for mode in MODES if mode.key == "hq_turbo")
+        commands = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp4"
+            wav = Path(directory) / "audio.wav"
+            source.touch()
+            wav.touch()
+            worker = QueueWorker(
+                [],
+                mode,
+                QueueRunConfig(
+                    prepared_wavs={str(source): str(wav)},
+                    cpp_threads=6,
+                    cpp_flash_attn=True,
+                ),
+            )
+            worker._run = lambda command, _label: commands.append(command)
+            worker.history.upsert = lambda *_args, **_kwargs: None
+            with patch("whisper_captioner.workers.source_output_dir", return_value=Path(directory)):
+                self.assertTrue(worker._process(str(source)))
+
+        command = commands[-1]
+        self.assertIn("-t", command)
+        self.assertEqual(command[command.index("-t") + 1], "6")
+        self.assertIn("--flash-attn", command)
 
     def test_parallel_qwen_results_are_sorted_and_progress_is_structured(self):
         mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")

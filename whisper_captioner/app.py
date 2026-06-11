@@ -31,6 +31,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from whisper_captioner.cache import cache_slug, canonical_media_url, validate_url_for_yt_dlp
 from whisper_captioner.asr_history import ASRHistoryEntry, ASRHistoryStore
+from whisper_captioner.chaptering import (
+    VideoChapter,
+    add_chapters_to_subtitles,
+    chapters_to_json,
+    chapters_to_markdown,
+    parse_chapters_response,
+)
 from whisper_captioner.chrome_control import (
     chrome_current_time,
     chrome_current_time_url,
@@ -49,6 +56,7 @@ from whisper_captioner.llm_handler import (
     llm_provider_ready,
     test_llm_connection,
 )
+from whisper_captioner.mac_gpu_monitor import MacGpuMonitor
 from whisper_captioner.overlay import SubtitleOverlay
 from whisper_captioner.qwen_chat_service import QwenChatServiceManager
 from whisper_captioner.ui_builder import build_main_window_ui
@@ -65,6 +73,7 @@ from whisper_captioner.workers import (
     clean_title_for_filename,
     infer_source_title,
     local_audio_cache_dir_for_source,
+    qwen3_asr_mode,
     source_output_dir,
 )
 from whisper_captioner.config import (
@@ -121,6 +130,8 @@ class MainWindow(QMainWindow):
         self.llm_text_thread: Optional[QThread] = None
         self.llm_text_worker: Optional[LLMTextWorker] = None
         self.controlled_segments: list[SubtitleSegment] = []
+        self.video_chapters: list[VideoChapter] = []
+        self._chapter_target_srt: Optional[Path] = None
         self._controlled_segment_starts: list[float] = []
         self.controlled_timer = QTimer(self)
         self.controlled_timer.setInterval(250)
@@ -150,6 +161,9 @@ class MainWindow(QMainWindow):
         self._current_progress: tuple[int, int] | None = None
         self.qwen_chat_service = QwenChatServiceManager()
         self.asr_history = ASRHistoryStore()
+        self.mac_gpu_monitor = MacGpuMonitor()
+        self.mac_gpu_monitor.sample_ready.connect(self.log)
+        self.mac_gpu_monitor.notice.connect(self.log)
 
         self._log_flush_timer = QTimer(self)
         self._log_flush_timer.setInterval(120)
@@ -198,6 +212,8 @@ class MainWindow(QMainWindow):
             self.qwen_chunk_seconds_spin,
             self.adaptive_split_checkbox,
             self.remote_vad_checkbox,
+            self.cpp_threads_spin,
+            self.cpp_flash_attn_checkbox,
         ):
             if hasattr(widget, "toggled"):
                 widget.toggled.connect(self._save_asr_runtime_settings)
@@ -229,14 +245,18 @@ class MainWindow(QMainWindow):
         self.subtitle_sync_button.clicked.connect(self.sync_current_subtitle_line)
         self.summarize_button.clicked.connect(lambda: self.start_llm_text_task("summary"))
         self.article_button.clicked.connect(lambda: self.start_llm_text_task("article"))
+        self.chapters_button.clicked.connect(self.start_chapter_action)
         self.ask_button.clicked.connect(lambda: self.start_llm_text_task("qa"))
         self.transcript_list.itemClicked.connect(self.jump_to_subtitle_index)
+        self.chapters_list.itemClicked.connect(self.jump_to_chapter)
         self.overlay.rewind_5_requested.connect(self.rewind_5s)
         self.overlay.rewind_requested.connect(self.rewind_10s)
         self.overlay.play_pause_requested.connect(self.toggle_playback)
         self.overlay.forward_5_requested.connect(self.forward_5s)
         self.overlay.forward_requested.connect(self.forward_10s)
+        self.overlay.chapter_seek_requested.connect(self.jump_to_chapter_seconds)
         self._load_settings()
+        self._update_chapter_button()
         self.refresh_asr_history()
         self._init_log_file()
 
@@ -276,6 +296,10 @@ class MainWindow(QMainWindow):
         )
         self.remote_vad_checkbox.setChecked(
             settings.value("asr/remote_vad_enabled", False, type=bool)
+        )
+        self.cpp_threads_spin.setValue(settings.value("asr/cpp_threads", 6, type=int))
+        self.cpp_flash_attn_checkbox.setChecked(
+            settings.value("asr/cpp_flash_attn", True, type=bool)
         )
         self._on_log_level_changed()
         self._on_llm_provider_changed()
@@ -321,6 +345,8 @@ class MainWindow(QMainWindow):
         settings.setValue("asr/qwen_chunk_seconds", self.qwen_chunk_seconds_spin.value())
         settings.setValue("asr/adaptive_split_enabled", self.adaptive_split_checkbox.isChecked())
         settings.setValue("asr/remote_vad_enabled", self.remote_vad_checkbox.isChecked())
+        settings.setValue("asr/cpp_threads", self.cpp_threads_spin.value())
+        settings.setValue("asr/cpp_flash_attn", self.cpp_flash_attn_checkbox.isChecked())
 
     def _queue_run_config(self, prepared_wavs: dict[str, str] | None = None) -> QueueRunConfig:
         overrides = {"prepared_wavs": prepared_wavs}
@@ -330,6 +356,8 @@ class MainWindow(QMainWindow):
             "qwen_chunk_seconds": "WHISPER_CAPTIONER_QWEN_CHUNK_SECONDS",
             "adaptive_split_enabled": "WHISPER_CAPTIONER_ADAPTIVE_SPLIT",
             "remote_vad_enabled": "WHISPER_CAPTIONER_REMOTE_VAD",
+            "cpp_threads": "WHISPER_CAPTIONER_CPP_THREADS",
+            "cpp_flash_attn": "WHISPER_CAPTIONER_CPP_FLASH_ATTN",
         }
         ui_values = {
             "qwen_parallel_enabled": self.qwen_parallel_checkbox.isChecked(),
@@ -337,6 +365,8 @@ class MainWindow(QMainWindow):
             "qwen_chunk_seconds": float(self.qwen_chunk_seconds_spin.value()),
             "adaptive_split_enabled": self.adaptive_split_checkbox.isChecked(),
             "remote_vad_enabled": self.remote_vad_checkbox.isChecked(),
+            "cpp_threads": self.cpp_threads_spin.value(),
+            "cpp_flash_attn": self.cpp_flash_attn_checkbox.isChecked(),
         }
         for field_name, value in ui_values.items():
             if environment_keys[field_name] not in os.environ:
@@ -449,11 +479,15 @@ class MainWindow(QMainWindow):
         suffix = {
             "summary": "总结分析.md",
             "article": "改写文章.md",
+            "chapters": "视频章节.md",
             "qa": "字幕问答.md",
         }.get(task_key, f"{task_key}.md")
         model_suffix = self._current_output_variant_suffix()
         path = note_dir / f"{self._note_base_name()}-{model_suffix}-{suffix}"
-        path.write_text(text, encoding="utf-8")
+        output_text = text
+        if task_key == "chapters":
+            output_text = chapters_to_markdown(parse_chapters_response(text))
+        path.write_text(output_text, encoding="utf-8")
         return path
 
     def _reveal_in_finder(self, path: Path) -> None:
@@ -466,13 +500,14 @@ class MainWindow(QMainWindow):
                 candidate = self._latest_export_base.with_suffix(suffix)
                 if candidate.exists():
                     files.append(candidate)
-        for task_key in ("summary", "article", "qa"):
+        for task_key in ("summary", "article", "chapters", "qa"):
             cache_path = self._postprocess_output_path(task_key)
             if cache_path and cache_path.exists():
                 files.append(cache_path)
             suffix = {
                 "summary": "总结分析.md",
                 "article": "改写文章.md",
+                "chapters": "视频章节.md",
                 "qa": "字幕问答.md",
             }[task_key]
             shared = self._video_output_dir() / f"{self._note_base_name()}-{suffix}"
@@ -574,6 +609,76 @@ class MainWindow(QMainWindow):
         self.controlled_timer.start()
         self._tick_controlled_captions()
 
+    def jump_to_chapter(self, item: QListWidgetItem) -> None:
+        start_seconds = item.data(256)
+        if start_seconds is None:
+            return
+        self.jump_to_chapter_seconds(float(start_seconds))
+
+    def jump_to_chapter_seconds(self, start_seconds: float) -> None:
+        target = max(0.0, start_seconds)
+        ok = bool(self._controlled_url and chrome_play_url_from(self._controlled_url, target))
+        if not ok:
+            chrome_play_from(target)
+        self._controlled_resume_time = target
+        self._set_playback_anchor(target)
+        self._controlled_paused = False
+        self._buffering_paused = False
+        self.controlled_timer.start()
+        self._tick_controlled_captions()
+
+    def _show_chapters(self, chapters: list[VideoChapter]) -> None:
+        self.video_chapters = chapters
+        if self._controlled_url:
+            self.overlay.set_chapters(chapters)
+        else:
+            self.overlay.clear_chapters()
+        self.chapters_list.clear()
+        for chapter in chapters:
+            timestamp = self._format_transcript_timestamp(chapter.start_seconds)
+            label = f"[{timestamp}] {chapter.title}"
+            if chapter.description:
+                label += f"\n{chapter.description}"
+            item = QListWidgetItem(label)
+            item.setData(256, chapter.start_seconds)
+            self.chapters_list.addItem(item)
+
+    def _update_chapter_button(self) -> None:
+        if self._controlled_url:
+            self.chapters_button.setText("生成并显示视频章节")
+        else:
+            self.chapters_button.setText("生成章节并写入 SRT")
+
+    def start_chapter_action(self) -> None:
+        self._chapter_target_srt = None
+        if self._controlled_url:
+            self.start_llm_text_task("chapters")
+            return
+
+        candidate = (
+            self._latest_export_base.with_suffix(".srt")
+            if self._latest_export_base
+            else None
+        )
+        if not candidate or not candidate.exists():
+            selected, _ = QFileDialog.getOpenFileName(
+                self,
+                "选择要加入章节的 SRT 字幕",
+                str(self._video_output_dir()),
+                "SRT subtitles (*.srt)",
+            )
+            if not selected:
+                return
+            candidate = Path(selected)
+            try:
+                self._set_controlled_segments(parse_srt(candidate))
+                self._refresh_transcript_list()
+            except Exception as exc:
+                QMessageBox.critical(self, "SRT 读取失败", str(exc))
+                return
+        self._chapter_target_srt = candidate
+        self.start_llm_text_task("chapters")
+
     def start_llm_text_task(self, task_key: str) -> None:
         if self.llm_text_thread:
             self.log("LLM post-process is already running")
@@ -595,10 +700,22 @@ class MainWindow(QMainWindow):
         cached_path = self._postprocess_output_path(task_key)
         if task_key != "qa" and cached_path and cached_path.exists():
             cached_text = cached_path.read_text(encoding="utf-8", errors="ignore")
-            self.analysis_output.setPlainText(cached_text)
-            self._save_shared_note_copy(task_key, cached_text)
-            self.log(f"Loaded cached LLM {task_key} output: {cached_path}")
-            return
+            if task_key == "chapters":
+                try:
+                    self._show_chapters(parse_chapters_response(cached_text))
+                except ValueError as exc:
+                    self.log(f"Cached chapters are invalid; regenerating: {exc}")
+                else:
+                    self.analysis_output.setPlainText(
+                        chapters_to_markdown(self.video_chapters)
+                    )
+                    self.log(f"Loaded cached LLM chapters output: {cached_path}")
+                    return
+            else:
+                self.analysis_output.setPlainText(cached_text)
+                self._save_shared_note_copy(task_key, cached_text)
+                self.log(f"Loaded cached LLM {task_key} output: {cached_path}")
+                return
 
         if task_key == "qa":
             question = self.analysis_question_input.text().strip()
@@ -619,6 +736,24 @@ class MainWindow(QMainWindow):
                 "3. 如果字幕证据不足，请明确说“证据不足”，不要脑补。\n"
             )
             max_tokens = 8000
+        elif task_key == "chapters":
+            title = "视频章节"
+            system_prompt = (
+                "你是一位视频内容编辑。请根据带时间戳的字幕划分主题章节，"
+                "严格输出 JSON，不得输出解释或 Markdown。"
+            )
+            user_text = (
+                "请为下面的视频字幕生成章节。\n"
+                "要求：\n"
+                "1. 章节数量应与内容长度匹配，通常 5-15 个；不要机械地等时长切分。\n"
+                "2. 每章从主题真正开始的字幕时间点起算，start_seconds 必须来自字幕时间。\n"
+                "3. 标题使用简体中文，简洁具体；description 用 1-2 句话概括本章。\n"
+                "4. 第一章可从 0 秒或第一条字幕开始，时间必须递增，不要重复。\n"
+                "5. 只输出 JSON 数组，格式："
+                '[{"start_seconds": 0, "title": "章节标题", "description": "章节描述"}]\n\n'
+                f"字幕转写稿：\n{transcript}"
+            )
+            max_tokens = 12000
         elif task_key == "article":
             title = "完整文章"
             system_prompt = "你是一位中文长文编辑，擅长把视频转写稿整理为可阅读的完整文章。"
@@ -650,6 +785,7 @@ class MainWindow(QMainWindow):
         self.analysis_output.setPlainText(f"{title}生成中...")
         self.summarize_button.setEnabled(False)
         self.article_button.setEnabled(False)
+        self.chapters_button.setEnabled(False)
         self.llm_text_thread = QThread()
         self.llm_text_worker = LLMTextWorker(
             task_key,
@@ -670,7 +806,40 @@ class MainWindow(QMainWindow):
         self.llm_text_thread.start()
 
     def _handle_llm_text_result(self, task_key: str, text: str) -> None:
-        self.analysis_output.setPlainText(text)
+        if task_key == "chapters":
+            try:
+                chapters = parse_chapters_response(text)
+            except ValueError as exc:
+                self.analysis_output.setPlainText(f"章节生成结果解析失败：{exc}\n\nLLM 原始输出：\n{text}")
+                self.log(f"LLM chapters output invalid: {exc}")
+                return
+            self._show_chapters(chapters)
+            text = chapters_to_json(chapters)
+            self.analysis_output.setPlainText(chapters_to_markdown(chapters))
+            if self._chapter_target_srt:
+                output_path = (
+                    self._chapter_target_srt
+                    if self._chapter_target_srt.stem.endswith("-带章节")
+                    else self._chapter_target_srt.with_name(
+                        f"{self._chapter_target_srt.stem}-带章节.srt"
+                    )
+                )
+                save_segments_as_srt(
+                    output_path,
+                    add_chapters_to_subtitles(self.controlled_segments, chapters),
+                )
+                self.log(f"Chaptered SRT written: {output_path}")
+                self.analysis_context_output.setPlainText(
+                    f"已生成带章节字幕：{output_path}\n原字幕保持不变：{self._chapter_target_srt}"
+                )
+                self._latest_export_base = output_path.with_suffix("")
+                QMessageBox.information(
+                    self,
+                    "章节已写入 SRT",
+                    f"新字幕文件已生成：\n\n{output_path}",
+                )
+        else:
+            self.analysis_output.setPlainText(text)
         path = self._postprocess_output_path(task_key)
         if path:
             path.write_text(text, encoding="utf-8")
@@ -685,6 +854,7 @@ class MainWindow(QMainWindow):
         name = {
             "summary": "总结分析.md",
             "article": "改写文章.md",
+            "chapters": "视频章节.json",
             "qa": "字幕问答.md",
         }.get(task_key, f"video-{task_key}.md")
         return self._controlled_cache_dir / f"{self._current_output_variant_suffix()}-{name}"
@@ -1146,6 +1316,7 @@ class MainWindow(QMainWindow):
             self.controlled_timer.stop()
         self._buffering_paused = False
         self._rolling_all_done = False
+        self.mac_gpu_monitor.stop()
         self._flush_ui_logs()
         self._flush_file_logs()
 
@@ -1515,6 +1686,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(0)
         self._set_status_summary(f"队列处理中 | 模式 {mode.label}")
+        if qwen3_asr_mode(mode) or mode.backend == "whisper_cpp":
+            self.mac_gpu_monitor.start()
         self.queue_thread.start()
 
     def process_local_media(self) -> None:
@@ -1617,8 +1790,13 @@ class MainWindow(QMainWindow):
         self._controlled_paused = False
         self._controlled_resume_time = 0.0
         self._controlled_url = canonical_media_url(source)
+        self._chapter_target_srt = None
+        self._update_chapter_button()
         job_key = cache_slug(self._controlled_url, mode.backend, mode.model_name, 30)
         self._controlled_cache_dir = CACHE_DIR / job_key
+        self.video_chapters = []
+        self.chapters_list.clear()
+        self.overlay.clear_chapters()
         self._current_caption_index = -1
         self._last_caption_debug_second = -1
         self._load_subtitle_offset()
@@ -1647,6 +1825,8 @@ class MainWindow(QMainWindow):
         self.controlled_worker.all_done.connect(self._on_rolling_done)
         self.controlled_worker.finished.connect(self.controlled_thread.quit)
         self.controlled_thread.finished.connect(self._clear_controlled_worker)
+        if qwen3_asr_mode(mode) or mode.backend == "whisper_cpp":
+            self.mac_gpu_monitor.start()
         self.controlled_thread.start()
 
     def _start_rolling_playback(self, segments: list[SubtitleSegment]) -> None:
@@ -1675,6 +1855,8 @@ class MainWindow(QMainWindow):
                 self._set_controlled_segments(parse_srt(srt_path))
                 self._controlled_url = ""
                 self._controlled_cache_dir = None
+                self._chapter_target_srt = srt_path
+                self._update_chapter_button()
                 self._rolling_all_done = True
                 self._current_caption_index = -1
                 self._refresh_transcript_list()
@@ -1694,22 +1876,18 @@ class MainWindow(QMainWindow):
             self.overlay.set_caption("本地转写文本已生成。")
 
     def _handle_native_subtitles_detected(self, segments: list[SubtitleSegment], message: str) -> None:
-        self.stop_all()
         self.progress_bar.setVisible(False)
         self.controlled_timer.stop()
-        # 加载内置字幕
         self._set_controlled_segments(segments)
         self._refresh_transcript_list()
         self._rolling_all_done = True
         self._current_caption_index = -1
         self._controlled_resume_time = 0.0
         self._set_playback_anchor(0.0)
-        # 恢复播放
         if not (self._controlled_url and chrome_play_url_from(self._controlled_url, 0.0)):
             chrome_play_from(0.0)
         self.controlled_timer.start()
         self._tick_controlled_captions()
-        # 更新状态
         self.overlay.set_caption("视频自带字幕已加载")
         self.log(message)
         self._set_status_summary("已加载视频自带字幕")
@@ -1797,6 +1975,7 @@ class MainWindow(QMainWindow):
             return
         self._controlled_resume_time = current
         caption_time = max(0.0, current + self.subtitle_offset)
+        self.overlay.set_chapter_at_time(current)
         debug_second = int(current)
         if debug_second != self._last_caption_debug_second and debug_second % 2 == 0:
             self._last_caption_debug_second = debug_second
@@ -1862,6 +2041,7 @@ class MainWindow(QMainWindow):
         return self._playback_anchor_time + elapsed
 
     def _clear_controlled_worker(self) -> None:
+        self.mac_gpu_monitor.stop()
         if self.controlled_worker:
             self.controlled_worker.deleteLater()
         if self.controlled_thread:
@@ -1878,6 +2058,7 @@ class MainWindow(QMainWindow):
         self.llm_text_worker = None
         self.summarize_button.setEnabled(True)
         self.article_button.setEnabled(True)
+        self.chapters_button.setEnabled(True)
 
     def _mark_item(self, source: str, ok: bool) -> None:
         marker = "✓" if ok else "✗"
@@ -1889,6 +2070,7 @@ class MainWindow(QMainWindow):
                 break
 
     def _clear_queue(self) -> None:
+        self.mac_gpu_monitor.stop()
         if self.queue_worker:
             self.queue_worker.deleteLater()
         if self.queue_thread:

@@ -32,9 +32,9 @@ TARGET_DIRS = [
     BASE_DIR / "03 大模型的RAG与MCP Agent设计",
 ]
 
-# 暂存目录（~/Documents/temp/batch_asr_staging/）
-STAGING_DIR = Path.home() / "Documents" / "temp" / "batch_asr_staging"
-MANIFEST_PATH = STAGING_DIR / "manifest.json"  # {slug: {"mp4": str, "json": str}}
+# 独立的中间产物目录
+OSRT_ROOT = Path.home() / "Movies" / "OSRT"
+MANIFEST_PATH = OSRT_ROOT / "manifest.json"  # {slug: {"mp4": str, "json": str, "raw_srt": str, ...}}
 
 NUC_HOST = "192.168.31.196"
 NUC_QWEN_PORT = "8001"
@@ -90,7 +90,7 @@ def load_manifest() -> dict:
 
 
 def save_manifest(manifest: dict) -> None:
-    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    OSRT_ROOT.mkdir(parents=True, exist_ok=True)
     tmp = MANIFEST_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(MANIFEST_PATH)
@@ -385,13 +385,18 @@ def transcribe_wav(wav_path: Path) -> list[dict]:
 
 LLM_SYSTEM_PROMPT = (
     "你是一个专业的中文字幕校对专家。你的任务是对 ASR 识别的字幕文本进行错别字修正、"
-    "同音字修正、去除重复词，以及修正技术术语（如大模型、RAG、MCP、Agent等）。\n"
-    "保持原意。输出格式严格为：\"序号: 规整后的文本\"，每行一个，不要添加解释。\n"
-    "你不能合并或者删除任何行，必须对每一个序号进行逐行返回修正后的结果。\n"
+    "同音字修正、去除重复词，以及修正技术术语（如大模型、RAG、MCP、Agent等）。\n\n"
+    "CRITICAL RULES — VIOLATION WILL CAUSE SYSTEM FAILURE:\n"
+    "1. You MUST return EXACTLY the same number of lines as the input. No more, no less.\n"
+    "2. NEVER summarize, merge, or delete any line. Every input line must produce exactly one output line.\n"
+    "3. Output format is strictly: \"序号: 规整后的文本\" — one line per entry.\n"
+    "4. If you cannot correct a line, output it unchanged.\n"
+    "5. Do NOT add any explanation, header, or footer text.\n\n"
     "技术词汇如 LangChain、RAG、MCP、FastAPI、LLM、API、Transformer、vLLM、Ollama 等保持英文原样。"
 )
 
 _LLM_LINE_RE = re.compile(r"^(\d+):\s*(.+)$")
+FALLBACK_THRESHOLD = 0.80  # 返回行数不足输入的 80% 即触发熔断
 
 
 def _parse_llm_lines(reply: str, expected_count: int) -> dict[int, str]:
@@ -433,8 +438,8 @@ def llm_polish(segments: list[dict]) -> list[dict]:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {GEMINI_API_KEY}",
         }
-        reply = ""
-        for attempt in range(3):
+        corrected = {}
+        for attempt in range(4):
             try:
                 req = urllib.request.Request(
                     GEMINI_API_URL,
@@ -445,20 +450,25 @@ def llm_polish(segments: list[dict]) -> list[dict]:
                 with urllib.request.urlopen(req, timeout=120) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 reply = data["choices"][0]["message"]["content"]
+                corrected = _parse_llm_lines(reply, len(batch))
+                if len(corrected) < len(batch) * FALLBACK_THRESHOLD:
+                    raise ValueError(f"返回行数({len(corrected)})低于阈值(需>={int(len(batch)*FALLBACK_THRESHOLD)})，疑似总结行为")
                 break
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "replace").strip()
                 print(f"    ⚠ Gemini HTTP {exc.code}（第{attempt+1}次）: {detail[:200]}", flush=True)
-                if attempt == 2:
-                    print("    ⚠ LLM 失败，保留原始文本", flush=True)
+                if attempt == 3:
+                    print("    ⚠ LLM 失败（触发熔断），保留原始文本", flush=True)
+                    corrected = {}
                 time.sleep(8 * (attempt + 1))
             except Exception as exc:
                 print(f"    ⚠ Gemini 异常（第{attempt+1}次）: {exc}", flush=True)
-                if attempt == 2:
-                    print("    ⚠ LLM 失败，保留原始文本", flush=True)
+                if attempt == 3:
+                    print("    ⚠ LLM 失败（触发熔断），保留原始文本", flush=True)
+                    corrected = {}
                 time.sleep(8 * (attempt + 1))
-        if reply:
-            corrected = _parse_llm_lines(reply, len(batch))
+                
+        if corrected:
             for local_i, seg in enumerate(batch):
                 if local_i in corrected:
                     result[batch_start + local_i] = {**seg, "text": corrected[local_i]}
@@ -470,13 +480,13 @@ def llm_polish(segments: list[dict]) -> list[dict]:
 # ─── 阶段一：全量 ASR ─────────────────────────────────────────────────────────
 
 def phase1_asr(mp4_files: list[Path]) -> None:
-    """对所有 MP4 做 ASR，原始结果 JSON 存入 STAGING_DIR，更新 manifest。"""
+    """对所有 MP4 做 ASR，原始结果 JSON 存入 OSRT_ROOT，更新 manifest。"""
     print("\n" + "=" * 60)
     print("【阶段一】ASR 转录（全量）")
-    print(f"暂存目录: {STAGING_DIR}")
+    print(f"OSRT 目录: {OSRT_ROOT}")
     print("=" * 60)
 
-    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    OSRT_ROOT.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest()
 
     total = len(mp4_files)
@@ -486,25 +496,23 @@ def phase1_asr(mp4_files: list[Path]) -> None:
 
     for i, mp4_path in enumerate(mp4_files, 1):
         slug = mp4_slug(mp4_path)
-        srt_path = mp4_path.with_suffix(".srt")
-        json_path = STAGING_DIR / f"{slug}.json"
-
-        # 最终 SRT 已存在 → 全跳过
-        if srt_path.exists():
-            print(f"\n[{i}/{total}] ⏩ SRT已存在，跳过: {mp4_path.name}", flush=True)
-            asr_skip += 1
-            # 确保 manifest 中也记录（以便阶段二幂等）
-            if slug not in manifest:
-                manifest[slug] = {"mp4": str(mp4_path), "json": str(json_path), "srt_done": True}
-                save_manifest(manifest)
-            continue
+        osrt_dir = OSRT_ROOT / mp4_path.stem
+        json_path = osrt_dir / "raw.json"
+        raw_srt_path = osrt_dir / "raw.srt"
 
         # 暂存 JSON 已存在 → ASR 已完成，跳过
         if json_path.exists():
-            print(f"\n[{i}/{total}] ⏩ ASR已完成，跳过: {mp4_path.name}", flush=True)
+            print(f"\n[{i}/{total}] ⏩ ASR中间体已存在，跳过: {mp4_path.name}", flush=True)
             asr_skip += 1
-            if slug not in manifest:
-                manifest[slug] = {"mp4": str(mp4_path), "json": str(json_path), "srt_done": False}
+            if slug not in manifest or not manifest[slug].get("asr_done"):
+                manifest[slug] = {
+                    "mp4": str(mp4_path),
+                    "osrt_dir": str(osrt_dir),
+                    "json": str(json_path),
+                    "raw_srt": str(raw_srt_path),
+                    "asr_done": True,
+                    "polished_done": manifest.get(slug, {}).get("polished_done", False)
+                }
                 save_manifest(manifest)
             continue
 
@@ -540,14 +548,23 @@ def phase1_asr(mp4_files: list[Path]) -> None:
 
         print(f"  → ASR 完成，{len(segments)} 段", flush=True)
 
-        # 保存原始 JSON 到暂存目录
+        # 保存原始 JSON 和 SRT 到 OSRT 目录
+        osrt_dir.mkdir(parents=True, exist_ok=True)
         json_path.write_text(
             json.dumps({"mp4": str(mp4_path), "segments": segments}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        save_srt(raw_srt_path, segments)
 
         # 更新 manifest
-        manifest[slug] = {"mp4": str(mp4_path), "json": str(json_path), "srt_done": False}
+        manifest[slug] = {
+            "mp4": str(mp4_path),
+            "osrt_dir": str(osrt_dir),
+            "json": str(json_path),
+            "raw_srt": str(raw_srt_path),
+            "asr_done": True,
+            "polished_done": manifest.get(slug, {}).get("polished_done", False)
+        }
         save_manifest(manifest)
 
         asr_done += 1
@@ -574,8 +591,8 @@ def phase2_llm() -> None:
         print("manifest 为空，没有需要规整的条目。", flush=True)
         return
 
-    pending_all = [(slug, info) for slug, info in manifest.items() if not info.get("srt_done")]
-    already_done = sum(1 for info in manifest.values() if info.get("srt_done"))
+    pending_all = [(slug, info) for slug, info in manifest.items() if info.get("asr_done") and not info.get("polished_done")]
+    already_done = sum(1 for info in manifest.values() if info.get("polished_done"))
 
     # 按原 MP4 路径排序，确保阶段二也按章节顺序输出 SRT（用户可边生成边观看）
     pending = sorted(pending_all, key=lambda x: x[1].get("mp4", ""))
@@ -588,14 +605,14 @@ def phase2_llm() -> None:
     for idx, (slug, info) in enumerate(pending, 1):
         mp4_path = Path(info["mp4"])
         json_path = Path(info["json"])
-        srt_path = mp4_path.with_suffix(".srt")
+        polished_srt_path = mp4_path.with_suffix(".polished.srt")
 
         print(f"\n[{idx}/{len(pending)}] ✏ LLM: {mp4_path.name}", flush=True)
 
-        # SRT 已存在（中途重跑保护）
-        if srt_path.exists():
-            print(f"  ⏩ SRT已存在，标记完成", flush=True)
-            manifest[slug]["srt_done"] = True
+        # polished SRT 已存在（中途重跑保护）
+        if polished_srt_path.exists():
+            print(f"  ⏩ polished.srt已存在，标记完成", flush=True)
+            manifest[slug]["polished_done"] = True
             save_manifest(manifest)
             llm_done += 1
             continue
@@ -627,15 +644,15 @@ def phase2_llm() -> None:
 
         # 写 SRT
         try:
-            save_srt(srt_path, polished)
-            print(f"  ✓ SRT 已保存: {srt_path.name}", flush=True)
+            save_srt(polished_srt_path, polished)
+            print(f"  ✓ SRT 已保存: {polished_srt_path.name}", flush=True)
         except Exception as e:
             print(f"  ✗ SRT 写入失败: {e}", flush=True)
             llm_fail.append(str(mp4_path))
             continue
 
         # 更新 manifest
-        manifest[slug]["srt_done"] = True
+        manifest[slug]["polished_done"] = True
         save_manifest(manifest)
         llm_done += 1
 
@@ -674,7 +691,7 @@ def main() -> None:
     print("两阶段批量 MP4 → SRT 转录脚本")
     print(f"  阶段一 ASR  : NUC Qwen3-ASR 1.7B ({NUC_QWEN_BASE_URL})")
     print(f"  阶段二 LLM  : Gemini 2.5 Flash")
-    print(f"  暂存目录    : {STAGING_DIR}")
+    print(f"  OSRT 目录   : {OSRT_ROOT}")
     print("=" * 60, flush=True)
 
     # NUC 健康检查
@@ -696,7 +713,7 @@ def main() -> None:
 
     elapsed_total = time.time() - start
     print(f"\n全部 ASR 阶段一已处理完毕！总耗时: {elapsed_total/60:.1f} 分钟", flush=True)
-    print(f"暂存 JSON 位置: {STAGING_DIR}", flush=True)
+    print(f"中间体及原生SRT位置: {OSRT_ROOT}", flush=True)
 
 
 if __name__ == "__main__":

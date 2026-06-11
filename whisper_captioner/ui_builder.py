@@ -197,6 +197,11 @@ def build_main_window_ui(window) -> None:
     window.qwen_chunk_seconds_spin.setValue(45)
     window.adaptive_split_checkbox = QCheckBox("启用自适应慢块拆分")
     window.remote_vad_checkbox = QCheckBox("启用远端分块 VAD 预裁边")
+    window.cpp_threads_spin = QSpinBox()
+    window.cpp_threads_spin.setRange(1, 8)
+    window.cpp_threads_spin.setValue(6)
+    window.cpp_flash_attn_checkbox = QCheckBox("启用 whisper.cpp Flash Attention")
+    window.cpp_flash_attn_checkbox.setChecked(True)
 
     root = QWidget()
     root_layout = QVBoxLayout(root)
@@ -362,6 +367,11 @@ def build_main_window_ui(window) -> None:
     asr_runtime_layout.addLayout(replicas_row)
     asr_runtime_layout.addWidget(window.adaptive_split_checkbox)
     asr_runtime_layout.addWidget(window.remote_vad_checkbox)
+    cpp_row = QHBoxLayout()
+    cpp_row.addWidget(QLabel("whisper.cpp 线程数"))
+    cpp_row.addWidget(window.cpp_threads_spin)
+    asr_runtime_layout.addLayout(cpp_row)
+    asr_runtime_layout.addWidget(window.cpp_flash_attn_checkbox)
     settings_layout.addWidget(asr_runtime_card)
     settings_layout.addStretch()
 

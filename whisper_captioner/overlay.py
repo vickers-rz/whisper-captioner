@@ -29,6 +29,7 @@ class SubtitleOverlay(QWidget):
     forward_5_requested = Signal()
     forward_requested = Signal()
     play_pause_requested = Signal()
+    chapter_seek_requested = Signal(float)
 
     def __init__(self) -> None:
         super().__init__()
@@ -66,6 +67,47 @@ class SubtitleOverlay(QWidget):
         self._apply_style()
 
     def _build_ui(self) -> None:
+        self._chapter_starts: list[float] = []
+        self._active_chapter_index = -1
+        self.chapter_container = QWidget()
+        self.chapter_container.setObjectName("ChapterContainer")
+        chapter_layout = QVBoxLayout(self.chapter_container)
+        chapter_layout.setContentsMargins(14, 10, 14, 8)
+        chapter_nav = QHBoxLayout()
+        self.previous_chapter_button = QPushButton("")
+        self.current_chapter_button = QPushButton("")
+        self.next_chapter_button = QPushButton("")
+        for button in (
+            self.previous_chapter_button,
+            self.current_chapter_button,
+            self.next_chapter_button,
+        ):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setMinimumHeight(34)
+        self.previous_chapter_button.clicked.connect(
+            lambda: self._emit_chapter_seek(self._active_chapter_index - 1)
+        )
+        self.current_chapter_button.clicked.connect(
+            lambda: self._emit_chapter_seek(self._active_chapter_index)
+        )
+        self.next_chapter_button.clicked.connect(
+            lambda: self._emit_chapter_seek(self._active_chapter_index + 1)
+        )
+        chapter_nav.addWidget(self.previous_chapter_button, 1)
+        chapter_nav.addWidget(self.current_chapter_button, 2)
+        chapter_nav.addWidget(self.next_chapter_button, 1)
+        self.chapter_title_label = QLabel("")
+        self.chapter_title_label.setObjectName("ChapterTitle")
+        self.chapter_title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.chapter_description_label = QLabel("")
+        self.chapter_description_label.setObjectName("ChapterDescription")
+        self.chapter_description_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.chapter_description_label.setWordWrap(True)
+        chapter_layout.addLayout(chapter_nav)
+        chapter_layout.addWidget(self.chapter_title_label)
+        chapter_layout.addWidget(self.chapter_description_label)
+        self.chapter_container.hide()
+
         self.previous_label = QLabel("")
         self.previous_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.previous_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -144,6 +186,7 @@ class SubtitleOverlay(QWidget):
         controls.addWidget(self.forward_5_button)
         controls.addWidget(self.forward_button)
         layout.addLayout(controls)
+        layout.addWidget(self.chapter_container)
         layout.addWidget(self.previous_label)
         layout.addWidget(self.label)
         # Size grip sits below label via a nested layout
@@ -188,6 +231,41 @@ class SubtitleOverlay(QWidget):
             }}
             """
         )
+        self.chapter_container.setStyleSheet(
+            f"""
+            QWidget#ChapterContainer {{
+              background: rgba(0, 0, 0, {max(100, alpha - 45)});
+              border-radius: 16px;
+            }}
+            QPushButton {{
+              color: rgba(255, 255, 255, 210);
+              background: rgba(0, 0, 0, 120);
+              border: none;
+              border-bottom: 2px solid rgba(255, 255, 255, 70);
+              border-radius: 0px;
+              padding: 5px 10px;
+              font-weight: 600;
+            }}
+            QPushButton:hover {{
+              color: #55b8ff;
+              border-bottom: 2px solid #55b8ff;
+            }}
+            QPushButton:disabled {{
+              color: rgba(255, 255, 255, 50);
+            }}
+            QLabel#ChapterTitle {{
+              color: #d8ffe8;
+              font-size: 20px;
+              font-weight: 700;
+              padding-top: 6px;
+            }}
+            QLabel#ChapterDescription {{
+              color: rgba(255, 255, 255, 205);
+              font-size: 15px;
+              padding: 2px 20px 5px 20px;
+            }}
+            """
+        )
         self.setStyleSheet(f"SubtitleOverlay {{ background: transparent; }}")
 
     def _sync_pin_button(self) -> None:
@@ -217,6 +295,46 @@ class SubtitleOverlay(QWidget):
         self.previous_label.setText("")
         self.label.setText("")
         self.keep_on_top(raise_window=False)
+
+    def set_chapters(self, chapters: list[object]) -> None:
+        self._chapter_starts = [
+            max(0.0, float(getattr(chapter, "start_seconds")))
+            for chapter in chapters
+        ]
+        self._chapters = list(chapters)
+        self._active_chapter_index = -1
+        self.chapter_container.setVisible(bool(self._chapters))
+
+    def clear_chapters(self) -> None:
+        self._chapters = []
+        self._chapter_starts = []
+        self._active_chapter_index = -1
+        self.chapter_container.hide()
+
+    def set_chapter_at_time(self, seconds: float) -> None:
+        if not getattr(self, "_chapters", None):
+            return
+        import bisect
+
+        index = max(0, bisect.bisect_right(self._chapter_starts, seconds) - 1)
+        if index == self._active_chapter_index:
+            return
+        self._active_chapter_index = index
+        chapter = self._chapters[index]
+        previous = self._chapters[index - 1].title if index > 0 else ""
+        following = self._chapters[index + 1].title if index + 1 < len(self._chapters) else ""
+        self.previous_chapter_button.setText(previous or "已是第一章")
+        self.previous_chapter_button.setEnabled(index > 0)
+        self.current_chapter_button.setText(chapter.title)
+        self.next_chapter_button.setText(following or "已是最后一章")
+        self.next_chapter_button.setEnabled(index + 1 < len(self._chapters))
+        self.chapter_title_label.setText(chapter.title)
+        self.chapter_description_label.setText(chapter.description)
+        self.chapter_description_label.setVisible(bool(chapter.description))
+
+    def _emit_chapter_seek(self, index: int) -> None:
+        if 0 <= index < len(getattr(self, "_chapters", [])):
+            self.chapter_seek_requested.emit(self._chapters[index].start_seconds)
 
     def set_caption_context(self, segments: list[SubtitleSegment], current_index: int) -> None:
         if not segments or current_index < 0 or current_index >= len(segments):

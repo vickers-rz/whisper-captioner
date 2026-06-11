@@ -194,6 +194,19 @@ Backend benchmark note:
 - On a 30-second sample, `whisper.cpp q5_0` averaged about `4.64s`, `mlx-whisper FP16` about `6.42s`, and `mlx-audio q5` about `7.82s`.
 - On a 70-second mixed technical sample, `whisper.cpp q5_0` averaged about `8.18s`, `mlx-whisper FP16` about `9.35s`, and `mlx-audio q5` about `10.25s`.
 - Because `whisper.cpp q5_0` is faster and has cleaner chunk timestamps on these local samples, it remains the default.
+- With `whisper-cpp 1.8.6` on this Apple M2, a 45-second real sample took `7.35s` with 6 threads and Flash Attention, versus `7.60s` with 8 threads and `8.71s` with 4 threads.
+- Disabling Flash Attention took `12.61-13.18s` and changed the output from 22 to 18 segments, so the APP defaults to 6 threads with Flash Attention enabled.
+
+Controlled playback now downloads embedded Chinese subtitles before starting ASR. Manual subtitles are preferred, automatic subtitles are used as a fallback, and the selected track is cached and exported as standard SRT/TXT files before playback starts.
+
+The analysis tab can generate LLM-based video chapters from the timestamped transcript. Chapters include a title and description, are cached as JSON, exported as Markdown, and can be clicked to seek the controlled Chrome video.
+
+The chapter button is context-sensitive and always manual. During controlled URL playback it generates and displays the chapter overlay. For local subtitles or an existing SRT, it asks for the SRT when necessary and writes a separate `*-带章节.srt` file with chapter title and description inserted at the relevant subtitle positions; the source SRT is not overwritten.
+
+The settings page exposes both values. Environment variables override the saved settings:
+
+- `WHISPER_CAPTIONER_CPP_THREADS=6`
+- `WHISPER_CAPTIONER_CPP_FLASH_ATTN=1`
 
 ### 30s Comparison
 

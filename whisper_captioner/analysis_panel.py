@@ -1,11 +1,21 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 
 def build_analysis_panel(window) -> QWidget:
     window.summarize_button = QPushButton("总结并分析视频")
     window.article_button = QPushButton("将字幕改写成文章")
+    window.chapters_button = QPushButton("生成视频章节")
     window.ask_button = QPushButton("基于字幕提问")
 
     window.analysis_output = QTextEdit()
@@ -16,6 +26,7 @@ def build_analysis_panel(window) -> QWidget:
     window.analysis_context_output = QTextEdit()
     window.analysis_context_output.setReadOnly(True)
     window.analysis_context_output.setPlaceholderText("相关字幕证据会显示在这里。")
+    window.chapters_list = QListWidget()
 
     analysis_tab = QWidget()
     analysis_layout = QVBoxLayout(analysis_tab)
@@ -25,9 +36,12 @@ def build_analysis_panel(window) -> QWidget:
     analysis_buttons = QHBoxLayout()
     analysis_buttons.addWidget(window.summarize_button)
     analysis_buttons.addWidget(window.article_button)
+    analysis_buttons.addWidget(window.chapters_button)
     analysis_buttons.addWidget(window.ask_button)
     analysis_layout.addLayout(analysis_buttons)
     analysis_layout.addWidget(window.analysis_question_input)
+    analysis_layout.addWidget(QLabel("视频章节（点击跳转）"))
+    analysis_layout.addWidget(window.chapters_list)
     analysis_layout.addWidget(window.analysis_context_output)
     analysis_layout.addWidget(window.analysis_output)
     return analysis_tab
