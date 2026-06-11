@@ -1221,6 +1221,8 @@ class QwenChatServiceManager:
     def _provider_help_text(self, provider_key: str) -> str:
         if provider_key == "local_rapidmlx_8b":
             return "本地 Rapid-MLX，不需要 API Key。"
+        if provider_key == "nuc_ollama_gemma4":
+            return "NUC 上的 Gemma 4 E4B，本地 16K 上下文，不需要 API Key；适合字幕规整和中等长度文稿。"
         if provider_key == "gemini_flash":
             return "使用 Google Gemini 2.5 Flash。请在此填入 Gemini API Key。"
         if provider_key == "gemini_pro":
@@ -1700,9 +1702,21 @@ class QwenChatServiceManager:
 
     def _long_context_warning(self, char_count: int, segment_count: int, provider_key: str) -> str:
         if char_count < LONG_CONTEXT_CHAR_THRESHOLD and segment_count < LONG_CONTEXT_SEGMENT_THRESHOLD:
+            if provider_key == "nuc_ollama_gemma4":
+                # For Gemma 4, its comfortable limit is around 18000 characters (16K context)
+                if char_count >= 18000 or segment_count >= 500:
+                    return (
+                        f"当前字幕约 {segment_count} 段、{char_count} 字符，可能接近或超出本地 Gemma 4 (16K) 的有效上下文。"
+                        "建议拆分处理，或改用 Gemini 2.5 Pro。"
+                    )
             return ""
-        if provider_key == "gemini_pro":
+        if provider_key in {"gemini_pro"}:
             return ""
+        if provider_key == "nuc_ollama_gemma4":
+            return (
+                f"当前字幕约 {segment_count} 段、{char_count} 字符，可能接近或超出本地 Gemma 4 (16K) 的有效上下文。"
+                "建议拆分处理，或改用 Gemini 2.5 Pro。"
+            )
         return (
             f"当前字幕约 {segment_count} 段、{char_count} 字符，已经接近或超过本地 Qwen3-8B 更稳妥的单次长文本处理范围。"
         )

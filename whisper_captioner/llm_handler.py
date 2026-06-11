@@ -177,6 +177,7 @@ def _build_llm_call(
             "anthropic-version": "2023-06-01",
         }
     elif fmt == "ollama":
+        is_nuc_gemma4 = provider.key == "nuc_ollama_gemma4"
         body = {
             "model": model,
             "messages": [
@@ -186,10 +187,13 @@ def _build_llm_call(
             "think": False,
             "stream": False,
             "options": {
-                "temperature": 0.3,
-                "num_predict": max_tokens,
+                "temperature": 0.1 if is_nuc_gemma4 else 0.3,
+                "num_predict": min(max_tokens, 8192) if is_nuc_gemma4 else max_tokens,
             },
         }
+        if is_nuc_gemma4:
+            body["keep_alive"] = "10m"
+            body["options"]["num_ctx"] = 16384
         headers = {"Content-Type": "application/json"}
     else:
         body = {
@@ -334,6 +338,25 @@ def llm_fuse_with_reference(
     ]
 
 
+import socket
+import binascii
+
+def wake_on_lan_nuc():
+    """Send a Wake-on-LAN magic packet to the NUC."""
+    try:
+        from whisper_captioner.config import NUC_MAC_ADDRESS
+        mac = NUC_MAC_ADDRESS.replace(":", "").replace("-", "")
+        if len(mac) != 12:
+            return
+        mac_bytes = binascii.unhexlify(mac)
+        magic_packet = b"\xff" * 6 + mac_bytes * 16
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(magic_packet, ("255.255.255.255", 9))
+    except Exception:
+        pass
+
+
 def test_llm_connection(
     provider: LLMProvider,
     api_key: str,
@@ -341,15 +364,21 @@ def test_llm_connection(
     model_id_override: str = "",
 ) -> tuple[bool, str]:
     """Send a minimal request to verify API key and model."""
+    if provider.key.startswith("nuc_ollama"):
+        wake_on_lan_nuc()
+
     try:
         url, body, headers = _build_llm_call(
             provider, api_key, "Hello", api_url_override, model_id_override,
             max_tokens=10,
         )
-        raw = _llm_request(url, body, headers, timeout=15)
+        timeout = 120 if provider.key == "nuc_ollama_gemma4" else 15
+        raw = _llm_request(url, body, headers, timeout=timeout)
         json.loads(raw)
         return True, "Connection successful ✓"
     except urllib.error.HTTPError as exc:
         return False, f"HTTP {exc.code}: {exc.reason}"
     except Exception as exc:
+        if provider.key.startswith("nuc_ollama"):
+            return False, f"WOL packet sent. Error: {str(exc)}. Please wait a moment and try again."
         return False, str(exc)

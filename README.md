@@ -132,11 +132,12 @@ What it can do:
 - Attach any uploaded or historical subtitle file to a work conversation.
 - Chat with the LLM grounded on the attached subtitle content.
 - Run one-click `语句规整` or `转写成文稿` actions on the attached subtitle.
-- Switch between `NUC Ollama Qwen3-14B`, `Local Rapid-MLX Qwen3-8B`, `Gemini 2.5 Flash`, and `Gemini 2.5 Pro`.
+- Switch between `NUC Ollama Gemma 4 E4B (16K)`, `NUC Ollama Qwen3-14B`, `Local Rapid-MLX Qwen3-8B`, `Gemini 2.5 Flash`, and `Gemini 2.5 Pro`.
 
 Notes:
 
 - Long subtitle payloads now show an explicit warning when they are likely beyond the more comfortable single-shot range for local Qwen3-8B.
+- The NUC Gemma 4 provider explicitly requests a 16K context window, disables thinking, caps output at 8192 tokens, and keeps the model loaded for 10 minutes between requests.
 - When that warning appears, switch to `Gemini 2.5 Pro` if you have already configured its API key in the desktop app Settings pane.
 - Action exports are written under `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/qwen-chat/exports/`.
 
