@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import array
 from collections import Counter
 import io
 import json
+import math
 import os
 import re
 import threading
@@ -35,6 +37,9 @@ ADMISSION_RETRY_SECONDS = float(os.environ.get("QWEN_ADMISSION_RETRY_SECONDS", "
 ADMISSION_MAX_WAIT_SECONDS = float(os.environ.get("QWEN_ADMISSION_MAX_WAIT_SECONDS", "1800"))
 MAX_DIRECT_UPLOAD_MB = float(os.environ.get("QWEN_MAX_DIRECT_UPLOAD_MB", "64"))
 CHUNK_SECONDS = float(os.environ.get("QWEN_CHUNK_SECONDS", "30"))
+CHUNK_OVERLAP_SECONDS = float(os.environ.get("QWEN_CHUNK_OVERLAP_SECONDS", "2"))
+EMPTY_RETRY_MIN_DBFS = float(os.environ.get("QWEN_EMPTY_RETRY_MIN_DBFS", "-50"))
+TEXT_OVERLAP_MAX_CHARS = int(os.environ.get("QWEN_TEXT_OVERLAP_MAX_CHARS", "120"))
 
 app = FastAPI(title="NUC Qwen3-ASR 1.7B Proxy")
 semaphore = asyncio.Semaphore(QUEUE_CONCURRENCY)
@@ -219,6 +224,68 @@ def _sanitize_chunk_text(text: str) -> tuple[str, str | None]:
     return clean, None
 
 
+def _bounded_edit_distance(left: str, right: str, limit: int) -> int:
+    if abs(len(left) - len(right)) > limit:
+        return limit + 1
+    previous = list(range(len(right) + 1))
+    for left_index, left_char in enumerate(left, 1):
+        current = [left_index]
+        row_minimum = left_index
+        for right_index, right_char in enumerate(right, 1):
+            value = min(
+                current[-1] + 1,
+                previous[right_index] + 1,
+                previous[right_index - 1] + (left_char != right_char),
+            )
+            current.append(value)
+            row_minimum = min(row_minimum, value)
+        if row_minimum > limit:
+            return limit + 1
+        previous = current
+    return previous[-1]
+
+
+def _text_overlap_length(left: str, right: str) -> tuple[int, int]:
+    maximum = min(TEXT_OVERLAP_MAX_CHARS, len(left), len(right))
+    best: tuple[int, int, int] | None = None
+    for right_length in range(maximum, 3, -1):
+        allowed_errors = 0
+        if right_length >= 8:
+            allowed_errors = 1
+        if right_length >= 16:
+            allowed_errors = 2
+        minimum_left = max(4, right_length - allowed_errors)
+        maximum_left = min(len(left), right_length + allowed_errors)
+        for left_length in range(maximum_left, minimum_left - 1, -1):
+            distance = _bounded_edit_distance(
+                left[-left_length:],
+                right[:right_length],
+                allowed_errors,
+            )
+            if distance <= allowed_errors:
+                score = min(left_length, right_length) - distance * 3
+                candidate = (score, right_length, -distance)
+                if best is None or candidate > best:
+                    best = candidate
+    if best is not None:
+        _score, right_length, negative_distance = best
+        return right_length, -negative_distance
+    return 0, 0
+
+
+def _merge_overlapping_text(left: str, right: str) -> tuple[str, int, int]:
+    left = left.strip()
+    right = right.strip()
+    if not left:
+        return right, 0, 0
+    if not right:
+        return left, 0, 0
+    overlap, errors = _text_overlap_length(left, right)
+    if not overlap:
+        return f"{left}\n{right}", 0, 0
+    return f"{left}{right[overlap:]}", overlap, errors
+
+
 def _pseudo_segments_for_text(text: str, duration: float, offset: float) -> list[dict[str, Any]]:
     clean = re.sub(r"\s+", " ", text).strip()
     if not clean:
@@ -249,28 +316,112 @@ def _wav_duration_seconds(audio_path: Path) -> float:
         return reader.getnframes() / frame_rate
 
 
-def _iter_wav_chunks(audio_path: Path, chunk_seconds: float):
+def _wav_bytes_dbfs(wav_bytes: bytes) -> float:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as reader:
+        sample_width = reader.getsampwidth()
+        frames = reader.readframes(reader.getnframes())
+    if not frames:
+        return float("-inf")
+    if sample_width == 1:
+        samples = array.array("B", frames)
+        squared = sum((sample - 128) ** 2 for sample in samples)
+        peak = 127
+    elif sample_width == 2:
+        samples = array.array("h")
+        samples.frombytes(frames)
+        if os.sys.byteorder != "little":
+            samples.byteswap()
+        squared = sum(sample * sample for sample in samples)
+        peak = 32767
+    else:
+        return 0.0
+    rms = math.sqrt(squared / max(1, len(samples)))
+    if rms <= 0:
+        return float("-inf")
+    return 20.0 * math.log10(rms / peak)
+
+
+def _wav_slice_bytes(audio_path: Path, start_seconds: float, duration_seconds: float) -> bytes:
     with wave.open(str(audio_path), "rb") as reader:
         params = reader.getparams()
         frame_rate = reader.getframerate()
         if frame_rate <= 0:
             raise RuntimeError(f"Invalid WAV frame rate: {audio_path}")
-        frames_per_chunk = max(1, int(chunk_seconds * frame_rate))
+        start_frame = min(reader.getnframes(), max(0, int(start_seconds * frame_rate)))
+        frame_count = min(
+            max(1, int(duration_seconds * frame_rate)),
+            reader.getnframes() - start_frame,
+        )
+        reader.setpos(start_frame)
+        frames = reader.readframes(frame_count)
+    chunk_buffer = io.BytesIO()
+    with wave.open(chunk_buffer, "wb") as writer:
+        writer.setparams(params)
+        writer.writeframes(frames)
+    return chunk_buffer.getvalue()
+
+
+def _iter_wav_chunks(audio_path: Path, chunk_seconds: float, overlap_seconds: float = 0.0):
+    with wave.open(str(audio_path), "rb") as reader:
+        frame_rate = reader.getframerate()
+        if frame_rate <= 0:
+            raise RuntimeError(f"Invalid WAV frame rate: {audio_path}")
         total_frames = reader.getnframes()
-        start_frame = 0
-        chunk_index = 0
-        while start_frame < total_frames:
-            reader.setpos(start_frame)
-            frame_count = min(frames_per_chunk, total_frames - start_frame)
-            frames = reader.readframes(frame_count)
-            chunk_buffer = io.BytesIO()
-            with wave.open(chunk_buffer, "wb") as writer:
-                writer.setparams(params)
-                writer.writeframes(frames)
-            duration = frame_count / frame_rate
-            yield chunk_index, start_frame / frame_rate, duration, chunk_buffer.getvalue()
-            start_frame += frame_count
-            chunk_index += 1
+    total_duration = total_frames / frame_rate
+    chunk_index = 0
+    nominal_start = 0.0
+    while nominal_start < total_duration:
+        nominal_duration = min(chunk_seconds, total_duration - nominal_start)
+        request_start = max(0.0, nominal_start - overlap_seconds)
+        request_end = min(
+            total_duration,
+            nominal_start + nominal_duration + overlap_seconds,
+        )
+        request_duration = request_end - request_start
+        yield {
+            "chunk_index": chunk_index,
+            "offset_seconds": nominal_start,
+            "duration_seconds": nominal_duration,
+            "request_offset_seconds": request_start,
+            "request_duration_seconds": request_duration,
+            "leading_context_seconds": nominal_start - request_start,
+            "trailing_context_seconds": request_end - (nominal_start + nominal_duration),
+            "audio_bytes": _wav_slice_bytes(audio_path, request_start, request_duration),
+        }
+        nominal_start += nominal_duration
+        chunk_index += 1
+
+
+def _split_wav_bytes(wav_bytes: bytes, overlap_seconds: float = 1.0) -> list[tuple[float, float, bytes]]:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as reader:
+        params = reader.getparams()
+        frame_rate = reader.getframerate()
+        total_frames = reader.getnframes()
+        frames = reader.readframes(total_frames)
+    if frame_rate <= 0 or total_frames <= 1:
+        return []
+    midpoint = total_frames // 2
+    overlap_frames = max(0, int(overlap_seconds * frame_rate))
+    windows = [
+        (0, min(total_frames, midpoint + overlap_frames)),
+        (max(0, midpoint - overlap_frames), total_frames),
+    ]
+    parts: list[tuple[float, float, bytes]] = []
+    for start_frame, end_frame in windows:
+        frame_bytes = frames[
+            start_frame * params.sampwidth * params.nchannels:
+            end_frame * params.sampwidth * params.nchannels
+        ]
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as writer:
+            writer.setparams(params)
+            writer.writeframes(frame_bytes)
+        parts.append((
+            start_frame / frame_rate,
+            (end_frame - start_frame) / frame_rate,
+            buffer.getvalue(),
+        ))
+    return parts
 
 
 async def _post_upstream_bytes(
@@ -291,6 +442,56 @@ async def _post_upstream_bytes(
         if response.status_code >= 400:
             raise HTTPException(status_code=response.status_code, detail=response.text)
         return response.json()
+
+
+async def _transcribe_chunk_with_empty_retry(
+    *,
+    audio_bytes: bytes,
+    filename: str,
+    language: str,
+) -> tuple[str, str | None, dict[str, Any]]:
+    data = await _post_upstream_bytes(
+        audio_bytes=audio_bytes,
+        filename=filename,
+        language=language,
+    )
+    raw_text = _clean_transcript(data.get("text", ""))
+    text, filtered_reason = _sanitize_chunk_text(raw_text)
+    dbfs = _wav_bytes_dbfs(audio_bytes)
+    retry = {
+        "attempted": False,
+        "reason": None,
+        "part_count": 0,
+        "part_text_lengths": [],
+    }
+    if text or filtered_reason or dbfs < EMPTY_RETRY_MIN_DBFS:
+        return text, filtered_reason, {
+            "raw_text": raw_text,
+            "audio_dbfs": dbfs,
+            "empty_retry": retry,
+        }
+
+    retry["attempted"] = True
+    retry["reason"] = "empty_non_silent_chunk"
+    merged = ""
+    for part_index, (_offset, _duration, part_bytes) in enumerate(
+        _split_wav_bytes(audio_bytes)
+    ):
+        part_data = await _post_upstream_bytes(
+            audio_bytes=part_bytes,
+            filename=f"{Path(filename).stem}-retry{part_index}.wav",
+            language=language,
+        )
+        part_text, _part_filter = _sanitize_chunk_text(part_data.get("text", ""))
+        retry["part_text_lengths"].append(len(part_text))
+        if part_text:
+            merged, _overlap, _errors = _merge_overlapping_text(merged, part_text)
+    retry["part_count"] = len(retry["part_text_lengths"])
+    return merged, None, {
+        "raw_text": raw_text,
+        "audio_dbfs": dbfs,
+        "empty_retry": retry,
+    }
 
 
 async def _run_qwen_transcription(
@@ -336,37 +537,60 @@ async def _run_qwen_transcription(
                         result["filtered_chunk_reason"] = filtered_reason
                 else:
                     chunk_results: list[dict[str, Any]] = []
-                    chunk_texts: list[str] = []
+                    merged_text = ""
                     merged_segments: list[dict[str, Any]] = []
-                    for chunk_index, offset, duration, chunk_bytes in _iter_wav_chunks(audio_path, CHUNK_SECONDS):
+                    for chunk in _iter_wav_chunks(
+                        audio_path,
+                        CHUNK_SECONDS,
+                        CHUNK_OVERLAP_SECONDS,
+                    ):
+                        chunk_index = chunk["chunk_index"]
+                        offset = chunk["offset_seconds"]
+                        duration = chunk["duration_seconds"]
                         chunk_name = f"{Path(filename).stem}-chunk{chunk_index:04d}.wav"
-                        data = await _post_upstream_bytes(
-                            audio_bytes=chunk_bytes,
+                        text, filtered_reason, diagnostics = await _transcribe_chunk_with_empty_retry(
+                            audio_bytes=chunk["audio_bytes"],
                             filename=chunk_name,
                             language=language,
                         )
-                        raw_text = _clean_transcript(data.get("text", ""))
-                        text, filtered_reason = _sanitize_chunk_text(raw_text)
+                        merged_text, overlap_chars, overlap_errors = _merge_overlapping_text(
+                            merged_text,
+                            text,
+                        )
                         if text:
-                            chunk_texts.append(text)
+                            novel_text = text[overlap_chars:]
+                        else:
+                            novel_text = ""
                         chunk_record = {
                             "chunk_index": chunk_index,
                             "offset_seconds": offset,
                             "duration_seconds": duration,
+                            "request_offset_seconds": chunk["request_offset_seconds"],
+                            "request_duration_seconds": chunk["request_duration_seconds"],
+                            "leading_context_seconds": chunk["leading_context_seconds"],
+                            "trailing_context_seconds": chunk["trailing_context_seconds"],
                             "text": text,
+                            "novel_text": novel_text,
+                            "overlap_chars": overlap_chars,
+                            "overlap_errors": overlap_errors,
+                            "audio_dbfs": diagnostics["audio_dbfs"],
+                            "empty_retry": diagnostics["empty_retry"],
                         }
                         if filtered_reason:
                             chunk_record["filtered_reason"] = filtered_reason
-                            chunk_record["raw_text_preview"] = raw_text[:500]
+                            chunk_record["raw_text_preview"] = diagnostics["raw_text"][:500]
                         chunk_results.append(chunk_record)
-                        merged_segments.extend(_pseudo_segments_for_text(text, duration, offset))
+                        merged_segments.extend(
+                            _pseudo_segments_for_text(novel_text, duration, offset)
+                        )
                     result = {
-                        "text": "\n".join(chunk_texts).strip(),
+                        "text": merged_text.strip(),
                         "segments": merged_segments,
                         "model": model,
                         "duration": total_duration,
                         "chunked": True,
                         "chunk_seconds": CHUNK_SECONDS,
+                        "chunk_overlap_seconds": CHUNK_OVERLAP_SECONDS,
                         "chunk_count": len(chunk_results),
                     }
                     _write_json(result_dir / "chunks.json", chunk_results)
