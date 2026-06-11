@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -26,6 +27,12 @@ class WorkerRecoveryTest(unittest.TestCase):
     def test_vad_all_silence_is_legal_empty_window(self):
         output = "[silencedetect] silence_start: 0"
         self.assertIsNone(parse_silencedetect_voice_window(output, 30.0))
+
+    def test_vad_without_silence_means_full_voice_window(self):
+        window = parse_silencedetect_voice_window("", 30.0)
+        self.assertIsNotNone(window)
+        self.assertEqual(window.start, 0.0)
+        self.assertEqual(window.duration, 30.0)
 
     def test_environment_config_is_clamped(self):
         with patch.dict(
@@ -69,6 +76,46 @@ class WorkerRecoveryTest(unittest.TestCase):
         self.assertEqual(progress[-1]["done"], 3)
         self.assertEqual(progress[-1]["total"], 3)
         self.assertTrue(progress[-1]["finished"])
+
+    def test_chunk_groups_merge_in_chunk_order_and_deduplicate_boundary(self):
+        groups = [
+            (45.0, "1", [SubtitleSegment(45.0, 46.0, "重复句"), SubtitleSegment(46.0, 47.0, "后句")]),
+            (0.0, "0", [SubtitleSegment(44.0, 45.0, "重复句")]),
+        ]
+        merged = QueueWorker._merge_qwen_chunk_groups(groups)
+        self.assertEqual([segment.text for segment in merged], ["重复句", "后句"])
+        self.assertEqual(merged[0].start, 44.0)
+        self.assertEqual(merged[0].end, 46.0)
+
+    def test_chunk_cancel_event_terminates_only_its_process(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        worker = QueueWorker([], mode)
+        cancel_event = threading.Event()
+        holder = {}
+        outcome = {}
+
+        def run():
+            try:
+                worker._run_chunk_command(
+                    ["/bin/sh", "-c", "sleep 30"],
+                    "test chunk",
+                    cancel_event,
+                    holder,
+                )
+            except Exception as exc:
+                outcome["error"] = str(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        deadline = time.monotonic() + 5
+        while "proc" not in holder and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn("proc", holder)
+        cancel_event.set()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertIn("cancelled", outcome["error"].lower())
+        self.assertEqual(len(worker._active_processes), 0)
 
     @patch("whisper_captioner.workers._request_json_url")
     def test_release_busy_only_logs(self, request):

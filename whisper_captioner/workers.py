@@ -1573,8 +1573,8 @@ class QueueWorker(QObject):
         futures: dict[Future, dict[str, Any]] = {}
         started: dict[Future, float] = {}
         cancel_events: dict[Future, threading.Event] = {}
-        process_by_future: dict[Future, subprocess.Popen[str]] = {}
-        results: list[SubtitleSegment] = []
+        process_holders: dict[Future, dict[str, Any]] = {}
+        result_groups: list[tuple[float, str, list[SubtitleSegment]]] = []
         successful_root_times: list[float] = []
         done = 0
         total = len(tasks)
@@ -1587,8 +1587,7 @@ class QueueWorker(QObject):
             futures[future] = task
             started[future] = time.monotonic()
             cancel_events[future] = cancel_event
-            holder["future"] = future
-            holder["processes"] = process_by_future
+            process_holders[future] = holder
 
         with ThreadPoolExecutor(max_workers=replicas, thread_name_prefix="qwen-asr") as executor:
             while (pending or futures) and not self._stop:
@@ -1606,7 +1605,7 @@ class QueueWorker(QObject):
                             continue
                         task["split"] = True
                         cancel_events[future].set()
-                        _terminate_process(process_by_future.get(future), timeout=1.0)
+                        _terminate_process(process_holders[future].get("proc"), timeout=1.0)
                         half = task["duration"] / 2.0
                         pending.extend(
                             [
@@ -1636,7 +1635,7 @@ class QueueWorker(QObject):
                     task = futures.pop(future)
                     elapsed = time.monotonic() - started.pop(future)
                     cancel_events.pop(future, None)
-                    process_by_future.pop(future, None)
+                    process_holders.pop(future, None)
                     if task["split"]:
                         try:
                             future.result()
@@ -1651,20 +1650,20 @@ class QueueWorker(QObject):
                         self.status.emit(f"Qwen3-ASR chunk {task['label']} failed; retrying once: {first_error}")
                         try:
                             chunk_segments = self._run_qwen_chunk_task(
-                                wav, task, threading.Event(), {"processes": {}}
+                                wav, task, threading.Event(), {}
                             )
                         except Exception as retry_error:
                             for event in cancel_events.values():
                                 event.set()
-                            for active_proc in list(process_by_future.values()):
-                                _terminate_process(active_proc, timeout=1.0)
+                            for holder in process_holders.values():
+                                _terminate_process(holder.get("proc"), timeout=1.0)
                             pending.clear()
                             for active_future in futures:
                                 active_future.cancel()
                             raise RuntimeError(
                                 f"Qwen3-ASR chunk {task['label']} failed after retry: {retry_error}"
                             ) from retry_error
-                    results.extend(chunk_segments)
+                    result_groups.append((float(task["start"]), str(task["label"]), chunk_segments))
                     done += 1
                     if task["root"]:
                         successful_root_times.append(elapsed)
@@ -1679,7 +1678,7 @@ class QueueWorker(QObject):
                     )
         if self._stop:
             raise RuntimeError("Queue stopped")
-        return sorted(results, key=lambda segment: (segment.start, segment.end))
+        return self._merge_qwen_chunk_groups(result_groups)
 
     def _run_qwen_chunk_task(
         self,
@@ -1694,7 +1693,7 @@ class QueueWorker(QObject):
         chunk_out = Path(tempfile.gettempdir()) / f"{wav.stem}-qwen3-{label}-{token}"
         with self._process_lock:
             self._temp_paths.extend([chunk_wav, chunk_out.with_suffix(".txt")])
-        self._run(
+        self._run_chunk_command(
             [
                 FFMPEG,
                 "-hide_banner",
@@ -1712,6 +1711,8 @@ class QueueWorker(QObject):
                 str(chunk_wav),
             ],
             f"Preparing Qwen3-ASR chunk {label}",
+            cancel_event,
+            holder,
         )
         if cancel_event.is_set() or self._stop:
             raise RuntimeError("Chunk cancelled")
@@ -1730,46 +1731,13 @@ class QueueWorker(QObject):
             "--chunk-duration",
             str(max(1, int(task["duration"]))),
         ]
-        self.status.emit(f"Transcribing Qwen3-ASR chunk {label}")
-        proc = subprocess.Popen(
+        output = self._run_chunk_command(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            cwd=str(OUTPUT_DIR),
+            f"Transcribing Qwen3-ASR chunk {label}",
+            cancel_event,
+            holder,
+            timeout=max(120.0, float(task["duration"]) * 20.0),
         )
-        self._register_process(proc)
-        output_lines: list[str] = []
-
-        def consume_output() -> None:
-            if not proc.stdout:
-                return
-            for line in proc.stdout:
-                output_lines.append(line.rstrip())
-
-        output_thread = threading.Thread(target=consume_output, daemon=True)
-        output_thread.start()
-        future = holder.get("future")
-        if future is not None:
-            holder["processes"][future] = proc
-        try:
-            deadline = time.monotonic() + max(120.0, float(task["duration"]) * 20.0)
-            while proc.poll() is None:
-                if self._stop or cancel_event.wait(0.1):
-                    _terminate_process(proc, timeout=1.0)
-                    raise RuntimeError("Chunk cancelled")
-                if time.monotonic() >= deadline:
-                    _terminate_process(proc, timeout=1.0)
-                    raise TimeoutError(
-                        f"Qwen3-ASR chunk {label} timed out after "
-                        f"{max(120.0, float(task['duration']) * 20.0):.0f}s"
-                    )
-            output_thread.join(timeout=2)
-            output = "\n".join(output_lines)
-            if proc.returncode != 0:
-                raise RuntimeError(f"worker exited with code {proc.returncode}: {output[-1000:]}")
-        finally:
-            self._unregister_process(proc)
         chunk_txt = chunk_out.with_suffix(".txt")
         chunk_text = (
             chunk_txt.read_text(encoding="utf-8", errors="ignore").strip()
@@ -1784,6 +1752,80 @@ class QueueWorker(QObject):
             )
             for segment in pseudo_timestamp_qwen3_text(chunk_text, task["duration"])
         ]
+
+    def _run_chunk_command(
+        self,
+        cmd: list[str],
+        label: str,
+        cancel_event: threading.Event,
+        holder: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> str:
+        self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(OUTPUT_DIR),
+        )
+        self._register_process(proc)
+        holder["proc"] = proc
+        output_lines: list[str] = []
+
+        def consume_output() -> None:
+            if not proc.stdout:
+                return
+            for line in proc.stdout:
+                output_lines.append(line.rstrip())
+
+        output_thread = threading.Thread(target=consume_output, daemon=True)
+        output_thread.start()
+        try:
+            deadline = time.monotonic() + timeout if timeout is not None else None
+            while proc.poll() is None:
+                if self._stop or cancel_event.wait(0.1):
+                    _terminate_process(proc, timeout=1.0)
+                    raise RuntimeError("Chunk cancelled")
+                if deadline is not None and time.monotonic() >= deadline:
+                    _terminate_process(proc, timeout=1.0)
+                    raise TimeoutError(f"{label} timed out after {timeout:.0f}s")
+            output_thread.join(timeout=2)
+            output = "\n".join(output_lines)
+            if proc.returncode != 0:
+                raise RuntimeError(f"worker exited with code {proc.returncode}: {output[-1000:]}")
+            return output
+        finally:
+            output_thread.join(timeout=2)
+            if proc.stdout:
+                proc.stdout.close()
+            if holder.get("proc") is proc:
+                holder.pop("proc", None)
+            self._unregister_process(proc)
+
+    @staticmethod
+    def _merge_qwen_chunk_groups(
+        groups: list[tuple[float, str, list[SubtitleSegment]]],
+    ) -> list[SubtitleSegment]:
+        merged: list[SubtitleSegment] = []
+        for _start, _label, segments in sorted(groups, key=lambda item: (item[0], item[1])):
+            ordered = sorted(segments, key=lambda segment: (segment.start, segment.end))
+            if merged and ordered:
+                previous = merged[-1]
+                current = ordered[0]
+                if (
+                    previous.text.strip() == current.text.strip()
+                    and current.start - previous.end <= 1.5
+                ):
+                    merged[-1] = SubtitleSegment(
+                        previous.start,
+                        max(previous.end, current.end),
+                        previous.text,
+                    )
+                    ordered = ordered[1:]
+            merged.extend(ordered)
+        return merged
 
     def _transcribe_nuc_qwen3_asr_1p7b_chunked(self, wav: Path, base_url: str) -> list[SubtitleSegment]:
         duration = self._get_duration(wav)
