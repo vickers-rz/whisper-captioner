@@ -316,10 +316,13 @@ def _wav_duration_seconds(audio_path: Path) -> float:
         return reader.getnframes() / frame_rate
 
 
-def _wav_bytes_dbfs(wav_bytes: bytes) -> float:
-    with wave.open(io.BytesIO(wav_bytes), "rb") as reader:
-        sample_width = reader.getsampwidth()
-        frames = reader.readframes(reader.getnframes())
+def _wav_bytes_dbfs(wav_bytes: bytes) -> float | None:
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as reader:
+            sample_width = reader.getsampwidth()
+            frames = reader.readframes(reader.getnframes())
+    except wave.Error:
+        return None
     if not frames:
         return float("-inf")
     if sample_width == 1:
@@ -333,8 +336,22 @@ def _wav_bytes_dbfs(wav_bytes: bytes) -> float:
             samples.byteswap()
         squared = sum(sample * sample for sample in samples)
         peak = 32767
+    elif sample_width == 3:
+        samples = [
+            int.from_bytes(frames[index:index + 3], "little", signed=True)
+            for index in range(0, len(frames) - 2, 3)
+        ]
+        squared = sum(sample * sample for sample in samples)
+        peak = 8388607
+    elif sample_width == 4:
+        samples = array.array("i")
+        samples.frombytes(frames)
+        if os.sys.byteorder != "little":
+            samples.byteswap()
+        squared = sum(sample * sample for sample in samples)
+        peak = 2147483647
     else:
-        return 0.0
+        return None
     rms = math.sqrt(squared / max(1, len(samples)))
     if rms <= 0:
         return float("-inf")
@@ -464,7 +481,9 @@ async def _transcribe_chunk_with_empty_retry(
         "part_count": 0,
         "part_text_lengths": [],
     }
-    if text or filtered_reason or dbfs < EMPTY_RETRY_MIN_DBFS:
+    if text or filtered_reason or dbfs is None or dbfs < EMPTY_RETRY_MIN_DBFS:
+        if dbfs is None:
+            retry["reason"] = "audio_level_unavailable"
         return text, filtered_reason, {
             "raw_text": raw_text,
             "audio_dbfs": dbfs,

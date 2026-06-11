@@ -104,10 +104,19 @@ class WorkerRecoveryTest(unittest.TestCase):
                 ({"label": "0", "start": 0.0, "duration": 45.0}, "first"),
                 ({"label": "2", "start": 90.0, "duration": 1.0}, "third"),
             ]
-            for task, text in tasks:
+            for done, (task, text) in enumerate(tasks, start=1):
                 on_chunk_ready(
                     task,
                     [SubtitleSegment(task["start"], task["start"] + 1, text)],
+                )
+                _queue_worker.chunk_progress.emit(
+                    {
+                        "done": done,
+                        "total": 3,
+                        "finished": done == 3,
+                        "inflight": 3 - done,
+                        "splits": 0,
+                    }
                 )
             return []
 
@@ -130,6 +139,53 @@ class WorkerRecoveryTest(unittest.TestCase):
             [["second"], ["third"]],
         )
         self.assertEqual(progress[-1], (3, 3))
+
+    def test_controlled_qwen_parallel_forwards_dynamic_split_total(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        worker = RollingPrefetchWorker(
+            "https://example.com/video",
+            mode,
+            run_config=QueueRunConfig(qwen_replicas=2, qwen_chunk_seconds=45),
+        )
+        progress = []
+        worker.progress.connect(lambda done, total: progress.append((done, total)))
+
+        def fake_parallel(_queue_worker, _audio, on_chunk_ready=None):
+            child_tasks = [
+                {"label": "0a", "start": 0.0, "duration": 22.5},
+                {"label": "0b", "start": 22.5, "duration": 22.5},
+            ]
+            for done, task in enumerate(child_tasks, start=1):
+                on_chunk_ready(
+                    task,
+                    [SubtitleSegment(task["start"], task["start"] + 1, task["label"])],
+                )
+                _queue_worker.chunk_progress.emit(
+                    {
+                        "done": done,
+                        "total": 2,
+                        "finished": done == 2,
+                        "inflight": 2 - done,
+                        "splits": 1,
+                    }
+                )
+            return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(
+                QueueWorker,
+                "_transcribe_local_qwen3_asr_chunked",
+                fake_parallel,
+            ):
+                worker._transcribe_local_qwen_parallel(
+                    Path(directory) / "audio.wav",
+                    Path(directory),
+                    45.0,
+                )
+            raw_names = sorted(path.name for path in Path(directory).glob("chunk-*-raw.json"))
+
+        self.assertEqual(progress[-1], (2, 2))
+        self.assertEqual(raw_names, ["chunk-0a-raw.json", "chunk-0b-raw.json"])
 
     def test_nuc_asr_turbo_and_quality_modes_select_distinct_models(self):
         turbo = next(mode for mode in MODES if mode.key == "nuc_asr_turbo")
@@ -241,6 +297,83 @@ class WorkerRecoveryTest(unittest.TestCase):
         self.assertEqual(progress[-1]["done"], 3)
         self.assertEqual(progress[-1]["total"], 3)
         self.assertTrue(progress[-1]["finished"])
+
+    def test_parallel_qwen_retry_does_not_block_other_completed_chunks(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        worker = QueueWorker(
+            [],
+            mode,
+            QueueRunConfig(
+                qwen_replicas=2,
+                qwen_chunk_seconds=45,
+                qwen_parallel_enabled=True,
+            ),
+        )
+        worker._get_duration = lambda _path: 90.0
+        retry_started = threading.Event()
+        release_retry = threading.Event()
+        callbacks = []
+        outcome = {}
+
+        def fake_task(_wav, task, _cancel_event, _holder):
+            if task["label"] == "0" and task.get("attempt", 0) == 0:
+                raise RuntimeError("first attempt failed")
+            if task["label"] == "0":
+                retry_started.set()
+                release_retry.wait(timeout=5)
+            elif task["label"] == "1":
+                retry_started.wait(timeout=5)
+            return [SubtitleSegment(task["start"], task["start"] + 1, task["label"])]
+
+        worker._run_qwen_chunk_task = fake_task
+
+        def run_transcription():
+            try:
+                worker._transcribe_local_qwen3_asr_chunked(
+                    "/unused.wav",
+                    on_chunk_ready=lambda task, _segments: callbacks.append(task["label"]),
+                )
+            except Exception as exc:
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run_transcription)
+        thread.start()
+        self.assertTrue(retry_started.wait(timeout=3))
+        deadline = time.monotonic() + 3
+        while "1" not in callbacks and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn("1", callbacks)
+        release_retry.set()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", outcome)
+
+    def test_native_subtitle_fetch_removes_stale_attempt_files(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        worker = RollingPrefetchWorker("https://example.com/video", mode)
+
+        def fake_run(command, _label):
+            if "--write-auto-subs" not in command:
+                return
+            output_template = Path(command[command.index("-o") + 1])
+            subtitle_path = Path(str(output_template).replace("%(ext)s", "zh-Hans.vtt"))
+            subtitle_path.write_text(
+                "WEBVTT\n\n00:00:03.000 --> 00:00:04.000\n新字幕\n",
+                encoding="utf-8",
+            )
+
+        worker._run_cmd = fake_run
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stale_dir = root / "native-subs-zh"
+            stale_dir.mkdir()
+            (stale_dir / "native.old.vtt").write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n旧字幕\n",
+                encoding="utf-8",
+            )
+            segments, _kind = worker._load_or_fetch_native_subtitles(root)
+
+        self.assertEqual([segment.text for segment in segments], ["新字幕"])
 
     def test_chunk_groups_merge_in_chunk_order_and_deduplicate_boundary(self):
         groups = [

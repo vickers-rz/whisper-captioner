@@ -38,6 +38,12 @@ sudo docker run -d \
   -e ASR_HEALTH_URL=http://host.docker.internal:8000/health \
   -e ASR_BUSY_URL=http://host.docker.internal:8000/busy \
   -e ASR_BACKEND_HEALTH_URL=http://nuc-asr-backend:8000/health \
+  -e ASR_BACKEND_IMAGE=fedirz/faster-whisper-server:latest-cuda \
+  -e ASR_BACKEND_NETWORK="${NETWORK_NAME}" \
+  -e ASR_BACKEND_HOST_PORT=18000 \
+  -e ASR_MODEL_CACHE_DIR=/srv/ai-models/whisper-cache \
+  -e ASR_COMPUTE_TYPE=int8 \
+  -e ASR_MODEL_TTL_SECONDS=900 \
   -e ASR_IDLE_SECONDS="${ASR_IDLE_SECONDS}" \
   python:3.11-slim \
   bash -lc "pip install --no-cache-dir fastapi uvicorn httpx docker && uvicorn scheduler:app --app-dir /app --host 0.0.0.0 --port 8010"

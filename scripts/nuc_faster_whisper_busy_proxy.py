@@ -125,10 +125,10 @@ async def _get_upstream_health() -> tuple[bool, str]:
             return False, str(exc)
 
 
-async def _scheduler_post(path: str) -> Any:
+async def _scheduler_post(path: str, payload: dict[str, Any] | None = None) -> Any:
     async with httpx.AsyncClient(timeout=180) as client:
         try:
-            response = await client.post(f"{SCHEDULER_URL}{path}")
+            response = await client.post(f"{SCHEDULER_URL}{path}", json=payload)
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=503, detail=f"scheduler unavailable: {exc}") from exc
         if response.status_code >= 400:
@@ -156,7 +156,7 @@ async def _transcribe_local_file_to_result(
     result_dir: Path,
 ) -> dict[str, Any]:
     await _scheduler_post("/admit/asr")
-    await _scheduler_post("/ensure/asr")
+    await _scheduler_post("/ensure/asr", {"model": model})
     metadata = {
         "filename": filename,
         "model": model,
@@ -330,7 +330,13 @@ async def models() -> dict[str, Any]:
                 "object": "model",
                 "created": 0,
                 "owned_by": "faster-whisper",
-            }
+            },
+            {
+                "id": "deepdml/faster-whisper-large-v3-turbo-ct2",
+                "object": "model",
+                "created": 0,
+                "owned_by": "faster-whisper",
+            },
         ],
     }
 

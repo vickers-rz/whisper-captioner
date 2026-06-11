@@ -1599,6 +1599,7 @@ class QueueWorker(QObject):
                 "duration": min(chunk_seconds, duration - start),
                 "root": True,
                 "split": False,
+                "attempt": 0,
             }
             for index, start in enumerate(index * chunk_seconds for index in range(math.ceil(duration / chunk_seconds)))
             if start < duration
@@ -1650,6 +1651,7 @@ class QueueWorker(QObject):
                                     "duration": half,
                                     "root": False,
                                     "split": False,
+                                    "attempt": 0,
                                 },
                                 {
                                     "label": f"{task['label']}b",
@@ -1657,6 +1659,7 @@ class QueueWorker(QObject):
                                     "duration": task["duration"] - half,
                                     "root": False,
                                     "split": False,
+                                    "attempt": 0,
                                 },
                             ]
                         )
@@ -1679,25 +1682,27 @@ class QueueWorker(QObject):
                         continue
                     try:
                         chunk_segments = future.result()
-                    except Exception as first_error:
+                    except Exception as chunk_error:
                         if self._stop:
-                            raise RuntimeError("Queue stopped") from first_error
-                        self.status.emit(f"Qwen3-ASR chunk {task['label']} failed; retrying once: {first_error}")
-                        try:
-                            chunk_segments = self._run_qwen_chunk_task(
-                                wav, task, threading.Event(), {}
+                            raise RuntimeError("Queue stopped") from chunk_error
+                        if int(task.get("attempt", 0)) < 1:
+                            retry_task = dict(task)
+                            retry_task["attempt"] = 1
+                            self.status.emit(
+                                f"Qwen3-ASR chunk {task['label']} failed; retrying once: {chunk_error}"
                             )
-                        except Exception as retry_error:
-                            for event in cancel_events.values():
-                                event.set()
-                            for holder in process_holders.values():
-                                _terminate_process(holder.get("proc"), timeout=1.0)
-                            pending.clear()
-                            for active_future in futures:
-                                active_future.cancel()
-                            raise RuntimeError(
-                                f"Qwen3-ASR chunk {task['label']} failed after retry: {retry_error}"
-                            ) from retry_error
+                            submit(executor, retry_task)
+                            continue
+                        for event in cancel_events.values():
+                            event.set()
+                        for holder in process_holders.values():
+                            _terminate_process(holder.get("proc"), timeout=1.0)
+                        pending.clear()
+                        for active_future in futures:
+                            active_future.cancel()
+                        raise RuntimeError(
+                            f"Qwen3-ASR chunk {task['label']} failed after retry: {chunk_error}"
+                        ) from chunk_error
                     result_groups.append((float(task["start"]), str(task["label"]), chunk_segments))
                     if on_chunk_ready is not None:
                         on_chunk_ready(task, chunk_segments)
@@ -2322,21 +2327,24 @@ class RollingPrefetchWorker(QObject):
         worker = QueueWorker([], self.mode, self.run_config)
         self._parallel_qwen_worker = worker
         worker.status.connect(self.status.emit)
+        worker.chunk_progress.connect(
+            lambda snapshot: self.progress.emit(
+                int(snapshot.get("done", 0)),
+                int(snapshot.get("total", 0)),
+            )
+        )
         pending_by_start: dict[float, tuple[dict[str, Any], list[SubtitleSegment]]] = {}
         next_start = 0.0
-        completed = 0
-        total = max(1, math.ceil(duration / self.run_config.qwen_chunk_seconds))
 
         def on_chunk_ready(task: dict[str, Any], segments: list[SubtitleSegment]) -> None:
-            nonlocal next_start, completed
+            nonlocal next_start
             start = float(task["start"])
             pending_by_start[start] = (task, segments)
-            completed += 1
-            self.progress.emit(completed, total)
             while next_start in pending_by_start:
                 ready_task, ready = pending_by_start.pop(next_start)
-                chunk_index = int(round(next_start / self.run_config.qwen_chunk_seconds))
-                save_segments(job_cache_dir / f"chunk-{chunk_index:04d}-raw.json", ready)
+                label = str(ready_task["label"])
+                cache_label = f"{int(label):04d}" if label.isdigit() else label
+                save_segments(job_cache_dir / f"chunk-{cache_label}-raw.json", ready)
                 self._emit_incremental_segments(ready)
                 next_start += float(ready_task["duration"])
 
@@ -3075,6 +3083,9 @@ class RollingPrefetchWorker(QObject):
                 ("manual", "--write-subs"),
                 ("automatic", "--write-auto-subs"),
             ):
+                for stale_path in subs_dir.glob("native.*"):
+                    if stale_path.is_file():
+                        stale_path.unlink()
                 try:
                     self._run_cmd(
                         [

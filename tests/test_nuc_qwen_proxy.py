@@ -77,6 +77,23 @@ def wav_bytes(seconds: float, amplitude: int = 1000, sample_rate: int = 1000) ->
     return buffer.getvalue()
 
 
+def wav_bytes_with_width(
+    seconds: float,
+    amplitude: int,
+    sample_width: int,
+    sample_rate: int = 1000,
+) -> bytes:
+    frame_count = int(seconds * sample_rate)
+    sample = int(amplitude).to_bytes(sample_width, "little", signed=True)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(sample_width)
+        writer.setframerate(sample_rate)
+        writer.writeframes(sample * frame_count)
+    return buffer.getvalue()
+
+
 class QwenProxyChunkTests(unittest.TestCase):
     def test_iter_chunks_adds_context_without_changing_nominal_windows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -114,6 +131,19 @@ class QwenProxyChunkTests(unittest.TestCase):
 
     def test_silence_dbfs_is_negative_infinity(self) -> None:
         self.assertEqual(float("-inf"), proxy._wav_bytes_dbfs(wav_bytes(1, amplitude=0)))
+
+    def test_pcm_24_and_32_bit_dbfs_are_measured(self) -> None:
+        self.assertLess(
+            proxy._wav_bytes_dbfs(wav_bytes_with_width(1, 1_000_000, 3)),
+            0.0,
+        )
+        self.assertLess(
+            proxy._wav_bytes_dbfs(wav_bytes_with_width(1, 100_000_000, 4)),
+            0.0,
+        )
+
+    def test_unsupported_wav_format_returns_unknown_level(self) -> None:
+        self.assertIsNone(proxy._wav_bytes_dbfs(b"not-a-wave-file"))
 
 
 class QwenProxyRetryTests(unittest.IsolatedAsyncioTestCase):
