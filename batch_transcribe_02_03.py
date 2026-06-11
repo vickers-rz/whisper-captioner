@@ -40,12 +40,18 @@ NUC_HOST = "192.168.31.196"
 NUC_QWEN_PORT = "8001"
 NUC_QWEN_BASE_URL = f"http://{NUC_HOST}:{NUC_QWEN_PORT}"
 
-GEMINI_API_KEY = "AIzaSyADl6hpoxdZUVdEqvLylzEwV7lvdr93Jdk"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 GEMINI_MODEL = "gemini-2.5-flash"
 
 FFMPEG = "/opt/homebrew/bin/ffmpeg"
 LLM_BATCH_SIZE = 80  # 每次 LLM 调用最多处理的段数
+
+
+def require_gemini_api_key() -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("缺少环境变量 GEMINI_API_KEY")
+    return GEMINI_API_KEY
 
 # ─── SRT / 工具函数 ──────────────────────────────────────────────────────────
 
@@ -436,7 +442,7 @@ def llm_polish(segments: list[dict]) -> list[dict]:
         }
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {GEMINI_API_KEY}",
+            "Authorization": f"Bearer {require_gemini_api_key()}",
         }
         corrected = {}
         for attempt in range(4):

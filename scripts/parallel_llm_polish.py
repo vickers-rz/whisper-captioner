@@ -23,7 +23,7 @@ MANIFEST_PATH = OSRT_ROOT / "manifest.json"
 
 FALLBACK_THRESHOLD = 0.80
 
-GEMINI_API_KEY = "AIzaSyADl6hpoxdZUVdEqvLylzEwV7lvdr93Jdk"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 GEMINI_MODEL = "gemini-2.5-flash"
 
@@ -31,6 +31,12 @@ GEMINI_MODEL = "gemini-2.5-flash"
 LLM_BATCH_SIZE = 120
 # 最大并发请求数。同一个 API Key 建议在 5-10 之间，以防触及每分钟请求数 (RPM) 限制。
 MAX_CONCURRENT_WORKERS = 8
+
+
+def require_gemini_api_key() -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("缺少环境变量 GEMINI_API_KEY")
+    return GEMINI_API_KEY
 
 # LLM 提示词 (参考 whisper_captioner 原版提示词进行规整，不带 timestamps 干扰)
 LLM_SYSTEM_PROMPT = (
@@ -118,7 +124,7 @@ def polish_batch(batch_idx: int, batch: list, total_segments: int, system_prompt
     }
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {GEMINI_API_KEY}",
+        "Authorization": f"Bearer {require_gemini_api_key()}",
     }
     
     for attempt in range(4):

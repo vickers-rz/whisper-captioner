@@ -203,6 +203,14 @@ The analysis tab can generate LLM-based video chapters from the timestamped tran
 
 The chapter button is context-sensitive and always manual. During controlled URL playback it generates and displays the chapter overlay. For local subtitles or an existing SRT, it asks for the SRT when necessary and writes a separate `*-带章节.srt` file with chapter title and description inserted at the relevant subtitle positions; the source SRT is not overwritten.
 
+Batch Gemini scripts read their credential exclusively from the environment:
+
+```bash
+export GEMINI_API_KEY="your-new-key"
+```
+
+No Gemini API key is stored in the repository.
+
 The settings page exposes both values. Environment variables override the saved settings:
 
 - `WHISPER_CAPTIONER_CPP_THREADS=6`

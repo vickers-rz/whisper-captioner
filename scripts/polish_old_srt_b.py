@@ -20,12 +20,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 STAGING_DIR = Path("~/Documents/temp/batch_asr_staging").expanduser()
 MANIFEST_PATH = STAGING_DIR / "manifest.json"
 
-GEMINI_API_KEY = "AIzaSyADl6hpoxdZUVdEqvLylzEwV7lvdr93Jdk"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 GEMINI_MODEL = "gemini-2.5-flash"
 
 LLM_BATCH_SIZE = 1500
 MAX_CONCURRENT_WORKERS = 8
+
+
+def require_gemini_api_key() -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("缺少环境变量 GEMINI_API_KEY")
+    return GEMINI_API_KEY
 
 LLM_SYSTEM_PROMPT = (
     "You are a Chinese subtitle corrector. Your task is to proofread and improve subtitle text "
@@ -137,7 +143,7 @@ def polish_batch(batch_idx: int, batch: list, system_prompt: str) -> dict:
     }
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {GEMINI_API_KEY}",
+        "Authorization": f"Bearer {require_gemini_api_key()}",
     }
     
     for attempt in range(4):
