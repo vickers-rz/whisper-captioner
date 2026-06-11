@@ -1629,11 +1629,13 @@ class MainWindow(QMainWindow):
         self.overlay.set_caption("正在准备字幕，Chrome 已暂停。")
         self._set_status_summary(f"网址受控字幕准备中 | 模式 {mode.label}")
         self.controlled_thread = QThread()
+        run_config = self._queue_run_config()
         self.controlled_worker = RollingPrefetchWorker(
             source, mode,
             llm_provider=llm_provider, llm_api_key=llm_api_key,
             llm_api_url=llm_api_url, llm_model_id=llm_model_id,
-            remote_vad_enabled=self._queue_run_config().remote_vad_enabled,
+            remote_vad_enabled=run_config.remote_vad_enabled,
+            run_config=run_config,
         )
         self.controlled_worker.moveToThread(self.controlled_thread)
         self.controlled_thread.started.connect(self.controlled_worker.run)

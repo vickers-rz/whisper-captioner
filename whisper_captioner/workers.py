@@ -1572,7 +1572,11 @@ class QueueWorker(QObject):
         finally:
             _cleanup_temp_paths(self._temp_paths)
 
-    def _transcribe_local_qwen3_asr_chunked(self, wav: Path) -> list[SubtitleSegment]:
+    def _transcribe_local_qwen3_asr_chunked(
+        self,
+        wav: Path,
+        on_chunk_ready: Callable[[dict[str, Any], list[SubtitleSegment]], None] | None = None,
+    ) -> list[SubtitleSegment]:
         duration = self._get_duration(wav)
         chunk_seconds = self.config.qwen_chunk_seconds
         tasks = [
@@ -1682,6 +1686,8 @@ class QueueWorker(QObject):
                                 f"Qwen3-ASR chunk {task['label']} failed after retry: {retry_error}"
                             ) from retry_error
                     result_groups.append((float(task["start"]), str(task["label"]), chunk_segments))
+                    if on_chunk_ready is not None:
+                        on_chunk_ready(task, chunk_segments)
                     done += 1
                     if task["root"]:
                         successful_root_times.append(elapsed)
@@ -2233,6 +2239,7 @@ class RollingPrefetchWorker(QObject):
         llm_provider: Optional[LLMProvider] = None, llm_api_key: str = "",
         llm_api_url: str = "", llm_model_id: str = "",
         remote_vad_enabled: bool | None = None,
+        run_config: QueueRunConfig | None = None,
     ) -> None:
         super().__init__()
         self.url = url
@@ -2242,6 +2249,7 @@ class RollingPrefetchWorker(QObject):
         self.llm_api_key = llm_api_key
         self.llm_api_url = llm_api_url
         self.llm_model_id = llm_model_id
+        self.run_config = run_config or QueueRunConfig.from_environment()
         self.remote_vad_enabled = (
             _env_bool("WHISPER_CAPTIONER_REMOTE_VAD", False)
             if remote_vad_enabled is None
@@ -2252,6 +2260,7 @@ class RollingPrefetchWorker(QObject):
         self._temp_paths: list[Path] = []
         self._used_nuc_asr = False
         self._has_emitted_segments = False
+        self._parallel_qwen_worker: QueueWorker | None = None
 
     def run(self) -> None:
         try:
@@ -2273,6 +2282,8 @@ class RollingPrefetchWorker(QObject):
 
     def stop(self) -> None:
         self._stop = True
+        if self._parallel_qwen_worker is not None:
+            self._parallel_qwen_worker.stop()
         _terminate_process(self.proc)
         self.proc = None
 
@@ -2288,6 +2299,49 @@ class RollingPrefetchWorker(QObject):
         else:
             self.first_segments.emit(segments)
             self._has_emitted_segments = True
+
+    def _transcribe_local_qwen_parallel(
+        self,
+        audio: Path,
+        job_cache_dir: Path,
+        duration: float,
+    ) -> bool:
+        worker = QueueWorker([], self.mode, self.run_config)
+        self._parallel_qwen_worker = worker
+        worker.status.connect(self.status.emit)
+        pending_by_start: dict[float, tuple[dict[str, Any], list[SubtitleSegment]]] = {}
+        next_start = 0.0
+        completed = 0
+        total = max(1, math.ceil(duration / self.run_config.qwen_chunk_seconds))
+
+        def on_chunk_ready(task: dict[str, Any], segments: list[SubtitleSegment]) -> None:
+            nonlocal next_start, completed
+            start = float(task["start"])
+            pending_by_start[start] = (task, segments)
+            completed += 1
+            self.progress.emit(completed, total)
+            while next_start in pending_by_start:
+                ready_task, ready = pending_by_start.pop(next_start)
+                chunk_index = int(round(next_start / self.run_config.qwen_chunk_seconds))
+                save_segments(job_cache_dir / f"chunk-{chunk_index:04d}-raw.json", ready)
+                self._emit_incremental_segments(ready)
+                next_start += float(ready_task["duration"])
+
+        try:
+            replicas = (
+                self.run_config.qwen_replicas
+                if self.run_config.qwen_parallel_enabled
+                else 1
+            )
+            self.status.emit(
+                f"Controlled Qwen3-ASR parallel transcription: {replicas} replica(s), "
+                f"{self.run_config.qwen_chunk_seconds:.0f}s chunks"
+            )
+            worker._transcribe_local_qwen3_asr_chunked(audio, on_chunk_ready=on_chunk_ready)
+            return True
+        finally:
+            self._parallel_qwen_worker = None
+            _cleanup_temp_paths(worker._temp_paths)
 
     # ---- internal pipeline ----
 
@@ -2389,6 +2443,14 @@ class RollingPrefetchWorker(QObject):
             offset = 0.0
             chunk_index = 0
             rebuilt_raw_cache = False
+
+            if qwen3_asr_mode(self.mode) and self.run_config.qwen_parallel_enabled:
+                rebuilt_raw_cache = self._transcribe_local_qwen_parallel(
+                    audio,
+                    job_cache_dir,
+                    duration,
+                )
+                offset = duration
 
             while offset < duration and not self._stop:
                 remaining = min(self.chunk_seconds, duration - offset)

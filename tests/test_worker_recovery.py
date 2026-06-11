@@ -1,7 +1,9 @@
 import os
 import threading
 import time
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from whisper_captioner.models import MODES, SubtitleSegment
@@ -28,6 +30,58 @@ class WorkerRecoveryTest(unittest.TestCase):
 
         self.assertEqual([[segment.text for segment in batch] for batch in first], [["first"]])
         self.assertEqual([[segment.text for segment in batch] for batch in more], [["second"]])
+
+    def test_controlled_qwen_parallel_buffers_out_of_order_results(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        config = QueueRunConfig(
+            qwen_replicas=2,
+            qwen_chunk_seconds=45,
+            qwen_parallel_enabled=True,
+        )
+        worker = RollingPrefetchWorker(
+            "https://example.com/video",
+            mode,
+            run_config=config,
+        )
+        first = []
+        more = []
+        progress = []
+        worker.first_segments.connect(first.append)
+        worker.more_segments.connect(more.append)
+        worker.progress.connect(lambda done, total: progress.append((done, total)))
+
+        def fake_parallel(_queue_worker, _audio, on_chunk_ready=None):
+            tasks = [
+                ({"label": "1", "start": 45.0, "duration": 45.0}, "second"),
+                ({"label": "0", "start": 0.0, "duration": 45.0}, "first"),
+                ({"label": "2", "start": 90.0, "duration": 1.0}, "third"),
+            ]
+            for task, text in tasks:
+                on_chunk_ready(
+                    task,
+                    [SubtitleSegment(task["start"], task["start"] + 1, text)],
+                )
+            return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(
+                QueueWorker,
+                "_transcribe_local_qwen3_asr_chunked",
+                fake_parallel,
+            ):
+                rebuilt = worker._transcribe_local_qwen_parallel(
+                    Path(directory) / "audio.wav",
+                    Path(directory),
+                    91.0,
+                )
+
+        self.assertTrue(rebuilt)
+        self.assertEqual([[segment.text for segment in batch] for batch in first], [["first"]])
+        self.assertEqual(
+            [[segment.text for segment in batch] for batch in more],
+            [["second"], ["third"]],
+        )
+        self.assertEqual(progress[-1], (3, 3))
 
     def test_nuc_asr_turbo_and_quality_modes_select_distinct_models(self):
         turbo = next(mode for mode in MODES if mode.key == "nuc_asr_turbo")
