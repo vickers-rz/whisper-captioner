@@ -94,6 +94,7 @@ NUC_SSH_USER = os.environ.get("WHISPER_CAPTIONER_NUC_SSH_USER", "jack")
 NUC_SSH_PORT = os.environ.get("WHISPER_CAPTIONER_NUC_SSH_PORT", "22")
 NUC_REMOTE_ASR_ROOT = os.environ.get("WHISPER_CAPTIONER_NUC_ASR_ROOT", "/srv/qwen3-asr-1p7b")
 LOCAL_AUDIO_CACHE_DIR = CACHE_DIR / "local-audio"
+ASR_HISTORY_PATH = CACHE_DIR / "asr-history.json"
 
 MLX_TERMS_SCRIPT = Path(__file__).with_name("mlx_terms.py")
 
