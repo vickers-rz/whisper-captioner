@@ -61,6 +61,39 @@ def cache_slug(*parts: object) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+def _readable_media_id(url: str) -> str:
+    parsed = urlparse(canonical_media_url(url))
+    host = parsed.netloc.lower()
+    if "youtube.com" in host:
+        video_id = parse_qs(parsed.query).get("v", [""])[0]
+        if video_id:
+            return f"youtube-{video_id}"
+    if "bilibili.com" in host:
+        match = re.search(r"/video/([^/?#]+)", parsed.path)
+        if match:
+            page = parse_qs(parsed.query).get("p", [""])[0]
+            return f"bilibili-{match.group(1)}" + (f"-p{page}" if page else "")
+    host_label = re.sub(r"[^a-z0-9]+", "-", host).strip("-") or "media"
+    return host_label[:40]
+
+
+def _readable_model_id(model_name: str) -> str:
+    label = model_name.rsplit("/", 1)[-1]
+    label = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-._")
+    return (label or "model")[:60]
+
+
+def controlled_cache_dir_name(
+    url: str,
+    backend: str,
+    model_name: str,
+    chunk_seconds: int | float,
+) -> str:
+    canonical = canonical_media_url(url)
+    digest = cache_slug(canonical, backend, model_name, chunk_seconds)
+    return f"{_readable_media_id(canonical)}__{_readable_model_id(model_name)}__{digest}"
+
+
 def validate_url_for_yt_dlp(url: str) -> tuple[bool, str]:
     """
     Check if a URL is likely downloadable by yt-dlp (video/audio content).

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import subprocess
 import time
 import urllib.error
 import urllib.request
+import binascii
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +22,9 @@ from whisper_captioner.config import (
     RAPIDMLX_MODEL,
     RAPIDMLX_PORT,
     RAPIDMLX_SERVED_MODEL,
+    NUC_MAC_ADDRESS,
+    NUC_OLLAMA_HOST,
+    NUC_OLLAMA_PORT,
     OUTPUT_DIR,
 )
 from whisper_captioner.models import LLMProvider, SubtitleSegment
@@ -220,6 +225,47 @@ def llm_provider_ready(provider: LLMProvider, api_key: str) -> bool:
     return bool(provider and (api_key or not provider.requires_api_key))
 
 
+def wake_on_lan_nuc() -> None:
+    """Send the NUC magic packet to global and local-subnet broadcasts."""
+    mac = NUC_MAC_ADDRESS.replace(":", "").replace("-", "")
+    if len(mac) != 12:
+        raise ValueError(f"Invalid NUC MAC address: {NUC_MAC_ADDRESS}")
+    mac_bytes = binascii.unhexlify(mac)
+    magic_packet = b"\xff" * 6 + mac_bytes * 16
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for target in ("255.255.255.255", "192.168.31.255"):
+            sock.sendto(magic_packet, (target, 9))
+
+
+def _nuc_ollama_is_ready(timeout: float = 1.0) -> bool:
+    try:
+        with urllib.request.urlopen(
+            f"http://{NUC_OLLAMA_HOST}:{NUC_OLLAMA_PORT}/api/tags",
+            timeout=timeout,
+        ) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
+def ensure_nuc_ollama_ready(timeout: float = 120.0) -> None:
+    if _nuc_ollama_is_ready():
+        return
+    wake_on_lan_nuc()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _nuc_ollama_is_ready(timeout=2.0):
+            return
+        time.sleep(2.0)
+    raise TimeoutError(f"NUC Ollama did not become ready within {timeout:.0f}s after WOL")
+
+
+def _ensure_provider_ready(provider: LLMProvider) -> None:
+    if provider.key.startswith("nuc_ollama"):
+        ensure_nuc_ollama_ready()
+
+
 def _extract_llm_reply(data: dict, fmt: str) -> str:
     """Extract reply text from LLM response based on format."""
     if fmt == "anthropic":
@@ -251,6 +297,7 @@ def llm_proofread(
     """Send segment texts to an LLM for proofreading. Returns corrected segments."""
     if not segments:
         return segments
+    _ensure_provider_ready(provider)
     lines = [f"{i + 1}: {s.text}" for i, s in enumerate(segments)]
     user_text = "\n".join(lines)
 
@@ -280,6 +327,7 @@ def llm_generate_text(
     max_tokens: int = 16000,
 ) -> str:
     """Generate free-form text from a transcript or prompt."""
+    _ensure_provider_ready(provider)
     url, body, headers = _build_llm_call(
         provider,
         api_key,
@@ -307,6 +355,7 @@ def llm_fuse_with_reference(
     """Fuse whisper segments with reference subtitles using LLM."""
     if not whisper_segments or not reference_segments:
         return whisper_segments
+    _ensure_provider_ready(provider)
     lines = []
     for i, segment in enumerate(whisper_segments):
         refs = overlapping_segments(reference_segments, segment.start, segment.end)
@@ -338,25 +387,6 @@ def llm_fuse_with_reference(
     ]
 
 
-import socket
-import binascii
-
-def wake_on_lan_nuc():
-    """Send a Wake-on-LAN magic packet to the NUC."""
-    try:
-        from whisper_captioner.config import NUC_MAC_ADDRESS
-        mac = NUC_MAC_ADDRESS.replace(":", "").replace("-", "")
-        if len(mac) != 12:
-            return
-        mac_bytes = binascii.unhexlify(mac)
-        magic_packet = b"\xff" * 6 + mac_bytes * 16
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(magic_packet, ("255.255.255.255", 9))
-    except Exception:
-        pass
-
-
 def test_llm_connection(
     provider: LLMProvider,
     api_key: str,
@@ -364,10 +394,8 @@ def test_llm_connection(
     model_id_override: str = "",
 ) -> tuple[bool, str]:
     """Send a minimal request to verify API key and model."""
-    if provider.key.startswith("nuc_ollama"):
-        wake_on_lan_nuc()
-
     try:
+        _ensure_provider_ready(provider)
         url, body, headers = _build_llm_call(
             provider, api_key, "Hello", api_url_override, model_id_override,
             max_tokens=10,

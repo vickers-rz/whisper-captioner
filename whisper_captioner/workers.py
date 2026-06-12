@@ -30,7 +30,7 @@ from typing import Any, Optional
 from PySide6.QtCore import QObject, QThread, Signal
 
 from whisper_captioner.asr_history import ASRHistoryStore, audio_cache_key_for_url
-from whisper_captioner.cache import cache_slug, canonical_media_url
+from whisper_captioner.cache import cache_slug, canonical_media_url, controlled_cache_dir_name
 from whisper_captioner.config import (
     BUFFER_PAUSE_MARGIN,
     BUFFER_RESUME_MARGIN,
@@ -97,6 +97,7 @@ PROGRESS_LINE_RE = re.compile(r"\b(\d{1,3}(?:\.\d+)?)%")
 SILENCE_START_RE = re.compile(r"silence_start:\s*([0-9.]+)")
 SILENCE_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
 ADAPTIVE_SPLIT_MULTIPLIER = 1.5
+LOCAL_AUDIO_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -112,8 +113,8 @@ class QueueRunConfig:
     qwen_replicas: int = 2
     qwen_chunk_seconds: float = 45.0
     qwen_parallel_enabled: bool = True
-    adaptive_split_enabled: bool = False
-    remote_vad_enabled: bool = False
+    adaptive_split_enabled: bool = True
+    remote_vad_enabled: bool = True
     cpp_threads: int = 6
     cpp_flash_attn: bool = True
 
@@ -125,8 +126,8 @@ class QueueRunConfig:
                 10.0, float(os.environ.get("WHISPER_CAPTIONER_QWEN_CHUNK_SECONDS", "45"))
             ),
             "qwen_parallel_enabled": _env_bool("WHISPER_CAPTIONER_QWEN_PARALLEL", True),
-            "adaptive_split_enabled": _env_bool("WHISPER_CAPTIONER_ADAPTIVE_SPLIT", False),
-            "remote_vad_enabled": _env_bool("WHISPER_CAPTIONER_REMOTE_VAD", False),
+            "adaptive_split_enabled": _env_bool("WHISPER_CAPTIONER_ADAPTIVE_SPLIT", True),
+            "remote_vad_enabled": _env_bool("WHISPER_CAPTIONER_REMOTE_VAD", True),
             "cpp_threads": max(
                 1, min(8, int(os.environ.get("WHISPER_CAPTIONER_CPP_THREADS", "6")))
             ),
@@ -265,6 +266,158 @@ def _local_audio_cache_key(source: str) -> str:
 
 def local_audio_cache_dir_for_source(source: str) -> Path:
     return LOCAL_AUDIO_CACHE_DIR / _local_audio_cache_key(source)
+
+
+def url_audio_cache_dir(source: str) -> Path:
+    return LOCAL_AUDIO_CACHE_DIR / audio_cache_key_for_url(source)
+
+
+def _path_size(path: Path) -> int:
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    try:
+        children = list(path.iterdir())
+    except OSError:
+        return 0
+    for child in children:
+        total += _path_size(child)
+    return total
+
+
+def prune_local_audio_cache(
+    *,
+    max_bytes: int = LOCAL_AUDIO_CACHE_MAX_BYTES,
+    keep: Path | None = None,
+) -> list[Path]:
+    if not LOCAL_AUDIO_CACHE_DIR.exists():
+        return []
+    entries = [path for path in LOCAL_AUDIO_CACHE_DIR.iterdir() if path.is_dir()]
+    sizes = {path: _path_size(path) for path in entries}
+    total = sum(sizes.values())
+    if total <= max_bytes:
+        return []
+    keep_resolved = keep.resolve() if keep is not None else None
+    candidates = []
+    for path in entries:
+        if keep_resolved is not None and path.resolve() == keep_resolved:
+            continue
+        try:
+            last_used = path.stat().st_mtime
+        except OSError:
+            last_used = 0.0
+        candidates.append((last_used, path))
+    removed: list[Path] = []
+    for _last_used, path in sorted(candidates, key=lambda item: item[0]):
+        shutil.rmtree(path, ignore_errors=True)
+        total -= sizes[path]
+        removed.append(path)
+        if total <= max_bytes:
+            break
+    return removed
+
+
+def prepare_url_audio_cache(
+    source: str,
+    *,
+    run_command: Any,
+    status_signal: Signal,
+) -> Path:
+    cache_dir = url_audio_cache_dir(source)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    wav = cache_dir / "audio-16k-mono.wav"
+    meta_path = cache_dir / "metadata.json"
+    if wav.exists() and wav.stat().st_size > 0:
+        now = time.time()
+        os.utime(cache_dir, (now, now))
+        status_signal.emit(f"Reusing URL audio cache: {wav}")
+        return wav
+
+    token = uuid.uuid4().hex
+    downloaded_template = cache_dir / f".download-{token}.%(ext)s"
+    temp_wav = cache_dir / f".audio-{token}.wav"
+    try:
+        run_command(
+            [
+                YT_DLP,
+                "-x",
+                "--audio-format",
+                "wav",
+                "--cookies-from-browser",
+                "chrome",
+                "-o",
+                str(downloaded_template),
+                source,
+            ],
+            "Downloading URL audio cache",
+        )
+        candidates = sorted(cache_dir.glob(f".download-{token}.*"))
+        audio = next(
+            (path for path in candidates if path.suffix.lower() in {".wav", ".m4a", ".mp3", ".opus"}),
+            None,
+        )
+        if audio is None:
+            raise RuntimeError("yt-dlp did not produce an audio file")
+        run_command(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-y",
+                "-i",
+                str(audio),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(temp_wav),
+            ],
+            "Preparing URL audio cache",
+        )
+        temp_wav.replace(wav)
+        _write_json_local(
+            meta_path,
+            {
+                "kind": "url",
+                "source": source,
+                "identity": canonical_media_url(source),
+                "wav": str(wav),
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            },
+        )
+        now = time.time()
+        os.utime(cache_dir, (now, now))
+        removed = prune_local_audio_cache(keep=cache_dir)
+        if removed:
+            status_signal.emit(
+                f"Local audio cache exceeded 2 GiB; removed {len(removed)} oldest cache item(s)"
+            )
+        return wav
+    finally:
+        _safe_unlink(temp_wav)
+        for candidate in cache_dir.glob(f".download-{token}.*"):
+            _safe_unlink(candidate)
+
+
+def controlled_cache_dir(
+    url: str,
+    backend: str,
+    model_name: str,
+    chunk_seconds: int | float,
+) -> Path:
+    canonical = canonical_media_url(url)
+    readable = CACHE_DIR / controlled_cache_dir_name(
+        canonical,
+        backend,
+        model_name,
+        chunk_seconds,
+    )
+    legacy = CACHE_DIR / cache_slug(canonical, backend, model_name, chunk_seconds)
+    if legacy.exists() and not readable.exists():
+        legacy.rename(readable)
+    return readable
 
 
 def _write_json_local(path: Path, payload: Any) -> None:
@@ -1418,57 +1571,11 @@ class QueueWorker(QObject):
             if prepared_wav:
                 wav = prepared_wav
             elif source.startswith(("http://", "https://")):
-                downloaded = Path(tempfile.gettempdir()) / f"whisper-captioner-{stamp}.%(ext)s"
-                self._run(
-                    [
-                        YT_DLP,
-                        "-x",
-                        "--audio-format",
-                        "wav",
-                        "--cookies-from-browser",
-                        "chrome",
-                        "-o",
-                        str(downloaded),
-                        source,
-                    ],
-                    "Downloading audio",
+                wav = prepare_url_audio_cache(
+                    source,
+                    run_command=self._run,
+                    status_signal=self.status,
                 )
-                candidates = sorted(Path(tempfile.gettempdir()).glob(f"whisper-captioner-{stamp}.*"))
-                audio = next((p for p in candidates if p.suffix.lower() in {".wav", ".m4a", ".mp3", ".opus"}), None)
-                if audio is None:
-                    raise RuntimeError("yt-dlp did not produce an audio file")
-                for candidate in candidates:
-                    self._track_temp_path(candidate)
-                cache_dir = LOCAL_AUDIO_CACHE_DIR / audio_cache_key_for_url(source)
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                cached_wav = cache_dir / "audio-16k-mono.wav"
-                if not cached_wav.exists():
-                    self._run(
-                        [
-                            FFMPEG,
-                            "-hide_banner",
-                            "-y",
-                            "-i",
-                            str(audio),
-                            "-ac",
-                            "1",
-                            "-ar",
-                            "16000",
-                            str(cached_wav),
-                        ],
-                        "Preparing URL audio cache",
-                    )
-                _write_json_local(
-                    cache_dir / "metadata.json",
-                    {
-                        "kind": "url",
-                        "source": source,
-                        "identity": canonical_media_url(source),
-                        "wav": str(cached_wav),
-                        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    },
-                )
-                wav = cached_wav
             else:
                 wav = self._prepare_local_audio_cache(source)
 
@@ -1589,10 +1696,11 @@ class QueueWorker(QObject):
         self,
         wav: Path,
         on_chunk_ready: Callable[[dict[str, Any], list[SubtitleSegment]], None] | None = None,
+        tasks_override: list[dict[str, Any]] | None = None,
     ) -> list[SubtitleSegment]:
         duration = self._get_duration(wav)
         chunk_seconds = self.config.qwen_chunk_seconds
-        tasks = [
+        tasks = tasks_override or [
             {
                 "label": str(index),
                 "start": start,
@@ -1601,7 +1709,9 @@ class QueueWorker(QObject):
                 "split": False,
                 "attempt": 0,
             }
-            for index, start in enumerate(index * chunk_seconds for index in range(math.ceil(duration / chunk_seconds)))
+            for index, start in enumerate(
+                index * chunk_seconds for index in range(math.ceil(duration / chunk_seconds))
+            )
             if start < duration
         ]
         replicas = self.config.qwen_replicas if self.config.qwen_parallel_enabled else 1
@@ -1615,6 +1725,32 @@ class QueueWorker(QObject):
         done = 0
         total = len(tasks)
         splits = 0
+
+        def split_task(task: dict[str, Any]) -> None:
+            nonlocal total, splits
+            half = float(task["duration"]) / 2.0
+            pending.extend(
+                [
+                    {
+                        "label": f"{task['label']}a",
+                        "start": float(task["start"]),
+                        "duration": half,
+                        "root": False,
+                        "split": False,
+                        "attempt": 0,
+                    },
+                    {
+                        "label": f"{task['label']}b",
+                        "start": float(task["start"]) + half,
+                        "duration": float(task["duration"]) - half,
+                        "root": False,
+                        "split": False,
+                        "attempt": 0,
+                    },
+                ]
+            )
+            total += 1
+            splits += 1
 
         def submit(executor: ThreadPoolExecutor, task: dict[str, Any]) -> None:
             cancel_event = threading.Event()
@@ -1642,29 +1778,7 @@ class QueueWorker(QObject):
                         task["split"] = True
                         cancel_events[future].set()
                         _terminate_process(process_holders[future].get("proc"), timeout=1.0)
-                        half = task["duration"] / 2.0
-                        pending.extend(
-                            [
-                                {
-                                    "label": f"{task['label']}a",
-                                    "start": task["start"],
-                                    "duration": half,
-                                    "root": False,
-                                    "split": False,
-                                    "attempt": 0,
-                                },
-                                {
-                                    "label": f"{task['label']}b",
-                                    "start": task["start"] + half,
-                                    "duration": task["duration"] - half,
-                                    "root": False,
-                                    "split": False,
-                                    "attempt": 0,
-                                },
-                            ]
-                        )
-                        total += 1
-                        splits += 1
+                        split_task(task)
                         self.status.emit(
                             f"Adaptive split {task['label']} at {threshold:.1f}s into two child chunks"
                         )
@@ -1692,6 +1806,17 @@ class QueueWorker(QObject):
                                 f"Qwen3-ASR chunk {task['label']} failed; retrying once: {chunk_error}"
                             )
                             submit(executor, retry_task)
+                            continue
+                        if (
+                            self.config.adaptive_split_enabled
+                            and task.get("root", False)
+                            and float(task["duration"]) >= 20.0
+                        ):
+                            split_task(task)
+                            self.status.emit(
+                                f"Qwen3-ASR chunk {task['label']} failed after retry; "
+                                "falling back to two child chunks"
+                            )
                             continue
                         for event in cancel_events.values():
                             event.set()
@@ -1772,13 +1897,15 @@ class QueueWorker(QObject):
             "zh",
             "--chunk-duration",
             str(max(1, int(task["duration"]))),
+            "--max-tokens",
+            "512",
         ]
         output = self._run_chunk_command(
             cmd,
             f"Transcribing Qwen3-ASR chunk {label}",
             cancel_event,
             holder,
-            timeout=max(120.0, float(task["duration"]) * 20.0),
+            timeout=max(120.0, float(task["duration"]) * 4.0),
         )
         chunk_txt = chunk_out.with_suffix(".txt")
         chunk_text = (
@@ -2324,17 +2451,110 @@ class RollingPrefetchWorker(QObject):
         job_cache_dir: Path,
         duration: float,
     ) -> bool:
+        chunk_seconds = self.run_config.qwen_chunk_seconds
+        tasks = [
+            {
+                "label": str(index),
+                "start": start,
+                "duration": min(chunk_seconds, duration - start),
+                "root": True,
+                "split": False,
+                "attempt": 0,
+            }
+            for index, start in enumerate(
+                index * chunk_seconds for index in range(math.ceil(duration / chunk_seconds))
+            )
+            if start < duration
+        ]
+        _write_json_local(
+            job_cache_dir / "chunk-index.json",
+            {
+                "source_audio_wav": str(audio),
+                "chunk_seconds": chunk_seconds,
+                "duration_seconds": duration,
+                "chunks": [
+                    {
+                        "label": task["label"],
+                        "start_seconds": task["start"],
+                        "end_seconds": task["start"] + task["duration"],
+                        "duration_seconds": task["duration"],
+                        "cache_file": f"chunk-{int(task['label']):04d}-raw.json",
+                    }
+                    for task in tasks
+                ],
+            },
+        )
         worker = QueueWorker([], self.mode, self.run_config)
         self._parallel_qwen_worker = worker
         worker.status.connect(self.status.emit)
-        worker.chunk_progress.connect(
-            lambda snapshot: self.progress.emit(
-                int(snapshot.get("done", 0)),
-                int(snapshot.get("total", 0)),
-            )
-        )
         pending_by_start: dict[float, tuple[dict[str, Any], list[SubtitleSegment]]] = {}
         next_start = 0.0
+        cached_count = 0
+        missing_tasks: list[dict[str, Any]] = []
+
+        for task in tasks:
+            cache_path = job_cache_dir / f"chunk-{int(task['label']):04d}-raw.json"
+            if cache_path.exists():
+                try:
+                    cached_segments = load_segments(cache_path)
+                except Exception as exc:
+                    self.status.emit(f"Chunk {task['label']}: invalid Qwen cache; rebuilding: {exc}")
+                    cache_path.unlink(missing_ok=True)
+                    missing_tasks.append(task)
+                    continue
+                pending_by_start[float(task["start"])] = (task, cached_segments)
+                cached_count += 1
+                self.status.emit(f"Chunk {task['label']}: loaded Qwen cache")
+                continue
+
+            half = float(task["duration"]) / 2.0
+            child_tasks = [
+                {
+                    "label": f"{task['label']}a",
+                    "start": float(task["start"]),
+                    "duration": half,
+                    "root": False,
+                    "split": False,
+                    "attempt": 0,
+                },
+                {
+                    "label": f"{task['label']}b",
+                    "start": float(task["start"]) + half,
+                    "duration": float(task["duration"]) - half,
+                    "root": False,
+                    "split": False,
+                    "attempt": 0,
+                },
+            ]
+            child_paths = [
+                job_cache_dir / f"chunk-{child['label']}-raw.json" for child in child_tasks
+            ]
+            if not any(path.exists() for path in child_paths):
+                missing_tasks.append(task)
+                continue
+            for child, child_path in zip(child_tasks, child_paths):
+                if not child_path.exists():
+                    missing_tasks.append(child)
+                    continue
+                try:
+                    cached_segments = load_segments(child_path)
+                except Exception as exc:
+                    self.status.emit(
+                        f"Chunk {child['label']}: invalid split cache; rebuilding: {exc}"
+                    )
+                    child_path.unlink(missing_ok=True)
+                    missing_tasks.append(child)
+                    continue
+                pending_by_start[float(child["start"])] = (child, cached_segments)
+                cached_count += 1
+                self.status.emit(f"Chunk {child['label']}: loaded split Qwen cache")
+
+        worker.chunk_progress.connect(
+            lambda snapshot: self.progress.emit(
+                cached_count + int(snapshot.get("done", 0)),
+                cached_count + int(snapshot.get("total", 0)),
+            )
+        )
 
         def on_chunk_ready(task: dict[str, Any], segments: list[SubtitleSegment]) -> None:
             nonlocal next_start
@@ -2349,6 +2569,15 @@ class RollingPrefetchWorker(QObject):
                 next_start += float(ready_task["duration"])
 
         try:
+            while next_start in pending_by_start:
+                ready_task, ready = pending_by_start.pop(next_start)
+                self._emit_incremental_segments(ready)
+                next_start += float(ready_task["duration"])
+            self.progress.emit(cached_count, len(tasks))
+            if not missing_tasks:
+                self.status.emit(f"Loaded all {cached_count} Qwen3-ASR chunks from cache")
+                return False
+
             replicas = (
                 self.run_config.qwen_replicas
                 if self.run_config.qwen_parallel_enabled
@@ -2356,9 +2585,14 @@ class RollingPrefetchWorker(QObject):
             )
             self.status.emit(
                 f"Controlled Qwen3-ASR parallel transcription: {replicas} replica(s), "
-                f"{self.run_config.qwen_chunk_seconds:.0f}s chunks"
+                f"{self.run_config.qwen_chunk_seconds:.0f}s chunks; "
+                f"{cached_count} cached, {len(missing_tasks)} pending"
             )
-            worker._transcribe_local_qwen3_asr_chunked(audio, on_chunk_ready=on_chunk_ready)
+            worker._transcribe_local_qwen3_asr_chunked(
+                audio,
+                on_chunk_ready=on_chunk_ready,
+                tasks_override=missing_tasks,
+            )
             return True
         finally:
             self._parallel_qwen_worker = None
@@ -2375,8 +2609,12 @@ class RollingPrefetchWorker(QObject):
 
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             self.cache_url = canonical_media_url(self.url)
-            job_key = cache_slug(self.cache_url, self.mode.backend, self.mode.model_name, self.chunk_seconds)
-            job_cache_dir = CACHE_DIR / job_key
+            job_cache_dir = controlled_cache_dir(
+                self.cache_url,
+                self.mode.backend,
+                self.mode.model_name,
+                self.chunk_seconds,
+            )
             job_cache_dir.mkdir(parents=True, exist_ok=True)
             manifest = {
                 "url": self.url,
@@ -2425,6 +2663,12 @@ class RollingPrefetchWorker(QObject):
             if cached_segments is not None:
                 try:
                     self.status.emit(f"Loaded final subtitle cache: {final_cache}")
+                    raw_segments = self._load_all_raw_segments(job_cache_dir)
+                    if raw_segments:
+                        self._export_subtitles(raw_segments, raw_output_base)
+                        self.status.emit(
+                            f"Raw subtitles written: {raw_output_base.with_suffix('.srt')}"
+                        )
                     self._export_final_subtitles(cached_segments, output_base)
                     self.first_segments.emit(cached_segments)
                     self.all_done.emit()
@@ -2432,31 +2676,34 @@ class RollingPrefetchWorker(QObject):
                 except Exception as exc:
                     self.status.emit(f"Final subtitle cache unreadable, rebuilding: {exc}")
 
-            # 2. Download full audio
-            downloaded = Path(tempfile.gettempdir()) / f"whisper-rolling-{stamp}.%(ext)s"
-            self._run_cmd(
-                [
-                    YT_DLP,
-                    "-x",
-                    "--audio-format",
-                    "wav",
-                    "--cookies-from-browser",
-                    "chrome",
-                    "-o",
-                    str(downloaded),
-                    self.url,
-                ],
-                "Downloading video audio",
+            # 2. Reuse or build the persistent URL audio cache.
+            audio = prepare_url_audio_cache(
+                self.url,
+                run_command=self._run_cmd,
+                status_signal=self.status,
             )
-            candidates = sorted(Path(tempfile.gettempdir()).glob(f"whisper-rolling-{stamp}.*"))
-            audio = next(
-                (p for p in candidates if p.suffix.lower() in {".wav", ".m4a", ".mp3", ".opus"}),
-                None,
+            audio_link = job_cache_dir / "source-audio.wav"
+            audio_link.unlink(missing_ok=True)
+            try:
+                audio_link.symlink_to(audio)
+            except OSError:
+                pass
+            _write_json_local(
+                job_cache_dir / "source-info.json",
+                {
+                    "url": self.url,
+                    "canonical_url": self.cache_url,
+                    "audio_cache_wav": str(audio),
+                    "backend": self.mode.backend,
+                    "model": self.mode.model_name,
+                    "pipeline_chunk_seconds": self.chunk_seconds,
+                    "asr_chunk_seconds": (
+                        self.run_config.qwen_chunk_seconds
+                        if qwen3_asr_mode(self.mode)
+                        else self.chunk_seconds
+                    ),
+                },
             )
-            if audio is None:
-                raise RuntimeError("yt-dlp did not produce an audio file")
-            for candidate in candidates:
-                self._track_temp_path(candidate)
             if self._stop:
                 return
 
@@ -2957,7 +3204,7 @@ class RollingPrefetchWorker(QObject):
 
     def _raw_output_base(self, stamp: str) -> Path:
         title = clean_title_for_filename(self._source_title())
-        return source_output_dir(GENERATED_DIR, title) / f"{title}-{self._output_variant_suffix()}-原始识别字幕"
+        return source_output_dir(GENERATED_DIR, title) / f"{title}-{self._asr_output_suffix()}-原始识别字幕"
 
     def _optimized_output_base(self, stamp: str) -> Path:
         title = clean_title_for_filename(self._source_title())
@@ -2968,15 +3215,16 @@ class RollingPrefetchWorker(QObject):
         return source_output_dir(GENERATED_DIR, title) / f"{title}-视频原生中文字幕"
 
     def _output_variant_suffix(self) -> str:
-        parts = [clean_title_for_filename(self.mode.key, fallback="mode")]
+        parts = [self._asr_output_suffix()]
         if self.llm_provider:
             parts.append(clean_title_for_filename(self.llm_provider.key, fallback="llm"))
             model_name = self.llm_model_id or self.llm_provider.model_id
             if model_name:
                 parts.append(clean_title_for_filename(model_name, fallback="model"))
-        else:
-            parts.append("raw")
         return "-".join(parts)
+
+    def _asr_output_suffix(self) -> str:
+        return clean_title_for_filename(self.mode.key, fallback="mode")
 
     def _source_title(self) -> str:
         title = self._fetch_remote_title() if self.url.startswith(("http://", "https://")) else ""
@@ -3043,8 +3291,8 @@ class RollingPrefetchWorker(QObject):
                     f"Full-document LLM polish cached ({time.monotonic() - t0:.1f}s)"
                 )
             else:
-                polished = all_segments
                 self.status.emit("No LLM provider/API key configured; exporting raw Whisper subtitles")
+                return all_segments
             if polished:
                 self._save_current_final_cache(self._final_subtitle_cache_path(job_cache_dir), polished)
                 self.status.emit("Updated final subtitle cache for current pipeline")
@@ -3052,9 +3300,6 @@ class RollingPrefetchWorker(QObject):
             return polished
         except Exception as exc:
             self.status.emit(f"Full-document LLM polish failed: {exc}; exporting raw Whisper subtitles")
-            if all_segments:
-                self._save_current_final_cache(self._final_subtitle_cache_path(job_cache_dir), all_segments)
-                self._export_final_subtitles(all_segments, output_base)
             return all_segments
 
     def _load_or_fetch_native_subtitles(self, job_cache_dir: Path) -> tuple[list[SubtitleSegment], str]:

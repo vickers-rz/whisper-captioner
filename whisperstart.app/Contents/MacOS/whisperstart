@@ -8,7 +8,7 @@ LAUNCH_LOG_DIR="$HOME/Library/Logs/WhisperCaptioner"
 LOG_FILE="$LAUNCH_LOG_DIR/whisperstart-launch.log"
 
 export PATH="/opt/homebrew/bin:/Users/vickers/miniforge3/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-export HF_HOME="${WHISPER_CAPTIONER_HF_HOME:-/Volumes/T7/MacBackup/Movies/whisper-captioner_APP_Resource/huggingface-cache}"
+export HF_HOME="${WHISPER_CAPTIONER_HF_HOME:-/Volumes/T7_APFS/MacBackup/Movies/whisper-captioner_APP_Resource/huggingface-cache}"
 export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
 export TRANSFORMERS_CACHE="$HF_HOME/transformers"
 

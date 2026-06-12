@@ -29,7 +29,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from whisper_captioner.cache import cache_slug, canonical_media_url, validate_url_for_yt_dlp
+from whisper_captioner.cache import (
+    canonical_media_url,
+    controlled_cache_dir_name,
+    validate_url_for_yt_dlp,
+)
 from whisper_captioner.asr_history import ASRHistoryEntry, ASRHistoryStore
 from whisper_captioner.chaptering import (
     VideoChapter,
@@ -292,10 +296,10 @@ class MainWindow(QMainWindow):
             settings.value("asr/qwen_chunk_seconds", 45, type=int)
         )
         self.adaptive_split_checkbox.setChecked(
-            settings.value("asr/adaptive_split_enabled", False, type=bool)
+            settings.value("asr/adaptive_split_enabled", True, type=bool)
         )
         self.remote_vad_checkbox.setChecked(
-            settings.value("asr/remote_vad_enabled", False, type=bool)
+            settings.value("asr/remote_vad_enabled", True, type=bool)
         )
         self.cpp_threads_spin.setValue(settings.value("asr/cpp_threads", 6, type=int))
         self.cpp_flash_attn_checkbox.setChecked(
@@ -883,8 +887,12 @@ class MainWindow(QMainWindow):
             return self._controlled_cache_dir
         mode = self.current_mode()
         canonical = canonical_media_url(source)
-        job_key = cache_slug(canonical, mode.backend, mode.model_name, 30)
-        return CACHE_DIR / job_key
+        return CACHE_DIR / controlled_cache_dir_name(
+            canonical,
+            mode.backend,
+            mode.model_name,
+            30,
+        )
 
     def _resolved_local_audio_cache_dir(self) -> Optional[Path]:
         source = self.url_input.text().strip()
@@ -1792,8 +1800,12 @@ class MainWindow(QMainWindow):
         self._controlled_url = canonical_media_url(source)
         self._chapter_target_srt = None
         self._update_chapter_button()
-        job_key = cache_slug(self._controlled_url, mode.backend, mode.model_name, 30)
-        self._controlled_cache_dir = CACHE_DIR / job_key
+        self._controlled_cache_dir = CACHE_DIR / controlled_cache_dir_name(
+            self._controlled_url,
+            mode.backend,
+            mode.model_name,
+            30,
+        )
         self.video_chapters = []
         self.chapters_list.clear()
         self.overlay.clear_chapters()

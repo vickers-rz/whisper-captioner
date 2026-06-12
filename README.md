@@ -328,7 +328,9 @@ path migration. Deleting a history row never deletes its WAV, subtitle cache, or
 Recovered Qwen3-ASR controls include 1-4 local process replicas, a default `45s` root chunk,
 one-level adaptive splitting (`max(10.0, fastest_of_first_3 * 1.5)`), and FFmpeg remote-chunk
 VAD (`-35dB`, `0.3s`). Two-replica local Qwen processing is enabled by default after machine
-acceptance; adaptive splitting and remote VAD remain disabled by default.
+acceptance; adaptive splitting and remote VAD are enabled by default. A root chunk that still
+fails after one retry is split once even before a timing baseline is available, and split-child
+caches are resumed independently.
 
 Environment variables override `QSettings`:
 
@@ -336,8 +338,8 @@ Environment variables override `QSettings`:
 WHISPER_CAPTIONER_QWEN_PARALLEL=1
 WHISPER_CAPTIONER_QWEN_REPLICAS=2
 WHISPER_CAPTIONER_QWEN_CHUNK_SECONDS=45
-WHISPER_CAPTIONER_ADAPTIVE_SPLIT=0
-WHISPER_CAPTIONER_REMOTE_VAD=0
+WHISPER_CAPTIONER_ADAPTIVE_SPLIT=1
+WHISPER_CAPTIONER_REMOTE_VAD=1
 ```
 
 Current large-file local-file flow for `NUC Qwen3-ASR 1.7B`:

@@ -12,11 +12,43 @@ from whisper_captioner.workers import (
     QueueWorker,
     RollingPrefetchWorker,
     _nuc_asr_model_for_mode,
+    controlled_cache_dir,
     parse_silencedetect_voice_window,
+    prepare_url_audio_cache,
+    prune_local_audio_cache,
 )
+from whisper_captioner.cache import controlled_cache_dir_name
 
 
 class WorkerRecoveryTest(unittest.TestCase):
+    def test_controlled_cache_name_is_human_readable_and_stable(self):
+        name = controlled_cache_dir_name(
+            "https://youtu.be/J5r17YdAmqY?t=12",
+            "mlx_audio",
+            "mlx-community/Qwen3-ASR-0.6B-4bit",
+            30,
+        )
+        self.assertTrue(name.startswith("youtube-J5r17YdAmqY__Qwen3-ASR-0.6B-4bit__"))
+        self.assertEqual(len(name.rsplit("__", 1)[-1]), 24)
+
+    def test_controlled_cache_dir_migrates_legacy_hash_directory(self):
+        url = "https://www.youtube.com/watch?v=J5r17YdAmqY"
+        backend = "mlx_audio"
+        model = "mlx-community/Qwen3-ASR-0.6B-4bit"
+        from whisper_captioner.cache import cache_slug, canonical_media_url
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / cache_slug(canonical_media_url(url), backend, model, 30)
+            legacy.mkdir()
+            (legacy / "chunk-0000-raw.json").write_text("[]", encoding="utf-8")
+            with patch("whisper_captioner.workers.CACHE_DIR", root):
+                migrated = controlled_cache_dir(url, backend, model, 30)
+
+            self.assertFalse(legacy.exists())
+            self.assertTrue((migrated / "chunk-0000-raw.json").exists())
+            self.assertIn("youtube-J5r17YdAmqY", migrated.name)
+
     def test_rolling_worker_emits_first_chunk_then_appends(self):
         mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
         worker = RollingPrefetchWorker("https://example.com/video", mode)
@@ -79,6 +111,66 @@ class WorkerRecoveryTest(unittest.TestCase):
         self.assertEqual(emitted[0][0], segments)
         self.assertIn("已下载、保存并载入", emitted[0][1])
 
+    def test_raw_and_polished_outputs_use_distinct_model_suffixes(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        from whisper_captioner.models import LLM_PROVIDERS
+
+        provider = next(
+            item for item in LLM_PROVIDERS if item.key == "nuc_ollama_gemma4"
+        )
+        worker = RollingPrefetchWorker(
+            "https://example.com/video",
+            mode,
+            llm_provider=provider,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("whisper_captioner.workers.GENERATED_DIR", Path(directory)),
+            patch.object(worker, "_source_title", return_value="测试视频"),
+        ):
+            raw_name = worker._raw_output_base("unused").name
+            polished_name = worker._optimized_output_base("unused").name
+
+        self.assertEqual(
+            raw_name,
+            "测试视频-qwen3_asr_06b_4bit_mlx-原始识别字幕",
+        )
+        self.assertEqual(
+            polished_name,
+            "测试视频-qwen3_asr_06b_4bit_mlx-nuc_ollama_gemma4-gemma4_latest-LLM优化字幕",
+        )
+
+    def test_failed_polish_does_not_export_fake_optimized_subtitles(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        from whisper_captioner.models import LLM_PROVIDERS
+        from whisper_captioner.subtitle_io import save_segments
+
+        provider = next(
+            item for item in LLM_PROVIDERS if item.key == "nuc_ollama_gemma4"
+        )
+        worker = RollingPrefetchWorker(
+            "https://example.com/video",
+            mode,
+            llm_provider=provider,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            save_segments(
+                root / "chunk-0000-raw.json",
+                [SubtitleSegment(0, 1, "原始文本")],
+            )
+            output_base = root / "LLM优化字幕"
+            with patch(
+                "whisper_captioner.workers.llm_proofread",
+                side_effect=TimeoutError("offline"),
+            ):
+                result = worker._run_full_document_polish(root, output_base)
+
+            self.assertEqual(result[0].text, "原始文本")
+            self.assertFalse(output_base.with_suffix(".srt").exists())
+            self.assertFalse(output_base.with_suffix(".txt").exists())
+            self.assertFalse(worker._final_subtitle_cache_path(root).exists())
+
     def test_controlled_qwen_parallel_buffers_out_of_order_results(self):
         mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
         config = QueueRunConfig(
@@ -98,7 +190,7 @@ class WorkerRecoveryTest(unittest.TestCase):
         worker.more_segments.connect(more.append)
         worker.progress.connect(lambda done, total: progress.append((done, total)))
 
-        def fake_parallel(_queue_worker, _audio, on_chunk_ready=None):
+        def fake_parallel(_queue_worker, _audio, on_chunk_ready=None, **_kwargs):
             tasks = [
                 ({"label": "1", "start": 45.0, "duration": 45.0}, "second"),
                 ({"label": "0", "start": 0.0, "duration": 45.0}, "first"),
@@ -131,6 +223,9 @@ class WorkerRecoveryTest(unittest.TestCase):
                     Path(directory),
                     91.0,
                 )
+            chunk_index = __import__("json").loads(
+                (Path(directory) / "chunk-index.json").read_text(encoding="utf-8")
+            )
 
         self.assertTrue(rebuilt)
         self.assertEqual([[segment.text for segment in batch] for batch in first], [["first"]])
@@ -139,6 +234,8 @@ class WorkerRecoveryTest(unittest.TestCase):
             [["second"], ["third"]],
         )
         self.assertEqual(progress[-1], (3, 3))
+        self.assertEqual(chunk_index["chunks"][1]["start_seconds"], 45.0)
+        self.assertEqual(chunk_index["chunks"][1]["cache_file"], "chunk-0001-raw.json")
 
     def test_controlled_qwen_parallel_forwards_dynamic_split_total(self):
         mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
@@ -150,7 +247,7 @@ class WorkerRecoveryTest(unittest.TestCase):
         progress = []
         worker.progress.connect(lambda done, total: progress.append((done, total)))
 
-        def fake_parallel(_queue_worker, _audio, on_chunk_ready=None):
+        def fake_parallel(_queue_worker, _audio, on_chunk_ready=None, **_kwargs):
             child_tasks = [
                 {"label": "0a", "start": 0.0, "duration": 22.5},
                 {"label": "0b", "start": 22.5, "duration": 22.5},
@@ -186,6 +283,152 @@ class WorkerRecoveryTest(unittest.TestCase):
 
         self.assertEqual(progress[-1], (2, 2))
         self.assertEqual(raw_names, ["chunk-0a-raw.json", "chunk-0b-raw.json"])
+
+    def test_controlled_qwen_parallel_only_runs_missing_chunks(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        worker = RollingPrefetchWorker(
+            "https://example.com/video",
+            mode,
+            run_config=QueueRunConfig(qwen_replicas=2, qwen_chunk_seconds=45),
+        )
+        emitted = []
+        worker.first_segments.connect(
+            lambda segments: emitted.extend(segment.text for segment in segments)
+        )
+        worker.more_segments.connect(
+            lambda segments: emitted.extend(segment.text for segment in segments)
+        )
+        received_tasks = []
+
+        def fake_parallel(_queue_worker, _audio, on_chunk_ready=None, tasks_override=None):
+            received_tasks.extend(task["label"] for task in tasks_override or [])
+            for task in tasks_override or []:
+                on_chunk_ready(
+                    task,
+                    [SubtitleSegment(task["start"], task["start"] + 1, f"new-{task['label']}")],
+                )
+            return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index in (0, 2):
+                start = index * 45.0
+                from whisper_captioner.subtitle_io import save_segments
+
+                save_segments(
+                    root / f"chunk-{index:04d}-raw.json",
+                    [SubtitleSegment(start, start + 1, f"cached-{index}")],
+                )
+            with patch.object(
+                QueueWorker,
+                "_transcribe_local_qwen3_asr_chunked",
+                fake_parallel,
+            ):
+                rebuilt = worker._transcribe_local_qwen_parallel(
+                    root / "audio.wav",
+                    root,
+                    135.0,
+                )
+
+        self.assertTrue(rebuilt)
+        self.assertEqual(received_tasks, ["1"])
+        self.assertEqual(emitted, ["cached-0", "new-1", "cached-2"])
+
+    def test_controlled_qwen_parallel_resumes_split_child_caches(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        worker = RollingPrefetchWorker(
+            "https://example.com/video",
+            mode,
+            run_config=QueueRunConfig(qwen_replicas=2, qwen_chunk_seconds=45),
+        )
+        emitted = []
+        worker.first_segments.connect(
+            lambda segments: emitted.extend(segment.text for segment in segments)
+        )
+        worker.more_segments.connect(
+            lambda segments: emitted.extend(segment.text for segment in segments)
+        )
+        received_tasks = []
+
+        def fake_parallel(_queue_worker, _audio, on_chunk_ready=None, tasks_override=None):
+            received_tasks.extend(task["label"] for task in tasks_override or [])
+            for task in tasks_override or []:
+                on_chunk_ready(
+                    task,
+                    [SubtitleSegment(task["start"], task["start"] + 1, f"new-{task['label']}")],
+                )
+            return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            from whisper_captioner.subtitle_io import save_segments
+
+            save_segments(
+                root / "chunk-0a-raw.json",
+                [SubtitleSegment(0, 1, "cached-0a")],
+            )
+            with patch.object(
+                QueueWorker,
+                "_transcribe_local_qwen3_asr_chunked",
+                fake_parallel,
+            ):
+                worker._transcribe_local_qwen_parallel(
+                    root / "audio.wav",
+                    root,
+                    45.0,
+                )
+
+        self.assertEqual(received_tasks, ["0b"])
+        self.assertEqual(emitted, ["cached-0a", "new-0b"])
+
+    def test_prepare_url_audio_cache_reuses_existing_wav(self):
+        class Status:
+            def __init__(self):
+                self.messages = []
+
+            def emit(self, message):
+                self.messages.append(message)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache_dir = root / "url-cache"
+            cache_dir.mkdir()
+            wav = cache_dir / "audio-16k-mono.wav"
+            wav.write_bytes(b"cached")
+            status = Status()
+            with (
+                patch("whisper_captioner.workers.url_audio_cache_dir", return_value=cache_dir),
+                patch("whisper_captioner.workers.prune_local_audio_cache"),
+            ):
+                result = prepare_url_audio_cache(
+                    "https://example.com/video",
+                    run_command=lambda *_args: self.fail("download should not run"),
+                    status_signal=status,
+                )
+
+        self.assertEqual(result, wav)
+        self.assertIn("Reusing URL audio cache", status.messages[-1])
+
+    def test_prune_local_audio_cache_removes_oldest_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            oldest = root / "oldest"
+            newest = root / "newest"
+            keep = root / "keep"
+            for path, size, timestamp in (
+                (oldest, 6, 10),
+                (newest, 6, 20),
+                (keep, 6, 30),
+            ):
+                path.mkdir()
+                (path / "audio.wav").write_bytes(b"x" * size)
+                os.utime(path, (timestamp, timestamp))
+            with patch("whisper_captioner.workers.LOCAL_AUDIO_CACHE_DIR", root):
+                removed = prune_local_audio_cache(max_bytes=12, keep=keep)
+            self.assertEqual(removed, [oldest])
+            self.assertFalse(oldest.exists())
+            self.assertTrue(newest.exists())
+            self.assertTrue(keep.exists())
 
     def test_nuc_asr_turbo_and_quality_modes_select_distinct_models(self):
         turbo = next(mode for mode in MODES if mode.key == "nuc_asr_turbo")
@@ -237,6 +480,12 @@ class WorkerRecoveryTest(unittest.TestCase):
         self.assertTrue(config.adaptive_split_enabled)
         self.assertEqual(config.cpp_threads, 8)
         self.assertFalse(config.cpp_flash_attn)
+
+    def test_recovery_features_are_enabled_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = QueueRunConfig.from_environment()
+        self.assertTrue(config.adaptive_split_enabled)
+        self.assertTrue(config.remote_vad_enabled)
 
     def test_cpp_runtime_args_use_selected_threads_and_flash_attention(self):
         enabled = QueueRunConfig(cpp_threads=6, cpp_flash_attn=True)
