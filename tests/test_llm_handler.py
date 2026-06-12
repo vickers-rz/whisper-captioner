@@ -5,6 +5,7 @@ from whisper_captioner.llm_handler import (
     _gemini_native_proofread,
     ensure_nuc_ollama_ready,
     llm_proofread,
+    test_llm_connection,
     wake_on_lan_nuc,
 )
 from whisper_captioner.models import LLM_PROVIDERS, SubtitleSegment, resolved_llm_api_key
@@ -67,6 +68,43 @@ class LLMHandlerTest(unittest.TestCase):
 
         ready.assert_called_once_with()
         self.assertEqual(result[0].text, "修正文本")
+
+    def test_local_ollama_provider_uses_nothink_chat_request(self):
+        provider = next(
+            item for item in LLM_PROVIDERS if item.key == "local_ollama_qwen35_4b"
+        )
+        response = '{"message":{"content":"1: 修正文本"},"eval_count":4,"eval_duration":1000000000}'
+        with patch(
+            "whisper_captioner.llm_handler._llm_request",
+            return_value=response,
+        ) as request:
+            result = llm_proofread(
+                [SubtitleSegment(0, 1, "原始文本")],
+                provider,
+                "",
+                max_tokens=64,
+            )
+
+        body = request.call_args.args[1]
+        self.assertFalse(body["think"])
+        self.assertFalse(body["stream"])
+        self.assertEqual(body["model"], "qwen3.5:4b")
+        self.assertEqual(body["options"]["num_predict"], 64)
+        self.assertEqual(result[0].text, "修正文本")
+
+    def test_local_ollama_connection_allows_cold_start(self):
+        provider = next(
+            item for item in LLM_PROVIDERS if item.key == "local_ollama_qwen35_4b"
+        )
+        with patch(
+            "whisper_captioner.llm_handler._llm_request",
+            return_value='{"message":{"content":"OK"}}',
+        ) as request:
+            ok, message = test_llm_connection(provider, "")
+
+        self.assertTrue(ok)
+        self.assertIn("successful", message)
+        self.assertEqual(request.call_args.kwargs["timeout"], 60)
 
     def test_gemini_native_honors_timeout_and_output_limit(self):
         response = MagicMock()

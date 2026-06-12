@@ -239,6 +239,14 @@ LLM_PROVIDERS = [
         False,
     ),
     LLMProvider(
+        "local_ollama_qwen35_4b",
+        "Local Ollama Qwen3.5-4B",
+        "http://127.0.0.1:11434/api/chat",
+        "qwen3.5:4b",
+        "ollama",
+        False,
+    ),
+    LLMProvider(
         "nuc_ollama_8b",
         "NUC Ollama Qwen3-8B",
         f"http://{NUC_OLLAMA_HOST}:{NUC_OLLAMA_PORT}/api/chat",

@@ -559,7 +559,12 @@ def test_llm_connection(
             provider, api_key, "Hello", api_url_override, model_id_override,
             max_tokens=10,
         )
-        timeout = 120 if provider.key == "nuc_ollama_gemma4" else 15
+        if provider.key == "nuc_ollama_gemma4":
+            timeout = 120
+        elif provider.key == "local_ollama_qwen35_4b":
+            timeout = 60
+        else:
+            timeout = 15
         raw = _llm_request(url, body, headers, timeout=timeout)
         json.loads(raw)
         return True, "Connection successful ✓"

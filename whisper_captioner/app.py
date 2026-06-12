@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import unquote, urlparse
 
-from PySide6.QtCore import QSettings, QThread, QTimer, Qt
+from PySide6.QtCore import QSettings, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -129,6 +129,33 @@ LOG_LEVELS = {
     "trace": 3,
 }
 
+
+class LLMConnectionTestThread(QThread):
+    result = Signal(bool, str)
+
+    def __init__(
+        self,
+        provider,
+        api_key: str,
+        api_url_override: str,
+        model_id_override: str,
+    ) -> None:
+        super().__init__()
+        self.provider = provider
+        self.api_key = api_key
+        self.api_url_override = api_url_override
+        self.model_id_override = model_id_override
+
+    def run(self) -> None:
+        ok, message = test_llm_connection(
+            self.provider,
+            self.api_key,
+            self.api_url_override,
+            self.model_id_override,
+        )
+        self.result.emit(ok, message)
+
+
 class MainWindow(QMainWindow):
     """
     应用程序主窗口类
@@ -156,6 +183,7 @@ class MainWindow(QMainWindow):
         self.controlled_worker: Optional[RollingPrefetchWorker] = None
         self.llm_text_thread: Optional[QThread] = None
         self.llm_text_worker: Optional[LLMTextWorker] = None
+        self.llm_test_thread: Optional[LLMConnectionTestThread] = None
         self.controlled_segments: list[SubtitleSegment] = []
         self.video_chapters: list[VideoChapter] = []
         self._chapter_target_srt: Optional[Path] = None
@@ -428,6 +456,8 @@ class MainWindow(QMainWindow):
         self._write_log_line("normal", f"Log level set to {key}")
 
     def _test_llm(self) -> None:
+        if self.llm_test_thread and self.llm_test_thread.isRunning():
+            return
         self._save_current_llm_key()
         key = self.llm_provider_combo.currentData()
         provider = next(p for p in LLM_PROVIDERS if p.key == key)
@@ -441,7 +471,17 @@ class MainWindow(QMainWindow):
         url_override = self.llm_custom_url_input.text().strip() if key == "custom" else ""
         model_override = self.llm_custom_model_input.text().strip() if key == "custom" else ""
 
-        ok, msg = test_llm_connection(provider, api_key, url_override, model_override)
+        self.llm_test_thread = LLMConnectionTestThread(
+            provider,
+            api_key,
+            url_override,
+            model_override,
+        )
+        self.llm_test_thread.result.connect(self._handle_llm_test_result)
+        self.llm_test_thread.finished.connect(self._clear_llm_test_thread)
+        self.llm_test_thread.start()
+
+    def _handle_llm_test_result(self, ok: bool, msg: str) -> None:
         if ok:
             QMessageBox.information(self, "测试", msg)
             self.log("LLM API test passed.")
@@ -449,6 +489,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "测试失败", msg)
             self.log(f"LLM API test failed: {msg}")
         self.llm_test_button.setEnabled(True)
+
+    def _clear_llm_test_thread(self) -> None:
+        if self.llm_test_thread:
+            self.llm_test_thread.deleteLater()
+        self.llm_test_thread = None
 
     def start_qwen_chat_service(self) -> None:
         try:
@@ -1360,6 +1405,7 @@ class MainWindow(QMainWindow):
                 self.queue_thread,
                 self.controlled_thread,
                 self.llm_text_thread,
+                self.llm_test_thread,
             )
             if thread is not None and thread.isRunning()
         ]

@@ -1244,6 +1244,8 @@ class QwenChatServiceManager:
     def _provider_help_text(self, provider_key: str) -> str:
         if provider_key == "local_rapidmlx_8b":
             return "本地 Rapid-MLX，不需要 API Key。"
+        if provider_key == "local_ollama_qwen35_4b":
+            return "本机 Ollama Qwen3.5-4B，不需要 API Key；适合本机快速规整，长文本仍可能受上下文限制。"
         if provider_key == "nuc_ollama_gemma4":
             return "NUC 上的 Gemma 4 E4B，本地 16K 上下文，不需要 API Key；适合字幕规整和中等长度文稿。"
         if provider_key == "gemini_flash":
@@ -1741,5 +1743,5 @@ class QwenChatServiceManager:
                 "建议拆分处理，或改用 Gemini 2.5 Pro。"
             )
         return (
-            f"当前字幕约 {segment_count} 段、{char_count} 字符，已经接近或超过本地 Qwen3-8B 更稳妥的单次长文本处理范围。"
+            f"当前字幕约 {segment_count} 段、{char_count} 字符，已经接近或超过本地小中型本机模型更稳妥的单次长文本处理范围。"
         )
