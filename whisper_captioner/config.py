@@ -84,8 +84,8 @@ SENSE_VOICE_CPP_FP16_MODEL_PATH = _first_existing_path(
 SENSE_VOICE_CPP_MAIN = str(SENSE_VOICE_CPP_MAIN_PATH)
 SENSE_VOICE_CPP_FP16_MODEL = str(SENSE_VOICE_CPP_FP16_MODEL_PATH)
 
-RAPIDMLX_PYTHON = "/opt/anaconda3/envs/rapidmlx/bin/python"
-RAPIDMLX_BIN = "/opt/anaconda3/envs/rapidmlx/bin/rapid-mlx"
+RAPIDMLX_PYTHON = str(HOME / "miniforge3/envs/rapidmlx/bin/python")
+RAPIDMLX_BIN = str(HOME / "miniforge3/envs/rapidmlx/bin/rapid-mlx")
 RAPIDMLX_HOST = "127.0.0.1"
 RAPIDMLX_PORT = "8765"
 RAPIDMLX_MODEL = "mlx-community/Qwen2.5-3B-Instruct-4bit"
