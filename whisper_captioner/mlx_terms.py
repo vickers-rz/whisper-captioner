@@ -1,3 +1,11 @@
+"""
+MLX 专有术语生成模块
+
+负责通过 MLX 本地大语言模型针对视频标题提取专用术语列表。
+主要职责包括：
+1. 根据视频标题通过零样本 (Zero-shot) 提示词，推测视频中可能出现的术语。
+2. 将返回的术语列表喂给 Whisper 或 LLM 后处理，以提升专业名词识别的准确率。
+"""
 from __future__ import annotations
 
 import json

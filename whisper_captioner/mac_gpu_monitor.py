@@ -1,3 +1,12 @@
+"""
+macOS GPU 内存监控模块
+
+用于在 macOS 平台上通过 `powermetrics` 工具监控 Apple Silicon (M1/M2/M3 等) 的 GPU 显存使用情况。
+这对于在本地运行大型模型（如 Qwen 或 Whisper）时防止 OOM (Out Of Memory) 至关重要。
+主要职责包括：
+1. 提取当前系统 GPU 内存和带宽的活动指标。
+2. 为并发任务调度提供准入限制，只有显存充裕时才允许新任务启动。
+"""
 from __future__ import annotations
 
 import os

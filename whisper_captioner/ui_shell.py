@@ -1,3 +1,9 @@
+"""
+UI Shell 构建模块
+
+提供在不同环境下启动 QApplication 的辅助方法。
+用于将核心界面的生命周期与系统的事件循环绑定，支持静默启动等选项。
+"""
 from __future__ import annotations
 
 WINDOW_STYLESHEET = """

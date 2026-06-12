@@ -1,3 +1,9 @@
+"""
+UI 构建器模块
+
+负责使用 PySide6 动态构建 Whisper Captioner 主界面的各个部分。
+将 UI 布局逻辑与业务逻辑（app.py）解耦，提高代码可维护性。
+"""
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
@@ -27,6 +33,12 @@ from whisper_captioner.transcript_panel import build_transcript_panel
 
 
 def build_realtime_review_panel(window) -> QWidget:
+    """
+    构建“实时回顾”选项卡面板
+    
+    该面板用于管理和回看通过实时麦克风/系统音频录制生成的对话会话。
+    提供会话列表、文本视图切换（原始/润色后），以及 LLM 校对和重新识别等操作按钮。
+    """
     tab = QWidget()
     layout = QHBoxLayout(tab)
     
@@ -70,6 +82,14 @@ def build_realtime_review_panel(window) -> QWidget:
     return tab
 
 def build_main_window_ui(window) -> None:
+    """
+    构建应用程序主窗口的完整 UI 布局
+    
+    初始化主界面的所有核心组件，包括：
+    - 运行状态与配置面板（模式、日志级别等）
+    - 各种播放与同步控制按钮
+    - 下方的多选项卡（队列、分析、全文字幕、ASR 历史、实时回顾、设置等）
+    """
     window.mode_combo = QComboBox()
     for mode in MODES:
         suffix = "" if mode.available else " (model missing)"

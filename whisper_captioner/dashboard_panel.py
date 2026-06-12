@@ -1,3 +1,9 @@
+"""
+仪表盘面板 UI 构建模块
+
+负责构建主界面顶部的运行面板。
+提供模式选择、日志级别、核心播放控制、字幕浮窗控制以及缓存目录管理等界面的快速访问按钮。
+"""
 from __future__ import annotations
 
 from PySide6.QtWidgets import QGroupBox, QHBoxLayout, QLabel, QVBoxLayout

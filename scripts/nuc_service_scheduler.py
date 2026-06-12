@@ -1,3 +1,13 @@
+"""
+NUC 服务调度器模块
+
+基于 FastAPI 构建的 Docker 容器资源调度器。
+由于 NUC (或宿主机) 的显存有限，无法同时运行 Qwen3-ASR 和 faster-whisper 的大模型，
+该模块的主要职责是：
+1. 监控 GPU 显存和使用率。
+2. 协调不同服务间的容器启停，实现大模型的互斥运行和热切换。
+3. 动态接收任务分配请求 (Admission Control)，决定哪个模型拥有 GPU 优先权。
+"""
 from __future__ import annotations
 
 import asyncio

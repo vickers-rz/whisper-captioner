@@ -1,4 +1,12 @@
-"""LLM integration for subtitle proofreading and fusion with reference subtitles."""
+"""
+大语言模型 (LLM) 交互与字幕处理模块
+
+负责与各种 LLM 提供商（OpenAI, Anthropic, Ollama, 兼容 OpenAI 格式的本地服务等）进行通信。
+主要职责包括：
+1. 构建通用的 API 请求（适配不同厂商的格式）。
+2. 提供字幕校对（润色）、基于字幕的自由文本生成（如总结、长文）和参考字幕融合功能。
+3. 自动管理和唤醒局域网内的推理节点（如发送 WOL 唤醒 NUC，自动拉起本地 Rapid-MLX 服务）。
+"""
 
 from __future__ import annotations
 
@@ -12,6 +20,20 @@ import urllib.request
 import binascii
 from pathlib import Path
 from typing import Optional
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    from pydantic import BaseModel
+    HAS_GOOGLE_GENAI = True
+
+    class RefinedChapter(BaseModel):
+        text: str
+except ImportError:
+    genai = None
+    genai_types = None
+    BaseModel = object
+    HAS_GOOGLE_GENAI = False
 
 from whisper_captioner.config import (
     RAPIDMLX_8B_MODEL,
@@ -31,9 +53,21 @@ from whisper_captioner.models import LLMProvider, SubtitleSegment
 from whisper_captioner.subtitle_io import overlapping_segments
 
 LLM_SYSTEM_PROMPT = (
-    "You are a Chinese subtitle corrector. Your task is to proofread and improve subtitle text "
-    "while preserving original meaning. The subtitle index and the corrected text should be in format: "
-    "\"序号: 修正后的文本\". Only output corrected lines, no explanations."
+    "你是中文视频字幕的严格校订编辑。你的任务是对字幕进行忠实去噪和规整。\n\n"
+    "这是“忠实校订”，不是摘要、改写、提纲或出版式压缩。\n\n"
+    "只允许：\n"
+    "1. 删除“嗯、啊、呃”等没有语义的语气词。\n"
+    "2. 删除结巴造成的连续重复，如“这个这个这个”。\n"
+    "3. 删除完全相同且相邻的重复句。\n"
+    "4. 修正明显病句、标点、错别字和技术术语。\n\n"
+    "不得删除：\n"
+    "1. 包含任何新增信息的近义重复。\n"
+    "2. 教学或讲解中的强调、解释、因果关系和过渡。\n"
+    "3. 例子、数字、代码标识、条件、否定表达和操作步骤。\n"
+    "4. 任何不能确定是冗余的内容。\n\n"
+    "不得总结、扩写、改变观点、重排论证或添加原文没有的知识。\n"
+    "输出长度原则上不得低于输入正文的 80%。不确定是否应删除时，保留原文。\n"
+    "输出格式必须为 \"序号: 规整后的文本\"，每行一个，不能包含多余的解释。如果不需要修改，直接输出原句。"
 )
 
 LLM_FUSION_PROMPT = (
@@ -294,7 +328,23 @@ def llm_proofread(
     timeout: int = 15,
     max_tokens: int = 4096,
 ) -> list[SubtitleSegment]:
-    """Send segment texts to an LLM for proofreading. Returns corrected segments."""
+    """
+    使用大语言模型对字幕片段进行校对和润色。
+
+    发送带编号的字幕行到 LLM，并解析返回的编号行，替换原始字幕文本。
+    
+    参数:
+        segments: 待校对的字幕片段列表。
+        provider: LLM 服务提供商配置。
+        api_key: API 密钥。
+        api_url_override: 自定义的 API 地址（如果适用）。
+        model_id_override: 自定义的模型 ID（如果适用）。
+        timeout: API 请求超时时间（秒）。
+        max_tokens: 允许生成的最大 token 数量。
+
+    返回:
+        校对后的 SubtitleSegment 列表。时间轴与输入保持一致。
+    """
     if not segments:
         return segments
     _ensure_provider_ready(provider)
@@ -326,7 +376,24 @@ def llm_generate_text(
     timeout: int = 180,
     max_tokens: int = 16000,
 ) -> str:
-    """Generate free-form text from a transcript or prompt."""
+    """
+    使用大语言模型基于输入文本自由生成内容。
+
+    主要用于全文字幕总结、长文转写或基于字幕的问答。
+    
+    参数:
+        user_text: 用户的输入文本或提示词（通常包含全部字幕）。
+        provider: LLM 服务提供商配置。
+        api_key: API 密钥。
+        api_url_override: 自定义的 API 地址。
+        model_id_override: 自定义的模型 ID。
+        system_prompt: 系统级提示词，用于设定模型的行为角色。
+        timeout: API 请求超时时间（秒）。
+        max_tokens: 允许生成的最大 token 数量。
+
+    返回:
+        LLM 生成的回复文本。
+    """
     _ensure_provider_ready(provider)
     url, body, headers = _build_llm_call(
         provider,
@@ -352,7 +419,24 @@ def llm_fuse_with_reference(
     timeout: int = 20,
     terms: Optional[list[str]] = None,
 ) -> list[SubtitleSegment]:
-    """Fuse whisper segments with reference subtitles using LLM."""
+    """
+    使用大语言模型将 Whisper 识别结果与参考字幕进行融合修正。
+
+    这通常用于结合官方英文字幕纠正 Whisper 中文识别的专有名词、术语或断句。
+    
+    参数:
+        whisper_segments: Whisper 识别的基准中文字幕片段。
+        reference_segments: 原视频的参考字幕（可能是英文或带有正确术语的其他字幕）。
+        provider: LLM 服务提供商配置。
+        api_key: API 密钥。
+        api_url_override: 自定义的 API 地址。
+        model_id_override: 自定义的模型 ID。
+        timeout: API 请求超时时间（秒）。
+        terms: 可选的专有名词术语表。
+
+    返回:
+        融合修正后的 SubtitleSegment 列表。
+    """
     if not whisper_segments or not reference_segments:
         return whisper_segments
     _ensure_provider_ready(provider)

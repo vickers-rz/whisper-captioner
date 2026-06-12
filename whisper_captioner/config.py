@@ -1,3 +1,12 @@
+"""
+全局配置与常量模块
+
+定义 Whisper Captioner 项目的路径、环境变量读取和所有的默认常量。
+主要职责包括：
+1. 设置并读取输出目录、缓存目录和资源目录。
+2. 配置外部依赖的路径，如 ffmpeg, yt-dlp, whisper.cpp, mlx_whisper。
+3. 集中管理 NUC 服务器相关环境变量和各个端点服务的默认端口。
+"""
 from __future__ import annotations
 
 import os

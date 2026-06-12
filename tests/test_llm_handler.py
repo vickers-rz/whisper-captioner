@@ -6,10 +6,24 @@ from whisper_captioner.llm_handler import (
     llm_proofread,
     wake_on_lan_nuc,
 )
-from whisper_captioner.models import LLM_PROVIDERS, SubtitleSegment
+from whisper_captioner.models import LLM_PROVIDERS, SubtitleSegment, resolved_llm_api_key
 
 
 class LLMHandlerTest(unittest.TestCase):
+    def test_environment_api_key_overrides_saved_key(self):
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "new-key"}):
+            self.assertEqual(
+                resolved_llm_api_key("gemini_flash", "old-key"),
+                "new-key",
+            )
+
+    def test_saved_api_key_is_used_without_environment_override(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(
+                resolved_llm_api_key("gemini_flash", "saved-key"),
+                "saved-key",
+            )
+
     def test_wol_sends_global_and_subnet_broadcasts(self):
         sock = MagicMock()
         context = MagicMock()

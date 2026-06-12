@@ -1,3 +1,12 @@
+"""
+本地字幕后处理与 Web 聊天服务模块
+
+提供了一个本地 HTTP 服务器，用于在浏览器中展示一个类似 ChatGPT 的 Web UI 工作台。
+主要职责包括：
+1. 管理多轮对话的上下文。
+2. 将历史字幕（SRT/VTT/TXT）挂载为上下文，支持直接基于字幕提问。
+3. 提供一键式字幕工具（如“语句规整”、“转写成文稿”），并利用配置的 LLM 服务节点执行这些任务。
+"""
 from __future__ import annotations
 
 import base64
@@ -17,7 +26,12 @@ from PySide6.QtCore import QSettings
 
 from whisper_captioner.config import GENERATED_DIR, OUTPUT_DIR, QWEN_CHAT_DIR
 from whisper_captioner.llm_handler import llm_generate_text, llm_provider_ready
-from whisper_captioner.models import LLM_PROVIDERS, LLMProvider, SubtitleSegment
+from whisper_captioner.models import (
+    LLM_PROVIDERS,
+    LLMProvider,
+    SubtitleSegment,
+    resolved_llm_api_key,
+)
 from whisper_captioner.subtitle_io import (
     format_srt_timestamp,
     parse_subtitle_file,
@@ -961,6 +975,13 @@ EXPORT_DIRNAME = "exports"
 
 
 class QwenChatServiceManager:
+    """
+    Web 聊天服务管理器类
+    
+    负责启动、停止和管理本地后处理 Web 工作台的 HTTP 服务线程。
+    在指定端口（默认 8083）上监听请求，提供前端 HTML、静态资源和 REST API 接口，
+    实现与浏览器 UI 的双向交互和对话上下文存储。
+    """
     def __init__(
         self,
         storage_dir: Path = QWEN_CHAT_DIR,
@@ -1186,7 +1207,8 @@ class QwenChatServiceManager:
         if not provider:
             raise RuntimeError(f"Unsupported provider: {provider_key}")
         settings = QSettings("WhisperCaptioner", "App")
-        api_key = str(settings.value(f"llm/apikey/{provider.key}", ""))
+        saved_key = str(settings.value(f"llm/apikey/{provider.key}", ""))
+        api_key = resolved_llm_api_key(provider.key, saved_key)
         api_url = str(settings.value("llm/custom_url", "")) if provider.key == "custom" else ""
         model_id = str(settings.value("llm/custom_model", "")) if provider.key == "custom" else ""
         return provider, api_key, api_url, model_id
@@ -1198,7 +1220,8 @@ class QwenChatServiceManager:
         ordered_keys = tuple(p.key for p in LLM_PROVIDERS)
         for key in ordered_keys:
             provider = provider_map[key]
-            api_key = str(settings.value(f"llm/apikey/{provider.key}", ""))
+            saved_key = str(settings.value(f"llm/apikey/{provider.key}", ""))
+            api_key = resolved_llm_api_key(provider.key, saved_key)
             api_url = str(settings.value("llm/custom_url", "")) if provider.key == "custom" else provider.api_url
             model_id = str(settings.value("llm/custom_model", "")) if provider.key == "custom" else provider.model_id
             providers.append(

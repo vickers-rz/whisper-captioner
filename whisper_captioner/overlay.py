@@ -1,5 +1,12 @@
-"""Subtitle overlay widget for displaying captions on top of other applications."""
+"""
+透明字幕浮窗模块
 
+基于 PySide6 实现一个无边框、可穿透鼠标事件、总在最前的半透明字幕悬浮窗。
+主要职责包括：
+1. 在屏幕上悬浮显示最新生成的实时字幕。
+2. 支持调节字体大小、不透明度、窗口拖拽等自定义配置。
+3. 保证浮窗即使在全屏应用上方也能正确层叠。
+"""
 from __future__ import annotations
 
 from typing import Optional

@@ -1,3 +1,9 @@
+"""
+全文字幕面板 UI 构建模块
+
+负责构建主界面中的“全文字幕”选项卡。
+提供一个可点击的完整字幕列表视图，支持通过点击跳转视频播放进度。
+"""
 from __future__ import annotations
 
 from PySide6.QtWidgets import QLabel, QListWidget, QVBoxLayout, QWidget

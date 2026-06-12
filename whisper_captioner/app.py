@@ -1,3 +1,13 @@
+"""
+主界面与应用程序核心逻辑模块
+
+该模块包含了 Whisper Captioner 的核心 UI 及其主要的业务串联逻辑。
+主要职责包括：
+1. 构建并管理应用程序的主窗口 (MainWindow) 和相关的 UI 组件（如视频悬浮字幕 Overlay）。
+2. 处理用户交互事件（如按钮点击、设置更改、播放控制）。
+3. 调度底层处理任务（如本地/远程 ASR 转录、大语言模型文本分析、字幕处理等）。
+4. 与系统级资源交互（如系统托盘、GPU 监控、系统文件选择器）。
+"""
 from __future__ import annotations
 
 import bisect
@@ -96,7 +106,13 @@ from whisper_captioner.config import (
     REALTIME_DIR,
     SUBTITLE_PIPELINE_VERSION,
 )
-from whisper_captioner.models import CaptionMode, LLM_PROVIDERS, MODES, SubtitleSegment
+from whisper_captioner.models import (
+    CaptionMode,
+    LLM_PROVIDERS,
+    MODES,
+    SubtitleSegment,
+    resolved_llm_api_key,
+)
 from whisper_captioner.subtitle_io import (
     load_segments,
     overlapping_segments,
@@ -114,6 +130,13 @@ LOG_LEVELS = {
 }
 
 class MainWindow(QMainWindow):
+    """
+    应用程序主窗口类
+    
+    作为应用的控制器 (Controller) 和视图 (View) 容器。
+    负责初始化 UI (通过 ui_builder 模块)，管理后台线程 (QThread 和 Worker)，
+    并维护程序的运行时状态，如当前的字幕数据、受控浏览器状态及音频硬件配置。
+    """
     def __init__(self, overlay: SubtitleOverlay) -> None:
         super().__init__()
         self.overlay = overlay
@@ -315,7 +338,8 @@ class MainWindow(QMainWindow):
         key = self.llm_provider_combo.currentData()
         provider = next(p for p in LLM_PROVIDERS if p.key == key)
         settings = QSettings("WhisperCaptioner", "App")
-        self.llm_api_key_input.setText(settings.value(f"llm/apikey/{key}", ""))
+        saved_key = str(settings.value(f"llm/apikey/{key}", ""))
+        self.llm_api_key_input.setText(resolved_llm_api_key(key, saved_key))
         is_custom = (key == "custom")
         self.llm_custom_url_input.setVisible(is_custom)
         self.llm_custom_model_input.setVisible(is_custom)

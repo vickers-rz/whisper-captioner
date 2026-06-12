@@ -171,6 +171,50 @@ class WorkerRecoveryTest(unittest.TestCase):
             self.assertFalse(output_base.with_suffix(".txt").exists())
             self.assertFalse(worker._final_subtitle_cache_path(root).exists())
 
+    def test_disabled_polish_saves_raw_final_cache_without_fake_optimized_output(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        from whisper_captioner.subtitle_io import save_segments
+
+        worker = RollingPrefetchWorker("https://example.com/video", mode)
+        worker.cache_url = worker.url
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            save_segments(
+                root / "chunk-0000-raw.json",
+                [SubtitleSegment(0, 1, "原始文本")],
+            )
+            output_base = root / "LLM优化字幕"
+
+            result = worker._run_full_document_polish(root, output_base)
+            cached = worker._load_current_final_cache(
+                worker._final_subtitle_cache_path(root)
+            )
+
+            self.assertEqual(result[0].text, "原始文本")
+            self.assertEqual(cached[0].text, "原始文本")
+            self.assertFalse(output_base.with_suffix(".srt").exists())
+            self.assertFalse(output_base.with_suffix(".txt").exists())
+
+    def test_unready_llm_uses_raw_cache_signature_until_api_key_is_added(self):
+        mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
+        from whisper_captioner.models import LLM_PROVIDERS
+
+        provider = next(
+            item for item in LLM_PROVIDERS if item.key == "gemini_flash"
+        )
+        worker = RollingPrefetchWorker(
+            "https://example.com/video",
+            mode,
+            llm_provider=provider,
+        )
+
+        self.assertEqual(worker._pipeline_signature()["llm_provider"], "raw")
+        worker.llm_api_key = "configured"
+        self.assertEqual(
+            worker._pipeline_signature()["llm_provider"],
+            "gemini_flash",
+        )
+
     def test_controlled_qwen_parallel_buffers_out_of_order_results(self):
         mode = next(mode for mode in MODES if mode.key == "qwen3_asr_06b_4bit_mlx")
         config = QueueRunConfig(

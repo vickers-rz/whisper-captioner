@@ -1,5 +1,13 @@
+"""
+数据模型模块
+
+定义了 Whisper Captioner 项目中使用的核心数据类和常量配置，
+包括支持的字幕生成模式 (CaptionMode)、大语言模型提供商 (LLMProvider)
+以及字幕片段结构 (SubtitleSegment)。
+"""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +33,12 @@ from .config import (
 
 @dataclass(frozen=True)
 class CaptionMode:
+    """
+    字幕生成模式配置类
+    
+    用于定义不同 ASR（自动语音识别）后端及其运行参数。
+    包含本地运行模式（如 whisper.cpp, mlx_audio）和远程调用模式（如 NUC 节点）。
+    """
     key: str
     label: str
     model: Path | str
@@ -38,11 +52,18 @@ class CaptionMode:
 
     @property
     def available(self) -> bool:
+        """检查模型文件是否在本地存在（对于远程模型始终返回 True）"""
         return not isinstance(self.model, Path) or self.model.exists()
 
 
 @dataclass(frozen=True)
 class LLMProvider:
+    """
+    大语言模型提供商配置类
+    
+    定义了可用于文本后处理（如总结、问答、润色）的 LLM 服务节点。
+    包含 API 地址、模型 ID 及其所需的调用格式（如 openai 兼容格式）。
+    """
     key: str
     label: str
     api_url: str
@@ -53,9 +74,32 @@ class LLMProvider:
 
 @dataclass(frozen=True)
 class SubtitleSegment:
+    """
+    单条字幕片段数据类
+    
+    表示字幕文件（如 SRT）中的一个最小时间轴单元。
+    """
     start: float
     end: float
     text: str
+
+
+LLM_API_KEY_ENV_VARS = {
+    "gpt4o_mini": "OPENAI_API_KEY",
+    "gpt4o": "OPENAI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "gemini_flash": "GEMINI_API_KEY",
+    "gemini_pro": "GEMINI_API_KEY",
+    "minimax_m27": "MINIMAX_API_KEY",
+    "claude_sonnet": "ANTHROPIC_API_KEY",
+}
+
+
+def resolved_llm_api_key(provider_key: str, saved_key: str = "") -> str:
+    """Return the provider environment key when set, otherwise the saved key."""
+    env_name = LLM_API_KEY_ENV_VARS.get(provider_key, "")
+    env_key = os.environ.get(env_name, "").strip() if env_name else ""
+    return env_key or saved_key.strip()
 
 
 MODES = [

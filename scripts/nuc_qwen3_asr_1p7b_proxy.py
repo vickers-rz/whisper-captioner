@@ -1,3 +1,13 @@
+"""
+NUC Qwen3-ASR 1.7B 代理服务模块
+
+基于 FastAPI 构建的代理服务器，用于管理和转发向 Qwen3-ASR 模型的语音识别请求。
+主要职责包括：
+1. 提供与 OpenAI 兼容的音频转录 API 接口 (`/v1/audio/transcriptions`)。
+2. 处理长音频的大文件分块、并发限制和排队逻辑，防止后端显存溢出 (OOM)。
+3. 与调度器 (nuc_service_scheduler) 交互，在处理请求前唤醒 Qwen 模型容器，在空闲时自动停止后端服务以节省资源。
+4. 提供简单的重试和音频空片段过滤机制。
+"""
 from __future__ import annotations
 
 import asyncio

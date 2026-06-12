@@ -1,3 +1,9 @@
+"""
+队列面板 UI 构建模块
+
+负责构建主界面中的“队列”选项卡。
+提供 URL 输入框、加入队列、上下移动和批量处理排队任务等控件布局。
+"""
 from __future__ import annotations
 
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget

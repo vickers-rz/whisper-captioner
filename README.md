@@ -209,7 +209,10 @@ Batch Gemini scripts read their credential exclusively from the environment:
 export GEMINI_API_KEY="your-new-key"
 ```
 
-No Gemini API key is stored in the repository.
+The desktop APP and Web subtitle workspace also prefer `GEMINI_API_KEY` over
+an older key saved in APP settings. Other supported environment variables are
+`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `MINIMAX_API_KEY`, and
+`ANTHROPIC_API_KEY`. No API key is stored in the repository.
 
 The settings page exposes both values. Environment variables override the saved settings:
 

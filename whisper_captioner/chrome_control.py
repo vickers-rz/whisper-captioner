@@ -1,3 +1,12 @@
+"""
+Chrome 浏览器控制模块
+
+通过 AppleScript (osascript) 和 JavaScript 与 macOS 上的 Google Chrome 浏览器进行交互。
+主要职责包括：
+1. 获取当前活动标签页的 URL。
+2. 在指定的标签页中注入并执行 JavaScript 代码，以控制网页内的 `<video>` 元素。
+3. 提供播放、暂停、跳转、获取当前时间等针对视频播放的控制接口，用于“网址受控字幕”模式。
+"""
 from __future__ import annotations
 
 import subprocess

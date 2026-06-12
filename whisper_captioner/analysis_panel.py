@@ -1,3 +1,9 @@
+"""
+分析面板 UI 构建模块
+
+负责构建主界面中的“分析”选项卡。
+提供视频总结、文章改写、章节生成和基于字幕的问答 UI 布局。
+"""
 from __future__ import annotations
 
 from PySide6.QtWidgets import (

@@ -1,9 +1,18 @@
-"""Worker classes for async caption processing and transcription tasks.
+"""
+异步任务和底层工作线程模块
 
-This module provides worker classes that run in separate threads:
-- RealtimeWorker: Stream audio directly to Whisper for real-time captions
-- QueueWorker: Process a queue of media files (URLs or local files)
-- RollingPrefetchWorker: Download, chunk, and incrementally transcribe with LLM polish
+该模块包含了 Whisper Captioner 用于处理耗时任务的各类异步 Worker (继承自 QThread 或 QObject)。
+主要职责包括：
+- 本地和远程媒体下载、缓存与音频预处理。
+- 本地 ASR 模型 (如 whisper.cpp, MLX) 的子进程调用。
+- 远程 ASR 服务节点 (NUC) 的 API 通信。
+- 实时麦克风录音识别与字幕流处理。
+- LLM 文本后处理 (润色、翻译、纠错) 的并行调度。
+
+主要 Worker 类：
+- RealtimeWorker / NUCRealtimeWorker: 处理麦克风实时转录。
+- QueueWorker: 处理音视频文件的离线批量转录任务。
+- RollingPrefetchWorker: 处理基于 URL 的流式增量下载与边下边转录任务。
 """
 
 from __future__ import annotations
@@ -2669,7 +2678,13 @@ class RollingPrefetchWorker(QObject):
                         self.status.emit(
                             f"Raw subtitles written: {raw_output_base.with_suffix('.srt')}"
                         )
-                    self._export_final_subtitles(cached_segments, output_base)
+                    elif not self._llm_polish_ready():
+                        self._export_subtitles(cached_segments, raw_output_base)
+                        self.status.emit(
+                            f"Raw subtitles written: {raw_output_base.with_suffix('.srt')}"
+                        )
+                    if self._llm_polish_ready():
+                        self._export_final_subtitles(cached_segments, output_base)
                     self.first_segments.emit(cached_segments)
                     self.all_done.emit()
                     return
@@ -3145,16 +3160,27 @@ class RollingPrefetchWorker(QObject):
                 return True
         return False
 
+    def _llm_polish_ready(self) -> bool:
+        return bool(
+            self.llm_provider
+            and llm_provider_ready(self.llm_provider, self.llm_api_key)
+        )
+
     def _pipeline_signature(self) -> dict:
+        llm_ready = self._llm_polish_ready()
         return {
             "pipeline_version": SUBTITLE_PIPELINE_VERSION,
             "whisper_backend": self.mode.backend,
             "whisper_model": self.mode.model_name,
             "chunk_seconds": self.chunk_seconds,
             "native_subtitles": "zh-only-skip",
-            "llm_provider": self.llm_provider.key if self.llm_provider else "raw",
-            "llm_model": self.llm_model_id or (self.llm_provider.model_id if self.llm_provider else ""),
-            "llm_api_url": self.llm_api_url,
+            "llm_provider": self.llm_provider.key if llm_ready else "raw",
+            "llm_model": (
+                self.llm_model_id or self.llm_provider.model_id
+                if llm_ready
+                else ""
+            ),
+            "llm_api_url": self.llm_api_url if llm_ready else "",
             "proofread_scope": "full-document",
             "ai_zh_reference": False,
             "term_extraction": False,
@@ -3271,10 +3297,11 @@ class RollingPrefetchWorker(QObject):
             all_segments.extend(self._load_segment_cache(path, "Raw subtitle cache"))
         all_segments.sort(key=lambda item: (item.start, item.end))
         try:
-            if self.llm_provider and llm_provider_ready(self.llm_provider, self.llm_api_key) and cache_path.exists():
+            llm_ready = self._llm_polish_ready()
+            if llm_ready and cache_path.exists():
                 polished = self._load_segment_cache(cache_path, "Full-document LLM polish cache")
                 self.status.emit("Loaded full-document LLM polish cache")
-            elif self.llm_provider and llm_provider_ready(self.llm_provider, self.llm_api_key):
+            elif llm_ready:
                 self.status.emit(f"Running full-document LLM polish on {len(all_segments)} segment(s)")
                 t0 = time.monotonic()
                 polished = llm_proofread(
@@ -3292,6 +3319,11 @@ class RollingPrefetchWorker(QObject):
                 )
             else:
                 self.status.emit("No LLM provider/API key configured; exporting raw Whisper subtitles")
+                self._save_current_final_cache(
+                    self._final_subtitle_cache_path(job_cache_dir),
+                    all_segments,
+                )
+                self.status.emit("Updated final subtitle cache for raw pipeline")
                 return all_segments
             if polished:
                 self._save_current_final_cache(self._final_subtitle_cache_path(job_cache_dir), polished)
