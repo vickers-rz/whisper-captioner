@@ -324,10 +324,15 @@ def _gemini_native_proofread(
     api_key: str,
     model_id: str,
     system_prompt: str,
+    timeout: int,
+    max_tokens: int,
 ) -> dict[int, str]:
     if not HAS_GOOGLE_GENAI:
         raise ImportError("google-genai not installed")
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(
+        api_key=api_key,
+        http_options=genai_types.HttpOptions(timeout=max(1, timeout) * 1000),
+    )
     lines = [f"{i + 1}: {s.text}" for i, s in enumerate(segments)]
     user_text = "\n".join(lines)
     source_chars = len(user_text)
@@ -345,7 +350,7 @@ def _gemini_native_proofread(
                 config=genai_types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     temperature=0.1,
-                    max_output_tokens=8192,
+                    max_output_tokens=max_tokens,
                     thinking_config=thinking_config,
                     response_mime_type="application/json",
                     response_schema=RefinedChapter,
@@ -405,7 +410,12 @@ def llm_proofread(
     if HAS_GOOGLE_GENAI and provider.key in ("gemini_flash", "gemini_pro"):
         model_name = model_id_override or provider.model_id
         corrected = _gemini_native_proofread(
-            segments, api_key, model_name, LLM_SYSTEM_PROMPT
+            segments,
+            api_key,
+            model_name,
+            LLM_SYSTEM_PROMPT,
+            timeout,
+            max_tokens,
         )
         if corrected:
             return [

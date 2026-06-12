@@ -138,7 +138,10 @@ def polish_batch(batch_idx: int, batch: list, total_segments: int, system_prompt
 
     if HAS_GOOGLE_GENAI:
         try:
-            client = genai.Client(api_key=require_gemini_api_key())
+            client = genai.Client(
+                api_key=require_gemini_api_key(),
+                http_options=genai_types.HttpOptions(timeout=90_000),
+            )
             is_pro = "pro" in GEMINI_MODEL.lower()
             thinking_config = genai_types.ThinkingConfig(thinking_budget=1024) if is_pro else None
             
@@ -178,7 +181,10 @@ def polish_batch(batch_idx: int, batch: list, total_segments: int, system_prompt
                 except Exception as exc:
                     print(f"      ⚠ Gemini Native API 异常 (Batch {batch_idx}, 尝试 {attempt}): {exc}", flush=True)
                     time.sleep(attempt * 2)
-            return {}
+            print(
+                f"      ⚠ Gemini Native SDK 重试耗尽 (Batch {batch_idx})，降级到 urllib",
+                flush=True,
+            )
         except Exception as e:
             print(f"      ⚠ 无法初始化 Gemini Native Client，降级到 urllib: {e}", flush=True)
 

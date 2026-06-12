@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from whisper_captioner.llm_handler import (
+    _gemini_native_proofread,
     ensure_nuc_ollama_ready,
     llm_proofread,
     wake_on_lan_nuc,
@@ -66,6 +67,56 @@ class LLMHandlerTest(unittest.TestCase):
 
         ready.assert_called_once_with()
         self.assertEqual(result[0].text, "修正文本")
+
+    def test_gemini_native_honors_timeout_and_output_limit(self):
+        response = MagicMock()
+        response.parsed.text = "1: 修正文本"
+        response.text = ""
+        client = MagicMock()
+        client.models.generate_content.return_value = response
+
+        with patch("whisper_captioner.llm_handler.genai.Client", return_value=client) as factory:
+            result = _gemini_native_proofread(
+                [SubtitleSegment(0, 1, "原始文本")],
+                "test-key",
+                "gemini-2.5-flash",
+                "system prompt",
+                timeout=120,
+                max_tokens=60000,
+            )
+
+        http_options = factory.call_args.kwargs["http_options"]
+        self.assertEqual(http_options.timeout, 120_000)
+        config = client.models.generate_content.call_args.kwargs["config"]
+        self.assertEqual(config.max_output_tokens, 60000)
+        self.assertEqual(result, {0: "修正文本"})
+
+    def test_gemini_native_failure_falls_back_to_openai_compatible_api(self):
+        provider = next(
+            item for item in LLM_PROVIDERS if item.key == "gemini_flash"
+        )
+        fallback_response = '{"choices":[{"message":{"content":"1: 降级修正"}}]}'
+        with (
+            patch(
+                "whisper_captioner.llm_handler._gemini_native_proofread",
+                return_value={},
+            ) as native,
+            patch(
+                "whisper_captioner.llm_handler._llm_request",
+                return_value=fallback_response,
+            ) as fallback,
+        ):
+            result = llm_proofread(
+                [SubtitleSegment(0, 1, "原始文本")],
+                provider,
+                "test-key",
+                timeout=120,
+                max_tokens=60000,
+            )
+
+        native.assert_called_once()
+        fallback.assert_called_once()
+        self.assertEqual(result[0].text, "降级修正")
 
 
 if __name__ == "__main__":
