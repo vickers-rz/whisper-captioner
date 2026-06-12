@@ -319,6 +319,59 @@ def _extract_llm_reply(data: dict, fmt: str) -> str:
     return data["choices"][0]["message"]["content"]
 
 
+def _gemini_native_proofread(
+    segments: list[SubtitleSegment],
+    api_key: str,
+    model_id: str,
+    system_prompt: str,
+) -> dict[int, str]:
+    if not HAS_GOOGLE_GENAI:
+        raise ImportError("google-genai not installed")
+    client = genai.Client(api_key=api_key)
+    lines = [f"{i + 1}: {s.text}" for i, s in enumerate(segments)]
+    user_text = "\n".join(lines)
+    source_chars = len(user_text)
+    
+    is_pro = "pro" in model_id.lower()
+    thinking_config = genai_types.ThinkingConfig(thinking_budget=1024) if is_pro else None
+
+    prior_feedback = ""
+    for attempt in range(1, 4):
+        prompt = f"{prior_feedback}\n\n待校订正文：\n{user_text}"
+        try:
+            response = client.models.generate_content(
+                model=model_id,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.1,
+                    max_output_tokens=8192,
+                    thinking_config=thinking_config,
+                    response_mime_type="application/json",
+                    response_schema=RefinedChapter,
+                ),
+            )
+            output_text = response.parsed.text.strip() if response.parsed else ""
+            if not output_text and response.text:
+                output_text = response.text.strip()
+                
+            ratio = len(output_text) / max(1, source_chars)
+            if ratio >= 0.80:
+                return _parse_llm_lines(output_text, len(segments))
+                
+            prior_feedback = (
+                f"上一版删减过度（保留率仅 {ratio:.2f}）。"
+                "请严格按照一对一原则恢复所有被遗漏的句子和短语。"
+                "本次输出不得少于输入正文的 80%，不能通过概括来缩短内容。"
+            )
+            time.sleep(attempt * 2)
+        except Exception as e:
+            print(f"Gemini Native API Error (attempt {attempt}): {e}")
+            time.sleep(attempt * 2)
+
+    return {}
+
+
 def llm_proofread(
     segments: list[SubtitleSegment],
     provider: LLMProvider,
@@ -348,6 +401,18 @@ def llm_proofread(
     if not segments:
         return segments
     _ensure_provider_ready(provider)
+    
+    if HAS_GOOGLE_GENAI and provider.key in ("gemini_flash", "gemini_pro"):
+        model_name = model_id_override or provider.model_id
+        corrected = _gemini_native_proofread(
+            segments, api_key, model_name, LLM_SYSTEM_PROMPT
+        )
+        if corrected:
+            return [
+                SubtitleSegment(s.start, s.end, corrected.get(i, s.text))
+                for i, s in enumerate(segments)
+            ]
+
     lines = [f"{i + 1}: {s.text}" for i, s in enumerate(segments)]
     user_text = "\n".join(lines)
 

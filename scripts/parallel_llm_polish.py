@@ -16,6 +16,20 @@ import tempfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    from pydantic import BaseModel
+    HAS_GOOGLE_GENAI = True
+
+    class RefinedChapter(BaseModel):
+        text: str
+except ImportError:
+    genai = None
+    genai_types = None
+    BaseModel = object
+    HAS_GOOGLE_GENAI = False
+
 # ─── 配置与全局变量 ───────────────────────────────────────────────────────────
 
 OSRT_ROOT = Path.home() / "Movies" / "OSRT"
@@ -40,14 +54,21 @@ def require_gemini_api_key() -> str:
 
 # LLM 提示词 (参考 whisper_captioner 原版提示词进行规整，不带 timestamps 干扰)
 LLM_SYSTEM_PROMPT = (
-    "You are a Chinese subtitle corrector. Your task is to proofread and improve subtitle text "
-    "while preserving original meaning.\n\n"
-    "CRITICAL RULES — VIOLATION WILL CAUSE SYSTEM FAILURE:\n"
-    "1. You MUST return EXACTLY the same number of lines as the input. No more, no less.\n"
-    "2. NEVER summarize, merge, or delete any line. Every input line must produce exactly one output line.\n"
-    "3. Output format is strictly: \"序号: 规整后的文本\" — one line per entry.\n"
-    "4. If you cannot correct a line, output it unchanged.\n"
-    "5. Do NOT add any explanation, header, or footer text."
+    "你是中文视频字幕的严格校订编辑。你的任务是对字幕进行忠实去噪和规整。\n\n"
+    "这是“忠实校订”，不是摘要、改写、提纲或出版式压缩。\n\n"
+    "只允许：\n"
+    "1. 删除“嗯、啊、呃”等没有语义的语气词。\n"
+    "2. 删除结巴造成的连续重复，如“这个这个这个”。\n"
+    "3. 删除完全相同且相邻的重复句。\n"
+    "4. 修正明显病句、标点、错别字和技术术语。\n\n"
+    "不得删除：\n"
+    "1. 包含任何新增信息的近义重复。\n"
+    "2. 教学或讲解中的强调、解释、因果关系和过渡。\n"
+    "3. 例子、数字、代码标识、条件、否定表达和操作步骤。\n"
+    "4. 任何不能确定是冗余的内容。\n\n"
+    "不得总结、扩写、改变观点、重排论证或添加原文没有的知识。\n"
+    "输出长度原则上不得低于输入正文的 80%。不确定是否应删除时，保留原文。\n"
+    "输出格式必须为 \"序号: 规整后的文本\"，每行一个，不能包含多余的解释。如果不需要修改，直接输出原句。"
 )
 
 _LLM_LINE_RE = re.compile(r"^(\d+):\s*(.+)$")
@@ -111,8 +132,57 @@ def save_srt(srt_path: Path, segments: list) -> None:
 
 def polish_batch(batch_idx: int, batch: list, total_segments: int, system_prompt: str) -> dict:
     """对单个 batch 的字幕切片调用 Gemini API，进行局部重试"""
-    lines = [f"{i + 1}: {seg['text']}" for i, seg in enumerate(batch)]
+    lines = [f"{i + 1}: {s['text']}" for i, s in enumerate(batch)]
     user_text = "\n".join(lines)
+    source_chars = len(user_text)
+
+    if HAS_GOOGLE_GENAI:
+        try:
+            client = genai.Client(api_key=require_gemini_api_key())
+            is_pro = "pro" in GEMINI_MODEL.lower()
+            thinking_config = genai_types.ThinkingConfig(thinking_budget=1024) if is_pro else None
+            
+            prior_feedback = ""
+            for attempt in range(1, 4):
+                prompt = f"{prior_feedback}\n\n待校订正文：\n{user_text}"
+                try:
+                    response = client.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=prompt,
+                        config=genai_types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            temperature=0.1,
+                            max_output_tokens=8192,
+                            thinking_config=thinking_config,
+                            response_mime_type="application/json",
+                            response_schema=RefinedChapter,
+                        ),
+                    )
+                    output_text = response.parsed.text.strip() if response.parsed else ""
+                    if not output_text and response.text:
+                        output_text = response.text.strip()
+                        
+                    ratio = len(output_text) / max(1, source_chars)
+                    if ratio >= FALLBACK_THRESHOLD:
+                        parsed = parse_llm_lines(output_text, len(batch))
+                        if len(parsed) >= len(batch) * FALLBACK_THRESHOLD:
+                            return parsed
+                    
+                    prior_feedback = (
+                        f"上一版删减过度（保留率仅 {ratio:.2f}）。"
+                        "请严格按照一对一原则恢复所有被遗漏的句子和短语。"
+                        f"本次输出不得少于输入正文的 {FALLBACK_THRESHOLD*100:.0f}%，不能通过概括来缩短内容。"
+                    )
+                    print(f"      ⚠ Gemini Native SDK 保留率过低 {ratio:.2f} (Batch {batch_idx}, 尝试 {attempt}): 退避重试", flush=True)
+                    time.sleep(attempt * 2)
+                except Exception as exc:
+                    print(f"      ⚠ Gemini Native API 异常 (Batch {batch_idx}, 尝试 {attempt}): {exc}", flush=True)
+                    time.sleep(attempt * 2)
+            return {}
+        except Exception as e:
+            print(f"      ⚠ 无法初始化 Gemini Native Client，降级到 urllib: {e}", flush=True)
+
+    # Fallback to original urllib implementation
     body = {
         "model": GEMINI_MODEL,
         "messages": [
@@ -189,14 +259,21 @@ def build_system_prompt_for_video(mp4_name: str) -> str:
     terms_str = ", ".join(terms)
     
     custom_prompt = (
-        "You are a Chinese subtitle corrector. Your task is to proofread and improve subtitle text "
-        "while preserving original meaning.\n\n"
-        "CRITICAL RULES — VIOLATION WILL CAUSE SYSTEM FAILURE:\n"
-        "1. You MUST return EXACTLY the same number of lines as the input. No more, no less.\n"
-        "2. NEVER summarize, merge, or delete any line. Every input line must produce exactly one output line.\n"
-        "3. Output format is strictly: \"序号: 规整后的文本\" — one line per entry.\n"
-        "4. If you cannot correct a line, output it unchanged.\n"
-        "5. Do NOT add any explanation, header, or footer text.\n\n"
+        "你是中文视频字幕的严格校订编辑。你的任务是对字幕进行忠实去噪和规整。\n\n"
+        "这是“忠实校订”，不是摘要、改写、提纲或出版式压缩。\n\n"
+        "只允许：\n"
+        "1. 删除“嗯、啊、呃”等没有语义的语气词。\n"
+        "2. 删除结巴造成的连续重复，如“这个这个这个”。\n"
+        "3. 删除完全相同且相邻的重复句。\n"
+        "4. 修正明显病句、标点、错别字和技术术语。\n\n"
+        "不得删除：\n"
+        "1. 包含任何新增信息的近义重复。\n"
+        "2. 教学或讲解中的强调、解释、因果关系和过渡。\n"
+        "3. 例子、数字、代码标识、条件、否定表达和操作步骤。\n"
+        "4. 任何不能确定是冗余的内容。\n\n"
+        "不得总结、扩写、改变观点、重排论证或添加原文没有的知识。\n"
+        "输出长度原则上不得低于输入正文的 80%。不确定是否应删除时，保留原文。\n"
+        "输出格式必须为 \"序号: 规整后的文本\"，每行一个，不能包含多余的解释。如果不需要修改，直接输出原句。\n\n"
         "Important: This video is about AI and software development. Correct phonetically misrecognized terms "
         f"and output them in their standard form. Key terms expected in this video include: [{terms_str}]."
     )
