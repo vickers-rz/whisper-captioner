@@ -16,11 +16,38 @@ from whisper_captioner.workers import (
     parse_silencedetect_voice_window,
     prepare_url_audio_cache,
     prune_local_audio_cache,
+    remote_asr_quality_issue,
+    validate_remote_asr_segments,
 )
 from whisper_captioner.cache import controlled_cache_dir_name
 
 
 class WorkerRecoveryTest(unittest.TestCase):
+    def test_remote_asr_quality_rejects_repetition_hallucination(self):
+        segments = [
+            SubtitleSegment(index, index + 1, "请不吝点赞 订阅 打赏支持明镜与点点栏目")
+            for index in range(30)
+        ]
+        segments.extend(
+            SubtitleSegment(30 + index, 31 + index, f"问题{index % 3}")
+            for index in range(15)
+        )
+
+        issue = remote_asr_quality_issue(segments)
+
+        self.assertIsNotNone(issue)
+        with self.assertRaisesRegex(RuntimeError, "repetition hallucination"):
+            validate_remote_asr_segments(segments)
+
+    def test_remote_asr_quality_accepts_normal_transcript(self):
+        segments = [
+            SubtitleSegment(index, index + 1, f"Unique English sentence number {index}")
+            for index in range(80)
+        ]
+
+        self.assertIsNone(remote_asr_quality_issue(segments))
+        validate_remote_asr_segments(segments)
+
     def test_controlled_cache_name_is_human_readable_and_stable(self):
         name = controlled_cache_dir_name(
             "https://youtu.be/J5r17YdAmqY?t=12",

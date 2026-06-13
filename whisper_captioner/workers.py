@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -107,6 +108,7 @@ SILENCE_START_RE = re.compile(r"silence_start:\s*([0-9.]+)")
 SILENCE_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
 ADAPTIVE_SPLIT_MULTIPLIER = 1.5
 LOCAL_AUDIO_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+NUC_ASR_AUTO_LANGUAGE = "auto"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -506,11 +508,42 @@ def _nuc_asr_model_for_mode(mode: CaptionMode) -> str:
     return "large-v3"
 
 
+def remote_asr_quality_issue(segments: list[SubtitleSegment]) -> str | None:
+    texts = [" ".join(segment.text.split()) for segment in segments if segment.text.strip()]
+    if len(texts) < 20:
+        return None
+
+    counts = Counter(texts)
+    most_common_text, most_common_count = counts.most_common(1)[0]
+    repeated_share = most_common_count / len(texts)
+    unique_share = len(counts) / len(texts)
+    if most_common_count >= 8 and repeated_share >= 0.30:
+        return (
+            f"one phrase occupies {repeated_share:.0%} of {len(texts)} segments "
+            f"({most_common_text[:60]!r})"
+        )
+    if len(texts) >= 40 and unique_share <= 0.12:
+        return (
+            f"only {len(counts)} unique texts across {len(texts)} segments "
+            f"({unique_share:.0%} unique)"
+        )
+    return None
+
+
+def validate_remote_asr_segments(segments: list[SubtitleSegment]) -> None:
+    issue = remote_asr_quality_issue(segments)
+    if issue:
+        raise RuntimeError(
+            "NUC ASR returned a likely repetition hallucination; subtitle was not saved: "
+            f"{issue}"
+        )
+
+
 def _transcribe_via_nuc_asr(
     audio_path: Path,
     base_url: str = "",
     model: str = "large-v3",
-    language: str = "zh",
+    language: str = NUC_ASR_AUTO_LANGUAGE,
     response_format: str = "verbose_json",
     timeout: int = 120,
     status_signal: Signal | None = None,
@@ -1229,6 +1262,7 @@ class RealtimeReRecognizeWorker(QObject):
             segments = _transcribe_via_nuc_asr(
                 audio_file, base_url=self.base_url, timeout=600
             )
+            validate_remote_asr_segments(segments)
             
             # Save new raw segments
             save_segments(self.session_dir / "raw-segments.json", segments)
@@ -1442,7 +1476,7 @@ class QueueWorker(QObject):
         body_parts = []
         for field_name, field_value in [
             ("model", model),
-            ("language", "zh"),
+            ("language", NUC_ASR_AUTO_LANGUAGE),
             ("response_format", "verbose_json"),
         ]:
             body_parts.append(
@@ -1468,6 +1502,74 @@ class QueueWorker(QObject):
         if not task_id:
             raise RuntimeError(f"NUC local-file upload job did not return task id: {task}")
         return self._wait_for_nuc_job(task_id, base_url=base_url, filename=wav.name, busy_endpoint="/busy")
+
+    def _transcribe_file_via_nuc_chunks(
+        self,
+        wav: Path,
+        *,
+        base_url: str,
+        model: str,
+        chunk_seconds: float = 60.0,
+    ) -> list[SubtitleSegment]:
+        duration = _probe_audio_duration(wav)
+        all_segments: list[SubtitleSegment] = []
+        chunk_count = max(1, math.ceil(duration / chunk_seconds))
+        with tempfile.TemporaryDirectory(prefix="whisper-captioner-nuc-asr-") as directory:
+            chunk_dir = Path(directory)
+            for chunk_index in range(chunk_count):
+                if self._stop:
+                    raise RuntimeError("Queue stopped")
+                start = chunk_index * chunk_seconds
+                remaining = min(chunk_seconds, duration - start)
+                chunk_wav = chunk_dir / f"chunk-{chunk_index:04d}.wav"
+                self.status.emit(
+                    f"Preparing NUC ASR chunk {chunk_index + 1}/{chunk_count} "
+                    f"({start:.0f}-{start + remaining:.0f}s)"
+                )
+                self._run(
+                    [
+                        FFMPEG,
+                        "-y",
+                        "-ss",
+                        f"{start:.3f}",
+                        "-t",
+                        f"{remaining:.3f}",
+                        "-i",
+                        str(wav),
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        str(chunk_wav),
+                    ],
+                    f"Preparing NUC ASR chunk {chunk_index + 1}/{chunk_count}",
+                )
+                chunk_segments = _transcribe_via_nuc_asr(
+                    chunk_wav,
+                    base_url=base_url,
+                    model=model,
+                    timeout=max(180, int(remaining * 4)),
+                    status_signal=self.status,
+                )
+                validate_remote_asr_segments(chunk_segments)
+                for segment in chunk_segments:
+                    local_start = max(0.0, min(remaining, segment.start))
+                    local_end = max(0.0, min(remaining, segment.end))
+                    if segment.text.strip() and local_end > local_start:
+                        all_segments.append(
+                            SubtitleSegment(
+                                local_start + start,
+                                local_end + start,
+                                segment.text,
+                            )
+                        )
+                self.status.emit(
+                    f"NUC ASR chunk {chunk_index + 1}/{chunk_count}: "
+                    f"{len(chunk_segments)} segment(s)"
+                )
+        validate_remote_asr_segments(all_segments)
+        return all_segments
 
     def _transcribe_local_file_via_nuc_qwen_job(self, wav: Path, *, base_url: str) -> list[SubtitleSegment]:
         import urllib.request
@@ -1631,22 +1733,15 @@ class QueueWorker(QObject):
                     f"Transcribing with NUC remote ASR (faster-whisper CUDA, {nuc_asr_model})..."
                 )
                 duration = _probe_audio_duration(wav)
-                timeout = max(900, int(duration * 0.25 + 300))
-                self.status.emit(f"NUC remote ASR timeout budget: {timeout}s for {duration:.1f}s audio")
-                if source.startswith(("http://", "https://")):
-                    segments = _transcribe_via_nuc_asr(
-                        wav,
-                        base_url=str(self.mode.model),
-                        model=nuc_asr_model,
-                        timeout=timeout,
-                        status_signal=self.status,
-                    )
-                else:
-                    segments = self._transcribe_local_file_via_nuc_job(
-                        wav,
-                        base_url=str(self.mode.model),
-                        model=nuc_asr_model,
-                    )
+                self.status.emit(
+                    f"NUC remote ASR will process {duration:.1f}s audio in 60s chunks"
+                )
+                segments = self._transcribe_file_via_nuc_chunks(
+                    wav,
+                    base_url=str(self.mode.model),
+                    model=nuc_asr_model,
+                )
+                validate_remote_asr_segments(segments)
                 save_segments_as_txt(base.with_suffix(".txt"), segments)
                 save_segments_as_srt(base.with_suffix(".srt"), segments)
             elif self.mode.backend == "nuc_qwen3_asr_1p7b":

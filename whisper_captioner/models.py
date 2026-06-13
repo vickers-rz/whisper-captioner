@@ -122,7 +122,7 @@ MODES = [
         "实时字幕 NUC large-v3（远程 CUDA，3s延迟）",
         f"http://{NUC_OLLAMA_HOST}:{NUC_ASR_PORT}",
         True,
-        ("-l", "zh"),
+        ("-l", "auto"),
         "nuc_asr",
     ),
     CaptionMode(
@@ -199,7 +199,7 @@ MODES = [
         "NUC faster-whisper large-v3-turbo（远程 CUDA，快速）",
         f"http://{NUC_OLLAMA_HOST}:{NUC_ASR_PORT}",
         False,
-        ("-l", "zh"),
+        ("-l", "auto"),
         "nuc_asr",
     ),
     CaptionMode(
@@ -207,7 +207,7 @@ MODES = [
         "NUC faster-whisper large-v3（远程 CUDA，高质量）",
         f"http://{NUC_OLLAMA_HOST}:{NUC_ASR_PORT}",
         False,
-        ("-l", "zh"),
+        ("-l", "auto"),
         "nuc_asr",
     ),
     CaptionMode(

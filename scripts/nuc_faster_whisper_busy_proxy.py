@@ -177,13 +177,16 @@ async def _transcribe_local_file_to_result(
         try:
             async with httpx.AsyncClient(timeout=None) as client:
                 with audio_path.open("rb") as audio_file:
+                    form_data = {
+                        "model": model,
+                        "response_format": response_format,
+                        "vad_filter": "true",
+                    }
+                    if language.strip().lower() not in {"", "auto"}:
+                        form_data["language"] = language
                     response = await client.post(
                         f"{UPSTREAM_BASE_URL}{TRANSCRIBE_PATH}",
-                        data={
-                            "model": model,
-                            "language": language,
-                            "response_format": response_format,
-                        },
+                        data=form_data,
                         files={"file": (filename, audio_file, "audio/wav")},
                     )
         except httpx.HTTPError as exc:
@@ -220,7 +223,7 @@ class LocalFileTaskRequest(BaseModel):
     audio_path: str
     filename: str
     model: str = "large-v3"
-    language: str = "zh"
+    language: str = "auto"
     response_format: str = "verbose_json"
 
 
@@ -363,7 +366,7 @@ async def release_asr() -> Any:
 async def transcribe(
     file: UploadFile = File(...),
     model: str = Form("large-v3"),
-    language: str = Form("zh"),
+    language: str = Form("auto"),
     response_format: str = Form("verbose_json"),
 ) -> Any:
     audio_bytes = await file.read()
@@ -426,7 +429,7 @@ async def submit_local_file_job(payload: LocalFileTaskRequest) -> dict[str, Any]
 async def upload_local_file_job(
     file: UploadFile = File(...),
     model: str = Form("large-v3"),
-    language: str = Form("zh"),
+    language: str = Form("auto"),
     response_format: str = Form("verbose_json"),
 ) -> dict[str, Any]:
     filename = file.filename or "audio.wav"
