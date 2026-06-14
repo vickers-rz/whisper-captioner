@@ -46,6 +46,7 @@ STAGING_DIR = Path(os.environ.get("QWEN_ASR_STAGING_DIR", "/app/qwen-asr-staging
 ADMISSION_RETRY_SECONDS = float(os.environ.get("QWEN_ADMISSION_RETRY_SECONDS", "5"))
 ADMISSION_MAX_WAIT_SECONDS = float(os.environ.get("QWEN_ADMISSION_MAX_WAIT_SECONDS", "1800"))
 MAX_DIRECT_UPLOAD_MB = float(os.environ.get("QWEN_MAX_DIRECT_UPLOAD_MB", "64"))
+MAX_DIRECT_UPLOAD_SECONDS = float(os.environ.get("QWEN_MAX_DIRECT_UPLOAD_SECONDS", "120"))
 CHUNK_SECONDS = float(os.environ.get("QWEN_CHUNK_SECONDS", "30"))
 CHUNK_OVERLAP_SECONDS = float(os.environ.get("QWEN_CHUNK_OVERLAP_SECONDS", "2"))
 EMPTY_RETRY_MIN_DBFS = float(os.environ.get("QWEN_EMPTY_RETRY_MIN_DBFS", "-50"))
@@ -549,7 +550,8 @@ async def _run_qwen_transcription(
         await _wait_for_qwen_admission()
         try:
             async for _ in _track_request({"filename": filename, "result_dir": str(result_dir)}):
-                if audio_path.stat().st_size <= MAX_DIRECT_UPLOAD_MB * 1024 * 1024:
+                if (audio_path.stat().st_size <= MAX_DIRECT_UPLOAD_MB * 1024 * 1024
+                        and total_duration <= MAX_DIRECT_UPLOAD_SECONDS):
                     data = await _post_upstream_bytes(
                         audio_bytes=audio_path.read_bytes(),
                         filename=filename,
