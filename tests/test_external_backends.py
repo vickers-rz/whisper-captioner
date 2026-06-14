@@ -7,8 +7,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from whisper_captioner.external_backends import (
+    fuse_gemini_with_whisper,
+    gemini_transcribe_audio,
     run_omnivad_shadow,
 )
+from whisper_captioner.models import SubtitleWord
 
 
 class ExternalBackendTests(unittest.TestCase):
@@ -52,6 +55,50 @@ class ExternalBackendTests(unittest.TestCase):
                 result = run_omnivad_shadow(root / "audio.wav", output_dir)
         self.assertEqual(result.status, "completed")
         self.assertEqual((result.regions[0].start, result.regions[0].end), (1.0, 2.5))
+
+    def test_gemini_transcribe_missing_key_is_skipped(self) -> None:
+        result = gemini_transcribe_audio(Path("/tmp/audio.wav"), "")
+        self.assertEqual(result.status, "skipped")
+
+    def test_fusion_aligns_gemini_text_with_whisper_words(self) -> None:
+        words = [
+            SubtitleWord(0.0, 0.5, "Hello"),
+            SubtitleWord(0.6, 1.2, "world"),
+            SubtitleWord(1.5, 2.0, "this"),
+            SubtitleWord(2.1, 2.8, "is"),
+            SubtitleWord(3.0, 3.5, "a"),
+            SubtitleWord(3.6, 4.2, "test"),
+        ]
+        gemini_lines = ["Hello world.", "This is a test."]
+        segments = fuse_gemini_with_whisper(gemini_lines, words)
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0].text, "Hello world.")
+        self.assertEqual(segments[1].text, "This is a test.")
+        # Timestamps should align with word ranges
+        self.assertAlmostEqual(segments[0].start, 0.0, delta=0.1)
+        self.assertAlmostEqual(segments[0].end, 1.2, delta=0.2)
+        self.assertAlmostEqual(segments[1].start, 1.5, delta=0.2)
+        self.assertAlmostEqual(segments[1].end, 4.2, delta=0.2)
+
+    def test_fusion_normalizes_timeline_monotonic(self) -> None:
+        words = [
+            SubtitleWord(0.0, 0.3, "A"),
+            SubtitleWord(2.0, 2.3, "B"),
+            SubtitleWord(5.0, 5.3, "C"),
+        ]
+        gemini_lines = ["A.", "B.", "C."]
+        segments = fuse_gemini_with_whisper(gemini_lines, words)
+        self.assertEqual(len(segments), 3)
+        for i in range(1, len(segments)):
+            self.assertGreaterEqual(segments[i].start, segments[i - 1].end,
+                f"segment {i} start {segments[i].start} < previous end {segments[i-1].end}")
+            self.assertGreater(segments[i].end, segments[i].start,
+                f"segment {i} has non-positive duration")
+
+    def test_fusion_fallback_without_words(self) -> None:
+        segments = fuse_gemini_with_whisper(["One.", "Two.", "Three."], [])
+        self.assertEqual(len(segments), 3)
+        self.assertGreater(segments[-1].end, 0)
 
 
 if __name__ == "__main__":
