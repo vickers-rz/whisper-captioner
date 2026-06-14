@@ -1918,6 +1918,26 @@ class MainWindow(QMainWindow):
         run_config = self._queue_run_config()
         gemini_fusion = self.gemini_fusion_checkbox.isChecked()
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+
+        # Pre-flight: Gemini fusion requires API key
+        if gemini_fusion and not gemini_key:
+            box = QMessageBox(self)
+            box.setWindowTitle("Gemini 融合不可用")
+            box.setText(
+                "已启用 Gemini + Whisper 双模型融合，但未设置 GEMINI_API_KEY 环境变量。\n\n"
+                "请在终端中设置：export GEMINI_API_KEY=\"your-key\"\n"
+                "然后重新启动 Whisper Captioner。"
+            )
+            box.setIcon(QMessageBox.Icon.Warning)
+            skip_btn = box.addButton("跳过融合，继续", QMessageBox.ButtonRole.AcceptRole)
+            cancel_btn = box.addButton("取消任务", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() == cancel_btn:
+                self.log("Gemini fusion: task cancelled by user (no API key)")
+                return
+            gemini_fusion = False
+            self.log("Gemini fusion: skipped by user (no API key)")
+
         self.controlled_worker = RollingPrefetchWorker(
             source, mode,
             llm_provider=llm_provider, llm_api_key=llm_api_key,
@@ -1935,12 +1955,21 @@ class MainWindow(QMainWindow):
         self.controlled_worker.more_segments.connect(self._add_rolling_segments)
         self.controlled_worker.progress.connect(self._update_progress)
         self.controlled_worker.quality_updated.connect(self._update_subtitle_quality)
+        self.controlled_worker.gemini_fusion_blocked.connect(self._on_gemini_fusion_blocked)
         self.controlled_worker.all_done.connect(self._on_rolling_done)
         self.controlled_worker.finished.connect(self.controlled_thread.quit)
         self.controlled_thread.finished.connect(self._clear_controlled_worker)
         if qwen3_asr_mode(mode) or mode.backend == "whisper_cpp":
             self.mac_gpu_monitor.start()
         self.controlled_thread.start()
+
+    def _on_gemini_fusion_blocked(self, reason: str) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("Gemini 融合提示")
+        box.setText(reason)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.addButton("已知晓，继续", QMessageBox.ButtonRole.AcceptRole)
+        box.exec()
 
     def _update_subtitle_quality(self, report: object) -> None:
         if not isinstance(report, dict):

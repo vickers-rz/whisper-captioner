@@ -2591,6 +2591,7 @@ class RollingPrefetchWorker(QObject):
     all_done = Signal()
     native_subtitles_detected = Signal(list, str)  # (segments, message)
     quality_updated = Signal(object)
+    gemini_fusion_blocked = Signal(str)  # reason string
     finished = Signal()
 
     def __init__(
@@ -3398,11 +3399,19 @@ class RollingPrefetchWorker(QObject):
                     )
             elif gemini_result.status == "failed":
                 combined.diagnostics["gemini_fusion"]["warning"] = gemini_result.warning
-                self.status.emit(f"Gemini fusion skipped: {gemini_result.warning}")
+                self.status.emit(f"Gemini fusion failed: {gemini_result.warning}")
+                self.gemini_fusion_blocked.emit(
+                    f"Gemini 转写 API 调用失败：\n{gemini_result.warning}\n\n"
+                    "将继续使用纯 Whisper 字幕。"
+                )
         elif self.gemini_fusion_enabled and not combined.words:
             combined.diagnostics["gemini_fusion"] = {
                 "status": "skipped", "warning": "word timestamps unavailable",
             }
+            self.gemini_fusion_blocked.emit(
+                "Gemini 双模型融合已启用，但 Whisper ASR 未返回逐词时间戳。\n"
+                "融合需要词级时间戳才能将 Gemini 文本精确对齐到时间轴。"
+            )
         try:
             silencedetect_output = self._run_cmd_capture(
                 [
