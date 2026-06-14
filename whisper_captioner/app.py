@@ -336,6 +336,8 @@ class MainWindow(QMainWindow):
         self.gemini_fusion_checkbox.setChecked(
             settings.value("llm/gemini_fusion_enabled", False, type=bool)
         )
+        saved_gemini_key = str(settings.value("llm/gemini_api_key", ""))
+        self.gemini_api_key_input.setText(saved_gemini_key)
         saved_provider = str(settings.value("llm/provider", "gemini_flash"))
         idx = self.llm_provider_combo.findData(saved_provider)
         if idx >= 0:
@@ -388,6 +390,7 @@ class MainWindow(QMainWindow):
         settings = QSettings("WhisperCaptioner", "App")
         settings.setValue("llm/enabled", self.llm_group.isChecked())
         settings.setValue("llm/gemini_fusion_enabled", self.gemini_fusion_checkbox.isChecked())
+        settings.setValue("llm/gemini_api_key", self.gemini_api_key_input.text())
         settings.setValue(f"llm/apikey/{key}", self.llm_api_key_input.text())
         if key == "custom":
             settings.setValue("llm/custom_url", self.llm_custom_url_input.text().strip())
@@ -1761,11 +1764,13 @@ class MainWindow(QMainWindow):
             self.log("Queue is already running")
             return
         self.queue_thread = QThread()
-        gemini_fusion = self.gemini_fusion_checkbox.isChecked()
+        fusion_checked = self.gemini_fusion_checkbox.isChecked()
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not gemini_key:
+            gemini_key = self.gemini_api_key_input.text().strip()
         self.queue_worker = QueueWorker(
             items, mode, self._queue_run_config(prepared_wavs),
-            gemini_fusion_enabled=gemini_fusion and bool(gemini_key),
+            gemini_fusion_enabled=fusion_checked and bool(gemini_key),
             gemini_api_key=gemini_key,
         )
         self.queue_worker.moveToThread(self.queue_thread)
@@ -1963,7 +1968,10 @@ class MainWindow(QMainWindow):
         """Return (should_proceed, gemini_key) after possibly showing a dialog."""
         if not self.gemini_fusion_checkbox.isChecked():
             return True, ""
+        # Env var takes priority, GUI input as fallback
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not gemini_key:
+            gemini_key = self.gemini_api_key_input.text().strip()
         if gemini_key:
             return True, gemini_key
         box = QMessageBox(self)
