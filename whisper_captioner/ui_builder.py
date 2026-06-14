@@ -196,13 +196,14 @@ def build_main_window_ui(window) -> None:
     window.subtitle_later_button = QPushButton("Sub +0.5s")
     window.subtitle_sync_button = QPushButton("同步当前行")
     window.gemini_fusion_checkbox = QCheckBox(
-        "启用 Gemini + Whisper 双模型融合（Gemini 高精度文本 + Whisper 逐词时间戳）"
+        "高精度字幕：Whisper large-v3 底稿 + Gemini 高置信度文本校正"
     )
     window.gemini_api_key_input = QLineEdit()
     window.gemini_api_key_input.setPlaceholderText(
         "Gemini API Key（设置后优先使用环境变量 GEMINI_API_KEY）"
     )
     window.gemini_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+    window.gemini_api_key_clear_button = QPushButton("清除密钥")
     window.llm_group = QGroupBox("LLM 校对")
     window.llm_group.setCheckable(True)
     window.llm_group.setChecked(False)
@@ -382,6 +383,7 @@ def build_main_window_ui(window) -> None:
     gemini_key_row = QHBoxLayout()
     gemini_key_row.addWidget(QLabel("Gemini API Key："))
     gemini_key_row.addWidget(window.gemini_api_key_input)
+    gemini_key_row.addWidget(window.gemini_api_key_clear_button)
     settings_layout.addLayout(gemini_key_row)
     settings_layout.addWidget(window.llm_group)
     audio_route_card = QGroupBox("SoundSource / Loopback")

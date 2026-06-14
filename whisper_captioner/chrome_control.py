@@ -85,9 +85,11 @@ def _chrome_active_tabs() -> list[ChromeMediaTab]:
         'tell application "Google Chrome"\n'
         '  set activeTabs to ""\n'
         '  repeat with w in windows\n'
-        '    set t to active tab of w\n'
-        '    if activeTabs is not "" then set activeTabs to activeTabs & linefeed\n'
-        '    set activeTabs to activeTabs & (title of t) & (ASCII character 31) & (URL of t)\n'
+        '    repeat with tabIndex from 1 to (count of tabs of w)\n'
+        '      set t to tab tabIndex of w\n'
+        '      if activeTabs is not "" then set activeTabs to activeTabs & linefeed\n'
+        '      set activeTabs to activeTabs & (title of t) & (ASCII character 31) & (URL of t)\n'
+        '    end repeat\n'
         '  end repeat\n'
         '  return activeTabs\n'
         'end tell\n'
@@ -139,14 +141,15 @@ def run_chrome_script_for_url(target_url: str, script: str, activate_tab: bool =
     activation = ""
     if activate_tab:
         activation = (
-            '        set active tab index of w to (index of t)\n'
+            '        set active tab index of w to tabIndex\n'
             '        set index of w to 1\n'
             '        activate\n'
         )
     apple_script = (
         'tell application "Google Chrome"\n'
         '  repeat with w in windows\n'
-        '    repeat with t in tabs of w\n'
+        '    repeat with tabIndex from 1 to (count of tabs of w)\n'
+        '      set t to tab tabIndex of w\n'
         f'      if URL of t starts with "{safe_url}" then\n'
         f'{activation}'
         f'        return execute t javascript "{escaped}"\n'

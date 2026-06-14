@@ -8,6 +8,7 @@ from whisper_captioner.chrome_control import (
     _is_likely_media_url,
     chrome_get_url,
     chrome_media_tabs,
+    run_chrome_script_for_url,
 )
 
 
@@ -116,6 +117,64 @@ class ChromeControlTest(unittest.TestCase):
         MainWindow.start_controlled_url(window)
 
         get_item.assert_called_once()
+
+    @patch("whisper_captioner.app.validate_url_for_yt_dlp", return_value=(True, ""))
+    @patch("whisper_captioner.app.chrome_media_tabs", return_value=[])
+    def test_gemini_preflight_cancel_does_not_create_controlled_thread(
+        self, _media_tabs, _validate
+    ):
+        window = SimpleNamespace(
+            controlled_thread=None,
+            controlled_worker=None,
+            url_input=SimpleNamespace(
+                text=lambda: "https://example.com/video",
+                setText=lambda _value: None,
+            ),
+            queue=SimpleNamespace(currentItem=lambda: None),
+            _last_auto_url="",
+            log=lambda *_args: None,
+            current_mode=lambda: SimpleNamespace(
+                available=True,
+                label="NUC",
+                backend="nuc_asr",
+                model_name="large-v3-turbo",
+            ),
+            _check_gemini_fusion_ready=lambda: (False, ""),
+        )
+
+        MainWindow.start_controlled_url(window)
+
+        self.assertIsNone(window.controlled_thread)
+        self.assertIsNone(window.controlled_worker)
+
+    @patch("whisper_captioner.chrome_control.chrome_is_running", return_value=True)
+    @patch("whisper_captioner.chrome_control.subprocess.run")
+    def test_url_script_searches_inactive_tabs_without_activation(self, run, _running):
+        run.return_value.stdout = "12.5\n"
+        run.return_value.stderr = ""
+        run.return_value.returncode = 0
+
+        result = run_chrome_script_for_url(
+            "https://example.com/video",
+            "return 1",
+            activate_tab=False,
+        )
+
+        script = run.call_args.args[0][-1]
+        self.assertEqual(result, "12.5")
+        self.assertIn("repeat with tabIndex from 1 to (count of tabs of w)", script)
+        self.assertIn("set t to tab tabIndex of w", script)
+        self.assertNotIn("set active tab index", script)
+
+    @patch("whisper_captioner.chrome_control.chrome_is_running", return_value=True)
+    @patch("whisper_captioner.chrome_control.subprocess.run")
+    def test_url_script_activates_exact_tab_only_when_requested(self, run, _running):
+        run.return_value.stdout = ""
+        run.return_value.stderr = ""
+        run.return_value.returncode = 0
+        run_chrome_script_for_url("https://example.com/video", "return 1")
+        script = run.call_args.args[0][-1]
+        self.assertIn("set active tab index of w to tabIndex", script)
 
 
 if __name__ == "__main__":

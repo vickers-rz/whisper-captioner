@@ -83,7 +83,10 @@ from whisper_captioner.llm_handler import (
     llm_provider_ready,
 )
 from whisper_captioner.external_backends import (
-    fuse_gemini_with_whisper_arbitrated,
+    GEMINI_FUSION_VERSION,
+    GEMINI_PROMPT_VERSION,
+    fuse_gemini_with_whisper,
+    gemini_fusion_cache_key,
     gemini_transcribe_audio,
     run_omnivad_shadow,
 )
@@ -1235,6 +1238,7 @@ class RealtimePolishWorker(QObject):
         self.api_key = api_key
         self.api_url_override = api_url_override
         self.model_id_override = model_id_override
+        self._stop = False
         self.batch_seconds = batch_seconds
         self._stop = False
 
@@ -1316,7 +1320,14 @@ class RealtimeReRecognizeWorker(QObject):
         self.api_url_override = api_url_override
         self.model_id_override = model_id_override
 
+    def stop(self) -> None:
+        self._stop = True
+
     def run(self) -> None:
+        if getattr(self, "_stop", False):
+            self.finished.emit()
+            return
+
         audio_file = self.session_dir / "full-audio.wav"
         if not audio_file.exists():
             self.status.emit("找不到完整的会话音频。")
@@ -1325,9 +1336,13 @@ class RealtimeReRecognizeWorker(QObject):
 
         try:
             self.status.emit("开始重新识别全量音频...")
+            if self._stop:
+                return
             segments = _transcribe_via_nuc_asr(
                 audio_file, base_url=self.base_url, timeout=600
             )
+            if self._stop:
+                return
             validate_remote_asr_segments(segments)
             
             # Save new raw segments
@@ -1345,6 +1360,8 @@ class RealtimeReRecognizeWorker(QObject):
                     json.dump(manifest, f, indent=2, ensure_ascii=False)
 
             if self.provider:
+                if self._stop:
+                    return
                 self.status.emit("开始重新 LLM 规整...")
                 # Polish the entire new segments
                 # For long sessions, might need batching, but let's reuse RealtimePolishWorker logic manually
@@ -1353,21 +1370,31 @@ class RealtimeReRecognizeWorker(QObject):
                 batch_start_time = segments[0].start if segments else 0
                 
                 for seg in segments:
+                    if self._stop:
+                        return
                     batch.append(seg)
                     if seg.end - batch_start_time >= 30.0:
+                        if self._stop:
+                            return
                         corrected = llm_proofread(
                             batch, self.provider, self.api_key,
                             self.api_url_override, self.model_id_override, timeout=30
                         )
+                        if self._stop:
+                            return
                         polished.extend(corrected)
                         batch.clear()
                         batch_start_time = seg.end
                         
                 if batch:
+                    if self._stop:
+                        return
                     corrected = llm_proofread(
                         batch, self.provider, self.api_key,
                         self.api_url_override, self.model_id_override, timeout=30
                     )
+                    if self._stop:
+                        return
                     polished.extend(corrected)
                     
                 save_segments(self.session_dir / "polished-segments.json", polished)
@@ -1584,6 +1611,7 @@ class QueueWorker(QObject):
         duration = _probe_audio_duration(wav)
         all_segments: list[SubtitleSegment] = []
         all_words: list[SubtitleWord] = []
+        detected_language = ""
         chunk_count = max(1, math.ceil(duration / chunk_seconds))
         with tempfile.TemporaryDirectory(prefix="whisper-captioner-nuc-asr-") as directory:
             chunk_dir = Path(directory)
@@ -1636,6 +1664,7 @@ class QueueWorker(QObject):
                     status_signal=self.status,
                 )
                 chunk_segments = result.segments
+                detected_language = result.language or detected_language
                 issue = remote_asr_quality_issue(chunk_segments)
                 if issue:
                     self.status.emit(
@@ -1651,6 +1680,7 @@ class QueueWorker(QObject):
                         status_signal=self.status,
                     )
                     chunk_segments = result.segments
+                    detected_language = result.language or detected_language
                     validate_remote_asr_segments(chunk_segments)
                 for segment_index, segment in enumerate(chunk_segments):
                     local_start = max(0.0, min(remaining, segment.start))
@@ -1683,9 +1713,8 @@ class QueueWorker(QObject):
                     f"{len(chunk_segments)} segment(s), {len(result.words)} word(s)"
                 )
         validate_remote_asr_segments(all_segments)
-        language = result.language if chunk_count > 0 else ""
         return ASRResult(
-            language=language,
+            language=detected_language,
             words=all_words,
             segments=all_segments,
             diagnostics={"word_timestamp_source": "nuc_faster_whisper_chunks"},
@@ -1863,6 +1892,16 @@ class QueueWorker(QObject):
                 )
                 segments = asr_result.segments
                 validate_remote_asr_segments(segments)
+                raw_base = base.with_name(f"{base.name}-Whisper原始")
+                save_segments_as_txt(raw_base.with_suffix(".txt"), asr_result.segments)
+                save_segments_as_srt(raw_base.with_suffix(".srt"), asr_result.segments)
+                save_asr_result(
+                    base.with_name(f"{base.name}-Whisper原始-asr.json"),
+                    asr_result,
+                )
+                self.status.emit(
+                    f"Whisper raw subtitles written: {raw_base.with_suffix('.srt')}"
+                )
 
                 # --- Gemini + Whisper fusion ---
                 if self.gemini_fusion_enabled and self.gemini_api_key and asr_result.words:
@@ -1872,16 +1911,63 @@ class QueueWorker(QObject):
                     gemini_result = gemini_transcribe_audio(
                         wav, self.gemini_api_key, model="gemini-2.5-flash",
                     )
+                    gemini_text_path = base.with_name(f"{base.name}-Gemini原文.txt")
+                    diagnostics_path = base.with_name(
+                        f"{base.name}-fusion-diagnostics.json"
+                    )
                     if gemini_result.status == "completed" and gemini_result.lines:
-                        fused = fuse_gemini_with_whisper_arbitrated(gemini_result.lines, asr_result.words)
-                        if fused:
-                            segments = fused
+                        gemini_text_path.write_text(
+                            gemini_result.text,
+                            encoding="utf-8",
+                        )
+                        fusion = fuse_gemini_with_whisper(
+                            gemini_result.lines,
+                            asr_result.words,
+                            whisper_segments=asr_result.segments,
+                        )
+                        if fusion.status in {"completed", "partial"} and fusion.segments:
+                            segments = fusion.segments
                             self.status.emit(
                                 f"Gemini+Whisper fusion: {len(gemini_result.lines)} Gemini lines → "
-                                f"{len(fused)} fused segments ({gemini_result.elapsed:.1f}s)"
+                                f"{len(fusion.segments)} fused segments "
+                                f"(confidence={fusion.confidence:.2f}, {gemini_result.elapsed:.1f}s)"
                             )
+                        else:
+                            self.status.emit(
+                                "Gemini fusion alignment blocked; preserving Whisper subtitles"
+                            )
+                        _write_json_local(
+                            diagnostics_path,
+                            {
+                                "gemini": {
+                                    "status": gemini_result.status,
+                                    "model": gemini_result.model,
+                                    "elapsed": gemini_result.elapsed,
+                                    "diagnostics": gemini_result.diagnostics,
+                                },
+                                "fusion": {
+                                    "status": fusion.status,
+                                    "confidence": fusion.confidence,
+                                    "warnings": fusion.warnings,
+                                    "diagnostics": fusion.diagnostics,
+                                    "segment_count": len(fusion.segments),
+                                },
+                            },
+                        )
                     elif gemini_result.status == "failed":
                         self.status.emit(f"Gemini fusion failed: {gemini_result.warning}")
+                        _write_json_local(
+                            diagnostics_path,
+                            {
+                                "gemini": {
+                                    "status": gemini_result.status,
+                                    "model": gemini_result.model,
+                                    "warning": gemini_result.warning,
+                                    "diagnostics": gemini_result.diagnostics,
+                                },
+                                "fusion": {"status": "skipped"},
+                            },
+                        )
                 elif self.gemini_fusion_enabled and not asr_result.words:
                     self.status.emit("Gemini fusion skipped: no word timestamps from ASR")
 
@@ -2973,11 +3059,13 @@ class RollingPrefetchWorker(QObject):
             if cached_segments is not None:
                 try:
                     raw_segments = self._load_all_raw_segments(job_cache_dir)
-                    quality_report = self._audit_and_cache_quality(
+                    prepared_result = self._prepare_final_asr_result(
                         audio,
-                        duration,
                         job_cache_dir,
                         raw_segments or cached_segments,
+                    )
+                    quality_report = self._audit_and_cache_quality(
+                        audio, duration, job_cache_dir, prepared_result
                     )
                     self.quality_updated.emit(quality_report_to_dict(quality_report))
                     if quality_report.status == "incomplete_speech_coverage":
@@ -3155,17 +3243,32 @@ class RollingPrefetchWorker(QObject):
                 if rebuilt_raw_cache:
                     self._discard_derived_subtitle_caches(job_cache_dir)
                 all_raw_segments = self._load_all_raw_segments(job_cache_dir)
+                prepared_result = self._prepare_final_asr_result(
+                    audio,
+                    job_cache_dir,
+                    all_raw_segments,
+                )
                 quality_report = self._audit_and_cache_quality(
                     audio,
                     duration,
                     job_cache_dir,
-                    all_raw_segments,
+                    prepared_result,
                 )
                 self.quality_updated.emit(quality_report_to_dict(quality_report))
                 if all_raw_segments:
                     self._export_subtitles(all_raw_segments, raw_output_base)
                     self.status.emit(f"Raw subtitles written: {raw_output_base.with_suffix('.srt')}")
-                final_segments = self._run_full_document_polish(job_cache_dir, output_base)
+                final_segments = self._run_full_document_polish(
+                    job_cache_dir,
+                    output_base,
+                    source_segments=prepared_result.segments,
+                )
+                if (
+                    final_segments
+                    and self.gemini_fusion_enabled
+                    and not self._llm_polish_ready()
+                ):
+                    self._export_final_subtitles(final_segments, output_base)
                 if final_segments and not self._has_emitted_segments:
                     self.first_segments.emit(final_segments)
                 self.all_done.emit()
@@ -3192,7 +3295,14 @@ class RollingPrefetchWorker(QObject):
     def _full_polish_cache_path(self, job_cache_dir: Path) -> Path:
         provider_key = self.llm_provider.key if self.llm_provider else "disabled"
         model_key = self.llm_model_id or (self.llm_provider.model_id if self.llm_provider else "")
-        polish_key = cache_slug(provider_key, model_key, self.llm_api_url, "full-document-polish-v1")
+        polish_key = cache_slug(
+            provider_key,
+            model_key,
+            self.llm_api_url,
+            "full-document-polish-v2",
+            self.gemini_fusion_enabled,
+            GEMINI_FUSION_VERSION,
+        )
         return job_cache_dir / f"all-polished-{polish_key}.json"
 
     def _load_segment_cache(self, path: Path, context: str) -> list[SubtitleSegment]:
@@ -3210,10 +3320,18 @@ class RollingPrefetchWorker(QObject):
         return all_segments
 
     def _final_subtitle_cache_path(self, job_cache_dir: Path) -> Path:
-        return job_cache_dir / "final-subtitles-current.json"
+        variant = "gemini-fusion" if self.gemini_fusion_enabled else "whisper"
+        return job_cache_dir / f"final-subtitles-{variant}.json"
 
     def _discard_derived_subtitle_caches(self, job_cache_dir: Path) -> None:
-        for path in [self._final_subtitle_cache_path(job_cache_dir), self._full_polish_cache_path(job_cache_dir)]:
+        paths = list(job_cache_dir.glob("final-subtitles-*.json"))
+        paths.extend(job_cache_dir.glob("all-polished-*.json"))
+        paths.extend(job_cache_dir.glob("gemini-whisper-fusion-*.json"))
+        paths.extend(
+            job_cache_dir / name
+            for name in ("fused-segments.json", "fusion-diagnostics.json")
+        )
+        for path in paths:
             if path.exists():
                 path.unlink()
                 self.status.emit(f"Discarded derived subtitle cache after raw rebuild: {path.name}")
@@ -3389,13 +3507,11 @@ class RollingPrefetchWorker(QObject):
         )
         return chunk_out.with_suffix(".srt")
 
-    def _audit_and_cache_quality(
+    def _load_combined_asr_result(
         self,
-        audio: Path,
-        duration: float,
         job_cache_dir: Path,
         fallback_segments: list[SubtitleSegment],
-    ):
+    ) -> ASRResult:
         result_files = sorted(job_cache_dir.glob("chunk-*-asr-v2.json"))
         words: list[SubtitleWord] = []
         segments: list[SubtitleSegment] = []
@@ -3422,42 +3538,107 @@ class RollingPrefetchWorker(QObject):
             diagnostics={"capability_warnings": list(dict.fromkeys(warnings))},
         )
 
-        # --- Gemini + Whisper dual-model fusion ---
-        if self.gemini_fusion_enabled and self.gemini_api_key and combined.words:
-            gemini_result = gemini_transcribe_audio(
-                audio, self.gemini_api_key, model="gemini-2.5-flash",
-            )
+        return combined
+
+    def _prepare_final_asr_result(
+        self,
+        audio: Path,
+        job_cache_dir: Path,
+        fallback_segments: list[SubtitleSegment],
+    ) -> ASRResult:
+        combined = self._load_combined_asr_result(job_cache_dir, fallback_segments)
+        if not self.gemini_fusion_enabled:
+            combined.diagnostics["gemini_fusion"] = {"status": "disabled"}
+            return combined
+        if not self.gemini_api_key:
             combined.diagnostics["gemini_fusion"] = {
-                "status": gemini_result.status,
-                "model": gemini_result.model,
-                "elapsed": gemini_result.elapsed,
+                "status": "skipped",
+                "warning": "Gemini API key unavailable",
             }
-            if gemini_result.status == "completed" and gemini_result.lines:
-                fused = fuse_gemini_with_whisper(gemini_result.lines, combined.words)
-                if fused:
-                    combined.diagnostics["gemini_fusion"]["fused_segments"] = len(fused)
-                    combined.diagnostics["gemini_fusion"]["source"] = "gemini-text + whisper-timestamps"
-                    combined.segments = fused
-                    self.status.emit(
-                        f"Gemini+Whisper fusion: {len(gemini_result.lines)} Gemini lines → "
-                        f"{len(fused)} fused segments "
-                        f"({gemini_result.elapsed:.1f}s)"
-                    )
-            elif gemini_result.status == "failed":
-                combined.diagnostics["gemini_fusion"]["warning"] = gemini_result.warning
-                self.status.emit(f"Gemini fusion failed: {gemini_result.warning}")
-                self.gemini_fusion_blocked.emit(
-                    f"Gemini 转写 API 调用失败：\n{gemini_result.warning}\n\n"
-                    "将继续使用纯 Whisper 字幕。"
-                )
-        elif self.gemini_fusion_enabled and not combined.words:
+            return combined
+        if not combined.words:
             combined.diagnostics["gemini_fusion"] = {
-                "status": "skipped", "warning": "word timestamps unavailable",
+                "status": "blocked",
+                "warning": "word timestamps unavailable",
             }
             self.gemini_fusion_blocked.emit(
                 "Gemini 双模型融合已启用，但 Whisper ASR 未返回逐词时间戳。\n"
-                "融合需要词级时间戳才能将 Gemini 文本精确对齐到时间轴。"
+                "已保留纯 Whisper 字幕，不会生成伪时间轴。"
             )
+            return combined
+
+        model = "gemini-2.5-flash"
+        cache_key = gemini_fusion_cache_key(
+            audio,
+            model,
+            self.mode.model_name,
+        )
+        cache_path = job_cache_dir / f"gemini-whisper-fusion-{cache_key}.json"
+        if cache_path.exists():
+            try:
+                cached = load_asr_result(cache_path)
+                self.status.emit(f"Loaded Gemini+Whisper fusion cache: {cache_path.name}")
+                save_segments(job_cache_dir / "fused-segments.json", cached.segments)
+                return cached
+            except Exception as exc:
+                self.status.emit(f"Fusion cache unreadable; rebuilding: {exc}")
+
+        gemini_result = gemini_transcribe_audio(audio, self.gemini_api_key, model=model)
+        fusion_diagnostics = {
+            "status": gemini_result.status,
+            "model": gemini_result.model,
+            "prompt_version": GEMINI_PROMPT_VERSION,
+            "algorithm_version": GEMINI_FUSION_VERSION,
+            "elapsed": gemini_result.elapsed,
+            "transport": gemini_result.diagnostics,
+        }
+        if gemini_result.status != "completed" or not gemini_result.lines:
+            fusion_diagnostics["warning"] = gemini_result.warning
+            combined.diagnostics["gemini_fusion"] = fusion_diagnostics
+            _write_json_local(job_cache_dir / "fusion-diagnostics.json", fusion_diagnostics)
+            self.status.emit(f"Gemini fusion failed: {gemini_result.warning}")
+            self.gemini_fusion_blocked.emit(
+                f"Gemini 转写 API 调用失败：\n{gemini_result.warning}\n\n"
+                "已保留纯 Whisper 字幕。"
+            )
+            return combined
+
+        fusion = fuse_gemini_with_whisper(
+            gemini_result.lines,
+            combined.words,
+            whisper_segments=combined.segments,
+        )
+        fusion_diagnostics.update(
+            status=fusion.status,
+            confidence=fusion.confidence,
+            warnings=fusion.warnings,
+            alignment=fusion.diagnostics,
+        )
+        combined.diagnostics["gemini_fusion"] = fusion_diagnostics
+        if fusion.status in {"completed", "partial"} and fusion.segments:
+            combined.segments = fusion.segments
+            self.status.emit(
+                f"Gemini+Whisper fusion: {len(gemini_result.lines)} lines -> "
+                f"{len(fusion.segments)} segments "
+                f"(confidence={fusion.confidence:.2f}, status={fusion.status})"
+            )
+        else:
+            self.status.emit("Gemini alignment blocked; preserving Whisper subtitles")
+            self.gemini_fusion_blocked.emit(
+                "Gemini 文本与 Whisper 时间轴匹配质量不足，已保留纯 Whisper 字幕。"
+            )
+        save_asr_result(cache_path, combined)
+        save_segments(job_cache_dir / "fused-segments.json", combined.segments)
+        _write_json_local(job_cache_dir / "fusion-diagnostics.json", fusion_diagnostics)
+        return combined
+
+    def _audit_and_cache_quality(
+        self,
+        audio: Path,
+        duration: float,
+        job_cache_dir: Path,
+        combined: ASRResult,
+    ):
         try:
             silencedetect_output = self._run_cmd_capture(
                 [
@@ -3799,6 +3980,15 @@ class RollingPrefetchWorker(QObject):
             "proofread_scope": "full-document",
             "ai_zh_reference": False,
             "term_extraction": False,
+            "gemini_fusion_enabled": self.gemini_fusion_enabled,
+            "gemini_model": "gemini-2.5-flash" if self.gemini_fusion_enabled else "",
+            "gemini_prompt_version": (
+                GEMINI_PROMPT_VERSION if self.gemini_fusion_enabled else ""
+            ),
+            "fusion_algorithm_version": (
+                GEMINI_FUSION_VERSION if self.gemini_fusion_enabled else ""
+            ),
+            "gemini_correction_only": self.gemini_fusion_enabled,
         }
 
     def _load_current_final_cache(self, cache_path: Path) -> Optional[list[SubtitleSegment]]:
@@ -3918,14 +4108,21 @@ class RollingPrefetchWorker(QObject):
         self._export_subtitles(segments, output_base)
         self.status.emit(f"Final subtitles written: {output_base.with_suffix('.srt')}")
 
-    def _run_full_document_polish(self, job_cache_dir: Path, output_base: Path) -> list[SubtitleSegment]:
+    def _run_full_document_polish(
+        self,
+        job_cache_dir: Path,
+        output_base: Path,
+        *,
+        source_segments: Optional[list[SubtitleSegment]] = None,
+    ) -> list[SubtitleSegment]:
         raw_files = sorted(job_cache_dir.glob("chunk-*-raw.json"))
-        if not raw_files:
+        if source_segments is None and not raw_files:
             return []
         cache_path = self._full_polish_cache_path(job_cache_dir)
-        all_segments: list[SubtitleSegment] = []
-        for path in raw_files:
-            all_segments.extend(self._load_segment_cache(path, "Raw subtitle cache"))
+        all_segments = list(source_segments or [])
+        if source_segments is None:
+            for path in raw_files:
+                all_segments.extend(self._load_segment_cache(path, "Raw subtitle cache"))
         all_segments.sort(key=lambda item: (item.start, item.end))
         try:
             llm_ready = self._llm_polish_ready()
@@ -3949,7 +4146,7 @@ class RollingPrefetchWorker(QObject):
                     f"Full-document LLM polish cached ({time.monotonic() - t0:.1f}s)"
                 )
             else:
-                self.status.emit("No LLM provider/API key configured; exporting raw Whisper subtitles")
+                self.status.emit("No LLM provider/API key configured; using prepared ASR subtitles")
                 self._save_current_final_cache(
                     self._final_subtitle_cache_path(job_cache_dir),
                     all_segments,

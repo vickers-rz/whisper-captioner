@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from whisper_captioner.external_backends import (
+    _merge_adjacent_duplicate_segments,
     _fusion_confidence,
     fuse_gemini_with_whisper,
-    fuse_gemini_with_whisper_arbitrated,
     gemini_transcribe_audio,
-    refine_timing_with_qwen,
     run_omnivad_shadow,
 )
-from whisper_captioner.models import SubtitleWord
+from whisper_captioner.models import SubtitleSegment, SubtitleWord
 
 
 class ExternalBackendTests(unittest.TestCase):
@@ -73,7 +75,9 @@ class ExternalBackendTests(unittest.TestCase):
             SubtitleWord(3.6, 4.2, "test"),
         ]
         gemini_lines = ["Hello world.", "This is a test."]
-        segments = fuse_gemini_with_whisper(gemini_lines, words)
+        fusion = fuse_gemini_with_whisper(gemini_lines, words)
+        segments = fusion.segments
+        self.assertEqual(fusion.status, "completed")
         self.assertEqual(len(segments), 2)
         self.assertEqual(segments[0].text, "Hello world.")
         self.assertEqual(segments[1].text, "This is a test.")
@@ -90,7 +94,7 @@ class ExternalBackendTests(unittest.TestCase):
             SubtitleWord(5.0, 5.3, "C"),
         ]
         gemini_lines = ["A.", "B.", "C."]
-        segments = fuse_gemini_with_whisper(gemini_lines, words)
+        segments = fuse_gemini_with_whisper(gemini_lines, words).segments
         self.assertEqual(len(segments), 3)
         for i in range(1, len(segments)):
             self.assertGreaterEqual(segments[i].start, segments[i - 1].end,
@@ -98,10 +102,10 @@ class ExternalBackendTests(unittest.TestCase):
             self.assertGreater(segments[i].end, segments[i].start,
                 f"segment {i} has non-positive duration")
 
-    def test_fusion_fallback_without_words(self) -> None:
-        segments = fuse_gemini_with_whisper(["One.", "Two.", "Three."], [])
-        self.assertEqual(len(segments), 3)
-        self.assertGreater(segments[-1].end, 0)
+    def test_fusion_blocks_without_words(self) -> None:
+        fusion = fuse_gemini_with_whisper(["One.", "Two.", "Three."], [])
+        self.assertEqual(fusion.status, "blocked")
+        self.assertEqual(fusion.segments, [])
 
     def test_fusion_confidence_full_match(self) -> None:
         conf = _fusion_confidence("hello world", 2, 2, 11, 11)
@@ -115,7 +119,7 @@ class ExternalBackendTests(unittest.TestCase):
         conf = _fusion_confidence("completely different", 0, 0, 0, 20)
         self.assertLess(conf, 0.3)
 
-    def test_arbitrated_fusion_same_as_basic_when_no_low_confidence(self) -> None:
+    def test_high_confidence_gemini_text_corrects_whisper_baseline(self) -> None:
         words = [
             SubtitleWord(0.0, 0.5, "Hello"),
             SubtitleWord(0.6, 1.2, "world"),
@@ -124,14 +128,18 @@ class ExternalBackendTests(unittest.TestCase):
             SubtitleWord(3.0, 4.2, "test"),
         ]
         gemini_lines = ["Hello world.", "This is test."]
-        # min_confidence=0 means ALL segments are low-conf → arbiter called
-        # Use min_confidence=2.0 so NO arbiter is triggered
-        result = fuse_gemini_with_whisper_arbitrated(gemini_lines, words, min_confidence=2.0)
-        self.assertEqual(len(result), 2)
-        self.assertEqual(result[0].text, "Hello world.")
-        self.assertEqual(result[1].text, "This is test.")
+        whisper = [
+            SubtitleSegment(0.0, 1.2, "Hello word."),
+            SubtitleSegment(1.5, 4.2, "This is test."),
+        ]
+        result = fuse_gemini_with_whisper(
+            gemini_lines, words, whisper_segments=whisper, min_confidence=0.7
+        )
+        self.assertEqual(len(result.segments), 2)
+        self.assertEqual(result.segments[0].text, "Hello world.")
+        self.assertEqual(result.segments[1].text, "This is test.")
 
-    def test_arbitrated_fusion_preserves_gemini_text(self) -> None:
+    def test_high_confidence_proper_noun_correction_preserves_gemini_text(self) -> None:
         # Gemini says "Deberg" (correct), Whisper says "Danberg" (wrong)
         words = [
             SubtitleWord(95.0, 95.3, "Danberg"),
@@ -139,15 +147,171 @@ class ExternalBackendTests(unittest.TestCase):
             SubtitleWord(96.1, 96.4, "director"),
         ]
         gemini_lines = ["Deberg the director."]
-        result = fuse_gemini_with_whisper_arbitrated(gemini_lines, words, min_confidence=2.0)
-        self.assertEqual(len(result), 1)
-        # Text must always be Gemini's version, never Whisper's
-        self.assertEqual(result[0].text, "Deberg the director.")
+        result = fuse_gemini_with_whisper(
+            gemini_lines,
+            words,
+            whisper_segments=[SubtitleSegment(95.0, 96.4, "Danberg the director.")],
+            min_confidence=0.7,
+        )
+        self.assertEqual(len(result.segments), 1)
+        self.assertEqual(result.segments[0].text, "Deberg the director.")
 
-    def test_refine_timing_no_words_returns_none(self) -> None:
-        result = refine_timing_with_qwen("test sentence", [], 0.0, 1.0)
-        self.assertIsNone(result)
+    def test_duplicate_lines_map_to_distinct_time_ranges(self) -> None:
+        words = [
+            SubtitleWord(0.0, 0.5, "hello"),
+            SubtitleWord(0.6, 1.0, "world"),
+            SubtitleWord(4.0, 4.5, "hello"),
+            SubtitleWord(4.6, 5.0, "world"),
+        ]
+        result = fuse_gemini_with_whisper(["Hello world.", "Hello world."], words)
+        self.assertEqual(result.status, "completed")
+        self.assertLess(result.segments[0].end, result.segments[1].start)
+        self.assertAlmostEqual(result.segments[1].start, 4.0, delta=0.2)
 
+    def test_adjacent_duplicate_fallback_segments_are_merged(self) -> None:
+        long_text = (
+            "He claims his inspiration for the film is his own experiences "
+            "growing up in 1950s Liverpool."
+        )
+        segment_type = __import__(
+            "whisper_captioner.models", fromlist=["SubtitleSegment"]
+        ).SubtitleSegment
+        segments = [
+            segment_type(109.42, 115.72, long_text),
+            segment_type(118.74, 119.26, long_text),
+            segment_type(119.26, 119.34, long_text),
+            segment_type(119.34, 119.66, long_text),
+            segment_type(119.66, 119.72, long_text),
+            segment_type(119.72, 119.86, long_text),
+            segment_type(119.86, 119.98, long_text),
+        ]
+        merged, count = _merge_adjacent_duplicate_segments(segments)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(count, 6)
+        self.assertEqual((merged[0].start, merged[0].end), (109.42, 119.98))
+
+    def test_unmatched_gemini_text_preserves_whisper(self) -> None:
+        words = [SubtitleWord(1.0, 2.0, "original")]
+        whisper = [__import__("whisper_captioner.models", fromlist=["SubtitleSegment"]).SubtitleSegment(
+            1.0, 2.0, "original"
+        )]
+        result = fuse_gemini_with_whisper(
+            ["completely unrelated hallucination"],
+            words,
+            whisper_segments=whisper,
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.segments[0].text, "original")
+
+    def test_low_confidence_text_keeps_whisper_baseline(self) -> None:
+        words = [
+            SubtitleWord(0.0, 0.4, "hello"),
+            SubtitleWord(0.5, 1.0, "world"),
+            SubtitleWord(1.1, 1.5, "other"),
+        ]
+        whisper = [
+            SubtitleSegment(0.0, 1.0, "hello world"),
+            SubtitleSegment(1.1, 1.5, "other"),
+        ]
+        result = fuse_gemini_with_whisper(
+            ["hello world", "other extra"],
+            words,
+            whisper_segments=whisper,
+            min_confidence=0.6,
+        )
+        candidate = result.diagnostics["line_candidates"][1]
+        self.assertFalse(candidate["accepted"])
+        self.assertEqual(result.segments[-1].text, "other")
+
+    def test_missing_gemini_section_preserves_whisper_section(self) -> None:
+        words = [
+            SubtitleWord(0.0, 0.5, "first"),
+            SubtitleWord(0.6, 1.0, "line"),
+            SubtitleWord(2.0, 2.5, "missing"),
+            SubtitleWord(2.6, 3.0, "section"),
+            SubtitleWord(4.0, 4.5, "last"),
+            SubtitleWord(4.6, 5.0, "line"),
+        ]
+        whisper = [
+            SubtitleSegment(0.0, 1.0, "first line"),
+            SubtitleSegment(2.0, 3.0, "missing section"),
+            SubtitleSegment(4.0, 5.0, "last line"),
+        ]
+        result = fuse_gemini_with_whisper(
+            ["First line.", "Last line."],
+            words,
+            whisper_segments=whisper,
+        )
+        self.assertEqual(
+            [segment.text for segment in result.segments],
+            ["First line.", "missing section", "Last line."],
+        )
+
+    def test_file_api_upload_poll_generate_and_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "long.wav"
+            audio.write_bytes(b"x")
+            uploaded = SimpleNamespace(name="files/test", state="PROCESSING")
+            active = SimpleNamespace(name="files/test", state="ACTIVE")
+            response = SimpleNamespace(
+                text="first line\nsecond line",
+                candidates=[SimpleNamespace(finish_reason="STOP")],
+                usage_metadata=SimpleNamespace(candidates_token_count=2),
+            )
+            generation_client = MagicMock()
+            file_client = MagicMock()
+            file_client.files.upload.return_value = uploaded
+            file_client.files.get.return_value = active
+            generation_client.models.generate_content.return_value = response
+            fake_types = SimpleNamespace(
+                HttpOptions=lambda **kwargs: kwargs,
+                UploadFileConfig=lambda **kwargs: kwargs,
+                GenerateContentConfig=lambda **kwargs: kwargs,
+            )
+            fake_google = types.ModuleType("google")
+            fake_google.genai = SimpleNamespace(
+                Client=MagicMock(side_effect=[generation_client, file_client]),
+                types=fake_types,
+            )
+            with (
+                patch.dict(sys.modules, {"google": fake_google, "google.genai": fake_google.genai}),
+                patch("whisper_captioner.external_backends.GEMINI_INLINE_MAX_BYTES", 0),
+                patch("whisper_captioner.external_backends.time.sleep"),
+            ):
+                result = gemini_transcribe_audio(audio, "secret")
+        self.assertEqual(result.status, "completed")
+        file_client.files.upload.assert_called_once()
+        file_client.files.get.assert_called_once_with(name="files/test")
+        file_client.files.delete.assert_called_once_with(name="files/test")
+        self.assertEqual(result.diagnostics["cleanup"], "deleted")
+
+    def test_token_limit_output_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "short.wav"
+            audio.write_bytes(b"x")
+            response = SimpleNamespace(
+                text="partial transcript",
+                candidates=[SimpleNamespace(finish_reason="MAX_TOKENS")],
+                usage_metadata=SimpleNamespace(candidates_token_count=8192),
+            )
+            client = MagicMock()
+            client.models.generate_content.return_value = response
+            fake_types = SimpleNamespace(
+                HttpOptions=lambda **kwargs: kwargs,
+                GenerateContentConfig=lambda **kwargs: kwargs,
+            )
+            fake_google = types.ModuleType("google")
+            fake_google.genai = SimpleNamespace(
+                Client=MagicMock(return_value=client),
+                types=fake_types,
+            )
+            with patch.dict(
+                sys.modules,
+                {"google": fake_google, "google.genai": fake_google.genai},
+            ):
+                result = gemini_transcribe_audio(audio, "secret")
+        self.assertEqual(result.status, "failed")
+        self.assertIn("truncated", result.warning)
 
 if __name__ == "__main__":
     unittest.main()

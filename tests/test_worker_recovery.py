@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from whisper_captioner.models import MODES, SubtitleSegment
+from whisper_captioner.models import ASRResult, MODES, SubtitleSegment, SubtitleWord
 from whisper_captioner.config import SUBTITLE_PIPELINE_VERSION
 from whisper_captioner.workers import (
     QueueRunConfig,
@@ -22,10 +22,131 @@ from whisper_captioner.workers import (
     remote_asr_quality_issue,
     validate_remote_asr_segments,
 )
+from whisper_captioner.external_backends import GeminiTranscribeResult
+from whisper_captioner.subtitle_io import load_segments, save_asr_result
 from whisper_captioner.cache import controlled_cache_dir_name
 
 
 class WorkerRecoveryTest(unittest.TestCase):
+    def test_controlled_fusion_becomes_final_cache_source(self):
+        mode = next(mode for mode in MODES if mode.key == "nuc_asr_turbo")
+        worker = RollingPrefetchWorker(
+            "https://example.com/video",
+            mode,
+            gemini_fusion_enabled=True,
+            gemini_api_key="secret",
+        )
+        worker.cache_url = worker.url
+        whisper_segments = [SubtitleSegment(0.0, 1.0, "hello world")]
+        words = [
+            SubtitleWord(0.0, 0.4, "hello"),
+            SubtitleWord(0.5, 1.0, "world"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "audio.wav"
+            audio.write_bytes(b"audio")
+            save_asr_result(
+                root / "chunk-0000-asr-v2.json",
+                ASRResult("en", words, whisper_segments, {}),
+            )
+            with patch(
+                "whisper_captioner.workers.gemini_transcribe_audio",
+                return_value=GeminiTranscribeResult(
+                    "completed",
+                    "Hello world.",
+                    lines=["Hello world."],
+                    model="gemini-2.5-flash",
+                ),
+            ):
+                prepared = worker._prepare_final_asr_result(
+                    audio, root, whisper_segments
+                )
+            final = worker._run_full_document_polish(
+                root,
+                root / "output",
+                source_segments=prepared.segments,
+            )
+
+            self.assertEqual(final[0].text, "Hello world.")
+            self.assertEqual(
+                load_segments(root / "fused-segments.json")[0].text,
+                "Hello world.",
+            )
+            cache = worker._load_current_final_cache(
+                worker._final_subtitle_cache_path(root)
+            )
+            self.assertIsNone(cache)
+            payload = json.loads(
+                worker._final_subtitle_cache_path(root).read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["segments"][0]["text"], "Hello world.")
+
+    def test_final_cache_path_binds_fusion_toggle(self):
+        mode = next(mode for mode in MODES if mode.key == "nuc_asr_turbo")
+        plain = RollingPrefetchWorker("https://example.com/video", mode)
+        fused = RollingPrefetchWorker(
+            "https://example.com/video",
+            mode,
+            gemini_fusion_enabled=True,
+            gemini_api_key="secret",
+        )
+        root = Path("/tmp/cache")
+        self.assertNotEqual(
+            plain._final_subtitle_cache_path(root),
+            fused._final_subtitle_cache_path(root),
+        )
+
+    def test_queue_nuc_fusion_writes_raw_and_diagnostics_outputs(self):
+        mode = next(mode for mode in MODES if mode.key == "nuc_asr_turbo")
+        worker = QueueWorker(
+            ["input.mp3"],
+            mode,
+            gemini_fusion_enabled=True,
+            gemini_api_key="secret",
+        )
+        asr_result = ASRResult(
+            "en",
+            [
+                SubtitleWord(0.0, 0.4, "hello"),
+                SubtitleWord(0.5, 1.0, "world"),
+            ],
+            [SubtitleSegment(0.0, 1.0, "hello world")],
+            {},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wav = root / "audio.wav"
+            wav.write_bytes(b"audio")
+            with (
+                patch("whisper_captioner.workers.GENERATED_DIR", root / "generated"),
+                patch.object(worker, "_prepare_local_audio_cache", return_value=wav),
+                patch.object(
+                    worker,
+                    "_transcribe_file_via_nuc_chunks",
+                    return_value=asr_result,
+                ),
+                patch("whisper_captioner.workers._probe_audio_duration", return_value=1.0),
+                patch("whisper_captioner.workers.validate_remote_asr_segments"),
+                patch(
+                    "whisper_captioner.workers.gemini_transcribe_audio",
+                    return_value=GeminiTranscribeResult(
+                        "completed",
+                        "Hello world.",
+                        lines=["Hello world."],
+                        model="gemini-2.5-flash",
+                    ),
+                ),
+                patch.object(worker, "_release_nuc_asr"),
+            ):
+                self.assertTrue(worker._process("input.mp3"))
+            output_dir = root / "generated" / "input"
+            names = {path.name for path in output_dir.iterdir()}
+            self.assertTrue(any(name.endswith("-Whisper原始.srt") for name in names))
+            self.assertTrue(any(name.endswith("-Whisper原始-asr.json") for name in names))
+            self.assertTrue(any(name.endswith("-Gemini原文.txt") for name in names))
+            self.assertTrue(any(name.endswith("-fusion-diagnostics.json") for name in names))
+
     def test_yt_dlp_bot_challenge_with_browser_cookies_is_retryable(self):
         command = [
             "/opt/homebrew/bin/yt-dlp",

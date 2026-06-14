@@ -68,6 +68,7 @@ from whisper_captioner.chrome_control import (
     chrome_seek_url_relative,
     chrome_toggle_playback,
 )
+from whisper_captioner.credentials import delete_secret, load_secret, save_secret
 from whisper_captioner.llm_handler import (
     llm_provider_ready,
     test_llm_connection,
@@ -130,6 +131,8 @@ LOG_LEVELS = {
     "debug": 2,
     "trace": 3,
 }
+KEYCHAIN_SERVICE = "WhisperCaptioner"
+GEMINI_KEYCHAIN_ACCOUNT = "gemini-api-key"
 
 
 class LLMConnectionTestThread(QThread):
@@ -255,6 +258,7 @@ class MainWindow(QMainWindow):
         self.overlay_less_opacity_button.clicked.connect(lambda: self.overlay.adjust_opacity(-0.05))
         self.overlay_reset_button.clicked.connect(self.overlay._reset_position)
         self.gemini_fusion_checkbox.toggled.connect(self._on_gemini_fusion_toggled)
+        self.gemini_api_key_clear_button.clicked.connect(self._clear_gemini_api_key)
         self.history_refresh_button.clicked.connect(self.refresh_asr_history)
         self.history_search_input.textChanged.connect(self.refresh_asr_history)
         self.history_status_combo.currentIndexChanged.connect(self.refresh_asr_history)
@@ -336,8 +340,17 @@ class MainWindow(QMainWindow):
         self.gemini_fusion_checkbox.setChecked(
             settings.value("llm/gemini_fusion_enabled", False, type=bool)
         )
-        saved_gemini_key = str(settings.value("llm/gemini_api_key", ""))
-        self.gemini_api_key_input.setText(saved_gemini_key)
+        legacy_gemini_key = str(settings.value("llm/gemini_api_key", "")).strip()
+        try:
+            if legacy_gemini_key:
+                save_secret(KEYCHAIN_SERVICE, GEMINI_KEYCHAIN_ACCOUNT, legacy_gemini_key)
+            settings.remove("llm/gemini_api_key")
+            self.gemini_api_key_input.setText(
+                load_secret(KEYCHAIN_SERVICE, GEMINI_KEYCHAIN_ACCOUNT)
+            )
+        except Exception as exc:
+            settings.remove("llm/gemini_api_key")
+            self.log(f"Gemini Keychain migration/load failed: {exc}")
         saved_provider = str(settings.value("llm/provider", "gemini_flash"))
         idx = self.llm_provider_combo.findData(saved_provider)
         if idx >= 0:
@@ -390,7 +403,15 @@ class MainWindow(QMainWindow):
         settings = QSettings("WhisperCaptioner", "App")
         settings.setValue("llm/enabled", self.llm_group.isChecked())
         settings.setValue("llm/gemini_fusion_enabled", self.gemini_fusion_checkbox.isChecked())
-        settings.setValue("llm/gemini_api_key", self.gemini_api_key_input.text())
+        settings.remove("llm/gemini_api_key")
+        gemini_key = self.gemini_api_key_input.text().strip()
+        if gemini_key and not os.environ.get("GEMINI_API_KEY", "").strip():
+            try:
+                if load_secret(KEYCHAIN_SERVICE, GEMINI_KEYCHAIN_ACCOUNT) != gemini_key:
+                    save_secret(KEYCHAIN_SERVICE, GEMINI_KEYCHAIN_ACCOUNT, gemini_key)
+            except Exception as exc:
+                QMessageBox.critical(self, "Keychain 保存失败", str(exc))
+                raise
         settings.setValue(f"llm/apikey/{key}", self.llm_api_key_input.text())
         if key == "custom":
             settings.setValue("llm/custom_url", self.llm_custom_url_input.text().strip())
@@ -1399,6 +1420,10 @@ class MainWindow(QMainWindow):
             self.controlled_worker.stop()
         if self.llm_text_worker:
             self.llm_text_worker.stop()
+        if getattr(self, "realtime_polish_worker", None):
+            self.realtime_polish_worker.stop()
+        if getattr(self, "realtime_re_recognize_worker", None):
+            self.realtime_re_recognize_worker.stop()
         if self.controlled_timer.isActive():
             self.controlled_timer.stop()
         self._buffering_paused = False
@@ -1416,6 +1441,8 @@ class MainWindow(QMainWindow):
                 self.controlled_thread,
                 self.llm_text_thread,
                 self.llm_test_thread,
+                getattr(self, "realtime_polish_thread", None),
+                getattr(self, "realtime_re_recognize_thread", None),
             )
             if thread is not None and thread.isRunning()
         ]
@@ -1767,6 +1794,11 @@ class MainWindow(QMainWindow):
         fusion_checked = self.gemini_fusion_checkbox.isChecked()
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not gemini_key:
+            try:
+                gemini_key = load_secret(KEYCHAIN_SERVICE, GEMINI_KEYCHAIN_ACCOUNT)
+            except Exception as exc:
+                self.log(f"Gemini Keychain read failed: {exc}")
+        if not gemini_key:
             gemini_key = self.gemini_api_key_input.text().strip()
         self.queue_worker = QueueWorker(
             items, mode, self._queue_run_config(prepared_wavs),
@@ -1893,8 +1925,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "模型缺失", f"当前所选模式不可用：{mode.label}")
             return
 
-        # Save LLM settings before starting
-        self._save_current_llm_key()
+        proceed, gemini_key = self._check_gemini_fusion_ready()
+        if not proceed:
+            return
+        run_config = self._queue_run_config()
+        try:
+            self._save_current_llm_key()
+        except Exception:
+            return
         llm_provider = None
         llm_api_key = ""
         llm_api_url = ""
@@ -1932,44 +1970,47 @@ class MainWindow(QMainWindow):
         self.overlay.show()
         self.overlay.set_caption("正在准备字幕，Chrome 已暂停。")
         self._set_status_summary(f"网址受控字幕准备中 | 模式 {mode.label}")
-        self.controlled_thread = QThread()
-        run_config = self._queue_run_config()
-        proceed, gemini_key = self._check_gemini_fusion_ready()
-        if not proceed:
-            return
-        gemini_fusion = bool(gemini_key)
-
-        self.controlled_worker = RollingPrefetchWorker(
-            source, mode,
-            llm_provider=llm_provider, llm_api_key=llm_api_key,
-            llm_api_url=llm_api_url, llm_model_id=llm_model_id,
-            remote_vad_enabled=run_config.remote_vad_enabled,
-            run_config=run_config,
-            gemini_fusion_enabled=gemini_fusion and bool(gemini_key),
-            gemini_api_key=gemini_key,
-        )
-        self.controlled_worker.moveToThread(self.controlled_thread)
-        self.controlled_thread.started.connect(self.controlled_worker.run)
-        self.controlled_worker.status.connect(self.log)
-        self.controlled_worker.native_subtitles_detected.connect(self._handle_native_subtitles_detected)
-        self.controlled_worker.first_segments.connect(self._start_rolling_playback)
-        self.controlled_worker.more_segments.connect(self._add_rolling_segments)
-        self.controlled_worker.progress.connect(self._update_progress)
-        self.controlled_worker.quality_updated.connect(self._update_subtitle_quality)
-        self.controlled_worker.gemini_fusion_blocked.connect(self._on_gemini_fusion_blocked)
-        self.controlled_worker.all_done.connect(self._on_rolling_done)
-        self.controlled_worker.finished.connect(self.controlled_thread.quit)
-        self.controlled_thread.finished.connect(self._clear_controlled_worker)
-        if qwen3_asr_mode(mode) or mode.backend == "whisper_cpp":
-            self.mac_gpu_monitor.start()
-        self.controlled_thread.start()
+        try:
+            self.controlled_thread = QThread()
+            self.controlled_worker = RollingPrefetchWorker(
+                source, mode,
+                llm_provider=llm_provider, llm_api_key=llm_api_key,
+                llm_api_url=llm_api_url, llm_model_id=llm_model_id,
+                remote_vad_enabled=run_config.remote_vad_enabled,
+                run_config=run_config,
+                gemini_fusion_enabled=bool(gemini_key),
+                gemini_api_key=gemini_key,
+            )
+            self.controlled_worker.moveToThread(self.controlled_thread)
+            self.controlled_thread.started.connect(self.controlled_worker.run)
+            self.controlled_worker.status.connect(self.log)
+            self.controlled_worker.native_subtitles_detected.connect(self._handle_native_subtitles_detected)
+            self.controlled_worker.first_segments.connect(self._start_rolling_playback)
+            self.controlled_worker.more_segments.connect(self._add_rolling_segments)
+            self.controlled_worker.progress.connect(self._update_progress)
+            self.controlled_worker.quality_updated.connect(self._update_subtitle_quality)
+            self.controlled_worker.gemini_fusion_blocked.connect(self._on_gemini_fusion_blocked)
+            self.controlled_worker.all_done.connect(self._on_rolling_done)
+            self.controlled_worker.finished.connect(self.controlled_thread.quit)
+            self.controlled_thread.finished.connect(self._clear_controlled_worker)
+            if qwen3_asr_mode(mode) or mode.backend == "whisper_cpp":
+                self.mac_gpu_monitor.start()
+            self.controlled_thread.start()
+        except Exception as exc:
+            self._reset_controlled_start_failure(str(exc))
 
     def _check_gemini_fusion_ready(self) -> tuple[bool, str]:
         """Return (should_proceed, gemini_key) after possibly showing a dialog."""
         if not self.gemini_fusion_checkbox.isChecked():
             return True, ""
-        # Env var takes priority, GUI input as fallback
+        # Environment takes priority, followed by Keychain and current input.
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not gemini_key:
+            try:
+                gemini_key = load_secret(KEYCHAIN_SERVICE, GEMINI_KEYCHAIN_ACCOUNT)
+            except Exception as exc:
+                QMessageBox.critical(self, "Keychain 读取失败", str(exc))
+                return False, ""
         if not gemini_key:
             gemini_key = self.gemini_api_key_input.text().strip()
         if gemini_key:
@@ -1977,9 +2018,8 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setWindowTitle("Gemini 融合不可用")
         box.setText(
-            "已启用 Gemini + Whisper 双模型融合，但未设置 GEMINI_API_KEY 环境变量。\n\n"
-            "请在终端中设置：export GEMINI_API_KEY=\"your-key\"\n"
-            "然后重新启动 Whisper Captioner。"
+            "已启用 Gemini + Whisper 双模型融合，但没有可用的 API Key。\n\n"
+            "请设置 GEMINI_API_KEY 环境变量，或在设置页输入并保存到 macOS Keychain。"
         )
         box.setIcon(QMessageBox.Icon.Warning)
         skip_btn = box.addButton("跳过融合，继续", QMessageBox.ButtonRole.AcceptRole)
@@ -1990,13 +2030,38 @@ class MainWindow(QMainWindow):
         self.log("Gemini fusion: skipped by user (no API key)")
         return True, ""
 
+    def _clear_gemini_api_key(self) -> None:
+        try:
+            delete_secret(KEYCHAIN_SERVICE, GEMINI_KEYCHAIN_ACCOUNT)
+        except Exception as exc:
+            QMessageBox.critical(self, "Keychain 清除失败", str(exc))
+            return
+        QSettings("WhisperCaptioner", "App").remove("llm/gemini_api_key")
+        self.gemini_api_key_input.clear()
+        self.log("Gemini API key removed from Keychain")
+
+    def _reset_controlled_start_failure(self, reason: str = "") -> None:
+        thread = self.controlled_thread
+        worker = self.controlled_worker
+        self.controlled_thread = None
+        self.controlled_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None and not thread.isRunning():
+            thread.deleteLater()
+        self.progress_bar.setVisible(False)
+        self.overlay.set_caption("")
+        self._set_status_summary("网址受控字幕启动失败")
+        if self._controlled_url:
+            chrome_resume_url(self._controlled_url, activate_tab=False)
+        if reason:
+            self.log(f"Controlled URL startup failed: {reason}")
+
     def _on_gemini_fusion_toggled(self, checked: bool) -> None:
         if not checked:
             return
-        target_key = "nuc_asr_turbo"
+        target_key = "nuc_asr"
         idx = self.mode_combo.findData(target_key)
-        if idx < 0:
-            idx = self.mode_combo.findData("nuc_asr")
         if idx >= 0 and self.mode_combo.currentData() != target_key:
             self.mode_combo.setCurrentIndex(idx)
             mode = self.current_mode()
@@ -2308,6 +2373,7 @@ class App:
         self.overlay = SubtitleOverlay()
         self.window = MainWindow(self.overlay)
         self.tray = QSystemTrayIcon(QIcon.fromTheme("audio-input-microphone"))
+        self._quit_pending = False
         self.tray.setToolTip("Whisper 字幕助手")
         self._build_menu()
         self.qt.aboutToQuit.connect(self.shutdown)
@@ -2363,12 +2429,22 @@ class App:
         self.window.wait_for_threads()
 
     def quit(self) -> None:
-        self.shutdown()
-        if self.window.active_threads():
-            self.window.log("Quit delayed: waiting for worker thread to finish safely.")
-            QTimer.singleShot(1000, self.quit)
+        if self._quit_pending:
             return
-        self.qt.quit()
+        self._quit_pending = True
+        self.window.stop_all()
+        self.window.qwen_chat_service.stop()
+        self.window._set_status_summary("正在等待任务安全退出")
+        self._finish_quit_when_ready()
+
+    def _finish_quit_when_ready(self) -> None:
+        if self.window.wait_for_threads(timeout_ms=1000):
+            self.window._flush_ui_logs()
+            self.window._flush_file_logs()
+            self.qt.quit()
+            return
+        self.window.log("正在等待任务安全退出")
+        QTimer.singleShot(1000, self._finish_quit_when_ready)
 
     def run(self) -> int:
         self.window.show()
