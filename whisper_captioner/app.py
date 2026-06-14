@@ -1746,6 +1746,9 @@ class MainWindow(QMainWindow):
         ]
         if not items:
             return
+        proceed, _ = self._check_gemini_fusion_ready()
+        if not proceed:
+            return
         self._start_queue_items(items, mode)
 
     def _start_queue_items(
@@ -1808,6 +1811,9 @@ class MainWindow(QMainWindow):
         self.overlay.show()
         self.overlay.set_caption("正在处理本地文件。")
         self._set_status_summary(f"本地转写中 | 模式 {mode.label} | {path.name}")
+        proceed, _ = self._check_gemini_fusion_ready()
+        if not proceed:
+            return
         self._start_queue_items([str(path)], mode)
 
     def _update_queue_chunk_progress(self, progress: object) -> None:
@@ -1923,27 +1929,10 @@ class MainWindow(QMainWindow):
         self._set_status_summary(f"网址受控字幕准备中 | 模式 {mode.label}")
         self.controlled_thread = QThread()
         run_config = self._queue_run_config()
-        gemini_fusion = self.gemini_fusion_checkbox.isChecked()
-        gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-
-        # Pre-flight: Gemini fusion requires API key
-        if gemini_fusion and not gemini_key:
-            box = QMessageBox(self)
-            box.setWindowTitle("Gemini 融合不可用")
-            box.setText(
-                "已启用 Gemini + Whisper 双模型融合，但未设置 GEMINI_API_KEY 环境变量。\n\n"
-                "请在终端中设置：export GEMINI_API_KEY=\"your-key\"\n"
-                "然后重新启动 Whisper Captioner。"
-            )
-            box.setIcon(QMessageBox.Icon.Warning)
-            skip_btn = box.addButton("跳过融合，继续", QMessageBox.ButtonRole.AcceptRole)
-            cancel_btn = box.addButton("取消任务", QMessageBox.ButtonRole.RejectRole)
-            box.exec()
-            if box.clickedButton() == cancel_btn:
-                self.log("Gemini fusion: task cancelled by user (no API key)")
-                return
-            gemini_fusion = False
-            self.log("Gemini fusion: skipped by user (no API key)")
+        proceed, gemini_key = self._check_gemini_fusion_ready()
+        if not proceed:
+            return
+        gemini_fusion = bool(gemini_key)
 
         self.controlled_worker = RollingPrefetchWorker(
             source, mode,
@@ -1969,6 +1958,29 @@ class MainWindow(QMainWindow):
         if qwen3_asr_mode(mode) or mode.backend == "whisper_cpp":
             self.mac_gpu_monitor.start()
         self.controlled_thread.start()
+
+    def _check_gemini_fusion_ready(self) -> tuple[bool, str]:
+        """Return (should_proceed, gemini_key) after possibly showing a dialog."""
+        if not self.gemini_fusion_checkbox.isChecked():
+            return True, ""
+        gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if gemini_key:
+            return True, gemini_key
+        box = QMessageBox(self)
+        box.setWindowTitle("Gemini 融合不可用")
+        box.setText(
+            "已启用 Gemini + Whisper 双模型融合，但未设置 GEMINI_API_KEY 环境变量。\n\n"
+            "请在终端中设置：export GEMINI_API_KEY=\"your-key\"\n"
+            "然后重新启动 Whisper Captioner。"
+        )
+        box.setIcon(QMessageBox.Icon.Warning)
+        skip_btn = box.addButton("跳过融合，继续", QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = box.addButton("取消任务", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() == cancel_btn:
+            return False, ""
+        self.log("Gemini fusion: skipped by user (no API key)")
+        return True, ""
 
     def _on_gemini_fusion_toggled(self, checked: bool) -> None:
         if not checked:

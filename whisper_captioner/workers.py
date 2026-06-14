@@ -1866,6 +1866,9 @@ class QueueWorker(QObject):
 
                 # --- Gemini + Whisper fusion ---
                 if self.gemini_fusion_enabled and self.gemini_api_key and asr_result.words:
+                    self.status.emit(
+                        f"Gemini+Whisper fusion: sending {duration:.0f}s audio to Gemini 2.5 Flash..."
+                    )
                     gemini_result = gemini_transcribe_audio(
                         wav, self.gemini_api_key, model="gemini-2.5-flash",
                     )
