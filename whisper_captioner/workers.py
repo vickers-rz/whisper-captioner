@@ -1421,6 +1421,8 @@ class QueueWorker(QObject):
         items: list[str],
         mode: CaptionMode,
         config: QueueRunConfig | None = None,
+        gemini_fusion_enabled: bool = False,
+        gemini_api_key: str = "",
     ) -> None:
         super().__init__()
         self.items = items
@@ -1432,6 +1434,8 @@ class QueueWorker(QObject):
         self._process_lock = threading.RLock()
         self._active_processes: set[subprocess.Popen[str]] = set()
         self._used_nuc_asr = False
+        self.gemini_fusion_enabled = gemini_fusion_enabled
+        self.gemini_api_key = gemini_api_key
         self.history = ASRHistoryStore()
 
     def run(self) -> None:
@@ -1576,9 +1580,10 @@ class QueueWorker(QObject):
         base_url: str,
         model: str,
         chunk_seconds: float = 60.0,
-    ) -> list[SubtitleSegment]:
+    ) -> ASRResult:
         duration = _probe_audio_duration(wav)
         all_segments: list[SubtitleSegment] = []
+        all_words: list[SubtitleWord] = []
         chunk_count = max(1, math.ceil(duration / chunk_seconds))
         with tempfile.TemporaryDirectory(prefix="whisper-captioner-nuc-asr-") as directory:
             chunk_dir = Path(directory)
@@ -1622,20 +1627,22 @@ class QueueWorker(QObject):
                         "no stable voice window detected"
                     )
                     continue
-                chunk_segments = _transcribe_via_nuc_asr(
+
+                result = _transcribe_via_nuc_asr_result(
                     chunk_wav,
                     base_url=base_url,
                     model=model,
                     timeout=max(180, int(remaining * 4)),
                     status_signal=self.status,
                 )
+                chunk_segments = result.segments
                 issue = remote_asr_quality_issue(chunk_segments)
                 if issue:
                     self.status.emit(
                         f"NUC ASR chunk {chunk_index + 1}/{chunk_count} "
                         f"looked unstable ({issue}); retrying with VAD"
                     )
-                    chunk_segments = _transcribe_via_nuc_asr(
+                    result = _transcribe_via_nuc_asr_result(
                         chunk_wav,
                         base_url=base_url,
                         model=model,
@@ -1643,6 +1650,7 @@ class QueueWorker(QObject):
                         timeout=max(180, int(remaining * 4)),
                         status_signal=self.status,
                     )
+                    chunk_segments = result.segments
                     validate_remote_asr_segments(chunk_segments)
                 for segment_index, segment in enumerate(chunk_segments):
                     local_start = max(0.0, min(remaining, segment.start))
@@ -1661,12 +1669,27 @@ class QueueWorker(QObject):
                                 segment.text,
                             )
                         )
+                for word in result.words:
+                    all_words.append(
+                        SubtitleWord(
+                            start=max(0.0, word.start + start),
+                            end=max(0.0, word.end + start),
+                            text=word.text,
+                            probability=word.probability,
+                        )
+                    )
                 self.status.emit(
                     f"NUC ASR chunk {chunk_index + 1}/{chunk_count}: "
-                    f"{len(chunk_segments)} segment(s)"
+                    f"{len(chunk_segments)} segment(s), {len(result.words)} word(s)"
                 )
         validate_remote_asr_segments(all_segments)
-        return all_segments
+        language = result.language if chunk_count > 0 else ""
+        return ASRResult(
+            language=language,
+            words=all_words,
+            segments=all_segments,
+            diagnostics={"word_timestamp_source": "nuc_faster_whisper_chunks"},
+        )
 
     def _transcribe_local_file_via_nuc_qwen_job(self, wav: Path, *, base_url: str) -> list[SubtitleSegment]:
         import urllib.request
@@ -1833,12 +1856,32 @@ class QueueWorker(QObject):
                 self.status.emit(
                     f"NUC remote ASR will process {duration:.1f}s audio in 60s chunks"
                 )
-                segments = self._transcribe_file_via_nuc_chunks(
+                asr_result = self._transcribe_file_via_nuc_chunks(
                     wav,
                     base_url=str(self.mode.model),
                     model=nuc_asr_model,
                 )
+                segments = asr_result.segments
                 validate_remote_asr_segments(segments)
+
+                # --- Gemini + Whisper fusion ---
+                if self.gemini_fusion_enabled and self.gemini_api_key and asr_result.words:
+                    gemini_result = gemini_transcribe_audio(
+                        wav, self.gemini_api_key, model="gemini-2.5-flash",
+                    )
+                    if gemini_result.status == "completed" and gemini_result.lines:
+                        fused = fuse_gemini_with_whisper(gemini_result.lines, asr_result.words)
+                        if fused:
+                            segments = fused
+                            self.status.emit(
+                                f"Gemini+Whisper fusion: {len(gemini_result.lines)} Gemini lines → "
+                                f"{len(fused)} fused segments ({gemini_result.elapsed:.1f}s)"
+                            )
+                    elif gemini_result.status == "failed":
+                        self.status.emit(f"Gemini fusion failed: {gemini_result.warning}")
+                elif self.gemini_fusion_enabled and not asr_result.words:
+                    self.status.emit("Gemini fusion skipped: no word timestamps from ASR")
+
                 save_segments_as_txt(base.with_suffix(".txt"), segments)
                 save_segments_as_srt(base.with_suffix(".srt"), segments)
             elif self.mode.backend == "nuc_qwen3_asr_1p7b":

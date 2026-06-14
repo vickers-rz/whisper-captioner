@@ -254,6 +254,7 @@ class MainWindow(QMainWindow):
         self.overlay_more_opacity_button.clicked.connect(lambda: self.overlay.adjust_opacity(0.05))
         self.overlay_less_opacity_button.clicked.connect(lambda: self.overlay.adjust_opacity(-0.05))
         self.overlay_reset_button.clicked.connect(self.overlay._reset_position)
+        self.gemini_fusion_checkbox.toggled.connect(self._on_gemini_fusion_toggled)
         self.history_refresh_button.clicked.connect(self.refresh_asr_history)
         self.history_search_input.textChanged.connect(self.refresh_asr_history)
         self.history_status_combo.currentIndexChanged.connect(self.refresh_asr_history)
@@ -1757,7 +1758,13 @@ class MainWindow(QMainWindow):
             self.log("Queue is already running")
             return
         self.queue_thread = QThread()
-        self.queue_worker = QueueWorker(items, mode, self._queue_run_config(prepared_wavs))
+        gemini_fusion = self.gemini_fusion_checkbox.isChecked()
+        gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        self.queue_worker = QueueWorker(
+            items, mode, self._queue_run_config(prepared_wavs),
+            gemini_fusion_enabled=gemini_fusion and bool(gemini_key),
+            gemini_api_key=gemini_key,
+        )
         self.queue_worker.moveToThread(self.queue_thread)
         self.queue_thread.started.connect(self.queue_worker.run)
         self.queue_worker.status.connect(self.log)
@@ -1962,6 +1969,20 @@ class MainWindow(QMainWindow):
         if qwen3_asr_mode(mode) or mode.backend == "whisper_cpp":
             self.mac_gpu_monitor.start()
         self.controlled_thread.start()
+
+    def _on_gemini_fusion_toggled(self, checked: bool) -> None:
+        if not checked:
+            return
+        target_key = "nuc_asr_turbo"
+        idx = self.mode_combo.findData(target_key)
+        if idx < 0:
+            idx = self.mode_combo.findData("nuc_asr")
+        if idx >= 0 and self.mode_combo.currentData() != target_key:
+            self.mode_combo.setCurrentIndex(idx)
+            mode = self.current_mode()
+            self.log(
+                f"Gemini 双模型融合已启用，自动切换 ASR 模式为 {mode.label}"
+            )
 
     def _on_gemini_fusion_blocked(self, reason: str) -> None:
         box = QMessageBox(self)
