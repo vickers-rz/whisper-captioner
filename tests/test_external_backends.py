@@ -7,8 +7,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from whisper_captioner.external_backends import (
+    _fusion_confidence,
     fuse_gemini_with_whisper,
+    fuse_gemini_with_whisper_arbitrated,
     gemini_transcribe_audio,
+    refine_timing_with_qwen,
     run_omnivad_shadow,
 )
 from whisper_captioner.models import SubtitleWord
@@ -99,6 +102,51 @@ class ExternalBackendTests(unittest.TestCase):
         segments = fuse_gemini_with_whisper(["One.", "Two.", "Three."], [])
         self.assertEqual(len(segments), 3)
         self.assertGreater(segments[-1].end, 0)
+
+    def test_fusion_confidence_full_match(self) -> None:
+        conf = _fusion_confidence("hello world", 2, 2, 11, 11)
+        self.assertGreater(conf, 0.9)
+
+    def test_fusion_confidence_partial_match(self) -> None:
+        conf = _fusion_confidence("hello world extra", 1, 3, 5, 17)
+        self.assertLess(conf, 0.5)
+
+    def test_fusion_confidence_no_match(self) -> None:
+        conf = _fusion_confidence("completely different", 0, 0, 0, 20)
+        self.assertLess(conf, 0.3)
+
+    def test_arbitrated_fusion_same_as_basic_when_no_low_confidence(self) -> None:
+        words = [
+            SubtitleWord(0.0, 0.5, "Hello"),
+            SubtitleWord(0.6, 1.2, "world"),
+            SubtitleWord(1.5, 2.0, "this"),
+            SubtitleWord(2.1, 2.8, "is"),
+            SubtitleWord(3.0, 4.2, "test"),
+        ]
+        gemini_lines = ["Hello world.", "This is test."]
+        # min_confidence=0 means ALL segments are low-conf → arbiter called
+        # Use min_confidence=2.0 so NO arbiter is triggered
+        result = fuse_gemini_with_whisper_arbitrated(gemini_lines, words, min_confidence=2.0)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].text, "Hello world.")
+        self.assertEqual(result[1].text, "This is test.")
+
+    def test_arbitrated_fusion_preserves_gemini_text(self) -> None:
+        # Gemini says "Deberg" (correct), Whisper says "Danberg" (wrong)
+        words = [
+            SubtitleWord(95.0, 95.3, "Danberg"),
+            SubtitleWord(95.4, 96.0, "the"),
+            SubtitleWord(96.1, 96.4, "director"),
+        ]
+        gemini_lines = ["Deberg the director."]
+        result = fuse_gemini_with_whisper_arbitrated(gemini_lines, words, min_confidence=2.0)
+        self.assertEqual(len(result), 1)
+        # Text must always be Gemini's version, never Whisper's
+        self.assertEqual(result[0].text, "Deberg the director.")
+
+    def test_refine_timing_no_words_returns_none(self) -> None:
+        result = refine_timing_with_qwen("test sentence", [], 0.0, 1.0)
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

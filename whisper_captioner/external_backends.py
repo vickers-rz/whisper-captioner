@@ -248,10 +248,237 @@ def fuse_gemini_with_whisper(
     return normalized
 
 
+def _fusion_confidence(
+    gemini_line: str,
+    matched_word_count: int,
+    total_words_in_span: int,
+    matched_chars: int,
+    total_chars: int,
+) -> float:
+    """Estimate alignment confidence for a fused segment (0.0–1.0).
+
+    High confidence = most Gemini chars matched to Whisper words.
+    Low confidence = Gemini text has little overlap with Whisper text.
+    """
+    if total_chars == 0:
+        return 1.0
+    char_ratio = matched_chars / total_chars
+    if total_words_in_span == 0:
+        return min(char_ratio, 0.3)  # no Whisper match at all
+    word_ratio = matched_word_count / max(1, total_words_in_span)
+    return 0.4 * char_ratio + 0.6 * word_ratio  # word match weighted higher
+
+
+def refine_timing_with_qwen(
+    gemini_sentence: str,
+    whisper_words_nearby: list[SubtitleWord],
+    proposed_start: float,
+    proposed_end: float,
+    ollama_host: str = "192.168.31.196",
+    ollama_port: str = "11434",
+    timeout: int = 30,
+) -> tuple[float, float] | None:
+    """Use NUC Qwen3.5-4B to refine sentence-to-timeline alignment.
+
+    Qwen's role (timing arbiter only):
+    - Gemini text is TRUSTED and MUST NOT be modified.
+    - Only output refined start_ms and end_ms based on the Whisper word timeline.
+    """
+    if not whisper_words_nearby:
+        return None
+
+    # Build a word timeline reference for Qwen
+    timeline_lines = []
+    for w in whisper_words_nearby:
+        timeline_lines.append(f"  [{w.start:.2f}s-{w.end:.2f}s] {w.text}")
+    timeline = "\n".join(timeline_lines)
+
+    prompt = (
+        "你是一个时间轴仲裁者。以下是 Whisper 提供的带时间戳的词级转写：\n\n"
+        f"{timeline}\n\n"
+        "以下是 Gemini 提供的目标句子（文本内容不可修改）：\n\n"
+        f"「{gemini_sentence}」\n\n"
+        "你的任务：在 Whisper 时间轴上找到最能覆盖这句 Gemini 句子的起止时间。\n"
+        "严格要求：\n"
+        "1. 只输出两个数字：start_ms end_ms（毫秒，整数）\n"
+        "2. 不要输出任何其他文字、标点或解释\n"
+        "3. Gemini 文本不可修改，你只负责定位时间轴\n"
+        "4. 如果找不到匹配，输出两个 0\n\n"
+        f"当前建议时间范围：{proposed_start*1000:.0f}ms-{proposed_end*1000:.0f}ms\n"
+    )
+
+    try:
+        import urllib.request
+        payload = json.dumps({
+            "model": "qwen3.5:4b",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "options": {"num_predict": 80, "temperature": 0.0},
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://{ollama_host}:{ollama_port}/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        content = body.get("message", {}).get("content", "").strip()
+
+        # Parse "start_ms end_ms"
+        parts = content.replace(",", " ").split()
+        if len(parts) >= 2:
+            start_ms = int(parts[0])
+            end_ms = int(parts[1])
+            if start_ms >= 0 and end_ms > start_ms:
+                return (start_ms / 1000.0, end_ms / 1000.0)
+        return None
+    except Exception:
+        return None
+
+
+@dataclass
+class FusedSegment:
+    start: float
+    end: float
+    text: str
+    confidence: float = 1.0
+
+
+def fuse_gemini_with_whisper_arbitrated(
+    gemini_lines: list[str],
+    whisper_words: list[SubtitleWord],
+    *,
+    ollama_host: str = "192.168.31.196",
+    ollama_port: str = "11434",
+    min_confidence: float = 0.4,
+) -> list[SubtitleSegment]:
+    """Fuse Gemini text with Whisper timestamps, with Qwen arbiter for low-confidence alignments.
+
+    Policy:
+    - Gemini text is the SOLE source of truth for content — never modified.
+    - Whisper word timestamps are the time axis.
+    - difflib provides initial alignment + confidence score.
+    - Low-confidence segments get Qwen timing refinement.
+    - Qwen only adjusts start_ms/end_ms, never text.
+    """
+    if not whisper_words:
+        total = max(1.0, float(len(gemini_lines)))
+        return [
+            SubtitleSegment(i / total * 180, (i + 1) / total * 180, line)
+            for i, line in enumerate(gemini_lines)
+        ]
+
+    # Build Whisper full text and word index spans
+    word_spans: list[tuple[int, int, float, float, int]] = []
+    pos = 0
+    for i, w in enumerate(whisper_words):
+        token = w.text
+        word_spans.append((pos, pos + len(token), w.start, w.end, i))
+        pos += len(token) + 1
+
+    whisper_full = " ".join(w.text for w in whisper_words)
+    gemini_full = "\n".join(gemini_lines)
+
+    # difflib character alignment
+    matcher = difflib.SequenceMatcher(
+        a=whisper_full.lower(), b=gemini_full.lower()
+    )
+    matches = matcher.get_matching_blocks()
+
+    gemini_char_to_word: list[int | None] = [None] * len(gemini_full)
+    for a, b, size in matches:
+        if size == 0:
+            continue
+        for offset in range(size):
+            g_pos = b + offset
+            w_pos = a + offset
+            for ws, we, _, _, wi in word_spans:
+                if ws <= w_pos < we:
+                    gemini_char_to_word[g_pos] = wi
+                    break
+
+    # Build fused segments with confidence
+    fused: list[FusedSegment] = []
+    for line in gemini_lines:
+        idx = gemini_full.index(line)
+        g_start = idx
+        g_end = idx + len(line)
+
+        word_indices: set[int] = set()
+        matched_chars = 0
+        for g_pos in range(g_start, min(g_end, len(gemini_char_to_word))):
+            wi = gemini_char_to_word[g_pos]
+            if wi is not None:
+                word_indices.add(wi)
+                matched_chars += 1
+        total_chars = g_end - g_start
+
+        if word_indices:
+            t_start = whisper_words[min(word_indices)].start
+            t_end = whisper_words[max(word_indices)].end
+            total_words = max(word_indices) - min(word_indices) + 1
+        else:
+            t_start = 0.0
+            for g_pos in range(g_start, -1, -1):
+                if g_pos < len(gemini_char_to_word) and gemini_char_to_word[g_pos] is not None:
+                    t_start = whisper_words[gemini_char_to_word[g_pos]].end
+                    break
+            t_end = t_start + 1.0
+            for g_pos in range(g_end, len(gemini_char_to_word)):
+                if gemini_char_to_word[g_pos] is not None:
+                    t_end = whisper_words[gemini_char_to_word[g_pos]].start
+                    break
+            total_words = 0
+
+        conf = _fusion_confidence(line, len(word_indices), total_words, matched_chars, total_chars)
+        fused.append(FusedSegment(
+            start=max(0.0, t_start),
+            end=max(t_start + 0.4, t_end),
+            text=line,
+            confidence=conf,
+        ))
+
+    # Refine low-confidence segments with Qwen arbiter
+    low_conf = [s for s in fused if s.confidence < min_confidence]
+    if low_conf and whisper_words:
+        for seg in low_conf:
+            mid = (seg.start + seg.end) / 2
+            window = 15.0
+            nearby = [
+                w for w in whisper_words
+                if seg.start - window <= w.start <= seg.end + window
+            ]
+            refined = refine_timing_with_qwen(
+                seg.text, nearby, seg.start, seg.end,
+                ollama_host=ollama_host, ollama_port=ollama_port,
+            )
+            if refined:
+                seg.start, seg.end = refined
+                seg.confidence = min(1.0, seg.confidence + 0.3)  # boost after refinement
+
+    # Normalize timeline
+    normalized: list[SubtitleSegment] = []
+    for i, seg in enumerate(fused):
+        text = seg.text.strip()
+        if not text:
+            continue
+        start = seg.start
+        next_start = fused[i + 1].start if i + 1 < len(fused) else seg.end + 1.0
+        end = max(seg.end, start + 0.4)
+        end = min(end, next_start)
+        if normalized and start < normalized[-1].end:
+            start = normalized[-1].end
+        if end <= start:
+            end = start + 0.001
+        normalized.append(SubtitleSegment(start, end, text))
+
+    return normalized
+
+
 def gemini_fusion_cache_key(audio_path: Path, gemini_model: str, whisper_model: str) -> str:
     digest = hashlib.sha256()
     digest.update(str(audio_path).encode())
     digest.update(gemini_model.encode())
     digest.update(whisper_model.encode())
-    digest.update(b"gemini-whisper-fusion-v1")
+    digest.update(b"gemini-whisper-fusion-v2")
     return digest.hexdigest()[:24]

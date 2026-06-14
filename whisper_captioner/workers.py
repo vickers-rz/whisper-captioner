@@ -83,7 +83,7 @@ from whisper_captioner.llm_handler import (
     llm_provider_ready,
 )
 from whisper_captioner.external_backends import (
-    fuse_gemini_with_whisper,
+    fuse_gemini_with_whisper_arbitrated,
     gemini_transcribe_audio,
     run_omnivad_shadow,
 )
@@ -1870,7 +1870,7 @@ class QueueWorker(QObject):
                         wav, self.gemini_api_key, model="gemini-2.5-flash",
                     )
                     if gemini_result.status == "completed" and gemini_result.lines:
-                        fused = fuse_gemini_with_whisper(gemini_result.lines, asr_result.words)
+                        fused = fuse_gemini_with_whisper_arbitrated(gemini_result.lines, asr_result.words)
                         if fused:
                             segments = fused
                             self.status.emit(
