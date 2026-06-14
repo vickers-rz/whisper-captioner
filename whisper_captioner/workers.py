@@ -82,12 +82,7 @@ from whisper_captioner.llm_handler import (
     llm_proofread,
     llm_provider_ready,
 )
-from whisper_captioner.external_backends import (
-    alignment_cache_key,
-    optional_alignment_backend,
-    run_omnivad_shadow,
-    save_alignment_result,
-)
+from whisper_captioner.external_backends import run_omnivad_shadow
 from whisper_captioner.models import (
     ASRResult,
     CaptionMode,
@@ -3421,31 +3416,7 @@ class RollingPrefetchWorker(QObject):
             if report.status == "passed":
                 report.status = "passed_with_warnings"
 
-        alignment_status = {"status": "disabled"}
-        if _env_bool("WHISPER_CAPTIONER_ALIGNMENT_ENABLED", False):
-            backend = optional_alignment_backend()
-            if backend is None or not backend.available:
-                alignment_status = {"status": "unavailable", "warning": "alignment CLI unavailable"}
-                report.warnings.append("alignment CLI unavailable")
-            elif not os.environ.get("LATTIFAI_API_KEY", "").strip():
-                alignment_status = {
-                    "status": "unauthenticated",
-                    "warning": "LATTIFAI_API_KEY is not configured",
-                }
-                report.warnings.append("LattifAI is installed but not authenticated")
-            elif not combined.words:
-                try:
-                    transcript = "\n".join(segment.text for segment in combined.segments)
-                    key = alignment_cache_key(audio, transcript, backend)
-                    aligned = backend.align(audio, transcript, job_cache_dir / f"alignment-{key}")
-                    save_alignment_result(job_cache_dir / f"alignment-{key}.json", aligned)
-                    alignment_status = {"status": "completed", "backend": backend.name}
-                except Exception as exc:
-                    alignment_status = {"status": "failed", "warning": str(exc)}
-                    report.warnings.append(f"alignment failed: {exc}")
-            else:
-                alignment_status = {"status": "not_needed", "reason": "reliable word timestamps available"}
-        report.diagnostics["alignment"] = alignment_status
+        report.diagnostics["alignment"] = {"status": "abandoned", "reason": "LattifAI tested and rejected"}
         report.diagnostics["language"] = combined.language
         report.diagnostics["language_policy"] = (
             "explicit" if self._language_pin.explicit_language not in {"", "auto"} else "detect-once-then-pin"

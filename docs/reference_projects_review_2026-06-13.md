@@ -224,6 +224,9 @@ fallback. License: Apache-2.0.
 
 ### lattifai-python
 
+> **2026-06-14: 已测试并放弃。** 对齐质量不满足本项目需求，相关代码已从
+> `external_backends.py`、`workers.py` 和测试中移除。
+
 Absorb:
 
 - forced alignment as a separate stage;

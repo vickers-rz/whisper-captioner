@@ -65,7 +65,7 @@
 - [x] 统一质量审计和最多两轮局部补录。
 - [x] detect-once-then-pin。
 - [x] OmniVAD shadow。
-- [x] 可选 CLI 强制对齐。
+- [x] 可选 CLI 强制对齐（已测试 LattifAI，质量不满足需求，已放弃并移除代码）
 - [x] UI、日志、缓存签名和恢复流程。
 - [x] 单元测试及真实素材回归。
 
@@ -96,8 +96,8 @@
 - 真实响应保存在 NUC
   `/app/asr-results/20260614-062306-319db533-school-names-240-265.wav`。
 - OmniVAD `0.2.12` 已安装并完成真实音频冒烟，25 秒音频 RTF 约 `0.0115`。
-- LattifAI `1.5.16` 已安装，MPS/CoreML 和依赖自检正常；当前缺少
-  `LATTIFAI_API_KEY`，因此 UI/质量报告显示 `unauthenticated`，普通字幕不受影响。
+- LattifAI `1.5.16` 已测试：对齐质量不满足项目需求，已放弃。
+  对齐相关代码已从 `external_backends.py`、`workers.py` 和测试中移除。
 
 真实素材：
 

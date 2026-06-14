@@ -7,18 +7,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from whisper_captioner.external_backends import (
-    CliAlignmentBackend,
     run_omnivad_shadow,
 )
 
 
 class ExternalBackendTests(unittest.TestCase):
-    def test_alignment_cli_missing_is_reported(self) -> None:
-        backend = CliAlignmentBackend("/definitely/missing/lai")
-        self.assertFalse(backend.available)
-        with self.assertRaisesRegex(RuntimeError, "unavailable"):
-            backend.align(Path("/tmp/audio.wav"), "text", Path("/tmp/output"))
-
     def test_omnivad_missing_falls_back_without_exception(self) -> None:
         with patch.dict(
             "os.environ",
