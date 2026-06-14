@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 UPSTREAM_BASE_URL = os.environ.get("UPSTREAM_BASE_URL", "http://nuc-asr-backend:8000")
@@ -153,6 +153,8 @@ async def _transcribe_local_file_to_result(
     model: str,
     language: str,
     response_format: str,
+    vad_filter: bool,
+    timestamp_granularities: list[str],
     result_dir: Path,
 ) -> dict[str, Any]:
     await _scheduler_post("/admit/asr")
@@ -162,6 +164,8 @@ async def _transcribe_local_file_to_result(
         "model": model,
         "language": language,
         "response_format": response_format,
+        "vad_filter": vad_filter,
+        "timestamp_granularities": timestamp_granularities,
         "audio_path": str(audio_path),
         "received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "result_dir": str(result_dir),
@@ -177,10 +181,11 @@ async def _transcribe_local_file_to_result(
         try:
             async with httpx.AsyncClient(timeout=None) as client:
                 with audio_path.open("rb") as audio_file:
-                    form_data = {
+                    form_data: dict[str, Any] = {
                         "model": model,
                         "response_format": response_format,
-                        "vad_filter": "true",
+                        "vad_filter": "true" if vad_filter else "false",
+                        "timestamp_granularities[]": timestamp_granularities,
                     }
                     if language.strip().lower() not in {"", "auto"}:
                         form_data["language"] = language
@@ -225,6 +230,8 @@ class LocalFileTaskRequest(BaseModel):
     model: str = "large-v3"
     language: str = "auto"
     response_format: str = "verbose_json"
+    vad_filter: bool = False
+    timestamp_granularities: list[str] = Field(default_factory=lambda: ["word"])
 
 
 def _create_task_record(
@@ -235,6 +242,8 @@ def _create_task_record(
     model: str,
     language: str,
     response_format: str,
+    vad_filter: bool,
+    timestamp_granularities: list[str],
     result_dir: Path,
 ) -> dict[str, Any]:
     return _task_update(
@@ -246,6 +255,8 @@ def _create_task_record(
         model=model,
         language=language,
         response_format=response_format,
+        vad_filter=vad_filter,
+        timestamp_granularities=timestamp_granularities,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         result_dir=str(result_dir),
@@ -260,6 +271,8 @@ def _start_local_file_task(
     model: str,
     language: str,
     response_format: str,
+    vad_filter: bool,
+    timestamp_granularities: list[str],
     result_dir: Path,
 ) -> None:
     async def runner() -> None:
@@ -276,6 +289,8 @@ def _start_local_file_task(
                 model=model,
                 language=language,
                 response_format=response_format,
+                vad_filter=vad_filter,
+                timestamp_granularities=timestamp_granularities,
                 result_dir=result_dir,
             )
             _task_update(
@@ -368,6 +383,8 @@ async def transcribe(
     model: str = Form("large-v3"),
     language: str = Form("auto"),
     response_format: str = Form("verbose_json"),
+    vad_filter: bool = Form(False),
+    timestamp_granularities: list[str] = Form(["word"], alias="timestamp_granularities[]"),
 ) -> Any:
     audio_bytes = await file.read()
     filename = file.filename or "audio.wav"
@@ -385,6 +402,7 @@ async def transcribe(
         "received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "result_dir": str(result_dir),
         "audio_path": str(audio_path),
+        "timestamp_granularities": timestamp_granularities,
     }
     _write_json(result_dir / "metadata.json", metadata)
     return await _transcribe_local_file_to_result(
@@ -393,6 +411,8 @@ async def transcribe(
         model=model,
         language=language,
         response_format=response_format,
+        vad_filter=vad_filter,
+        timestamp_granularities=timestamp_granularities,
         result_dir=result_dir,
     )
 
@@ -411,6 +431,8 @@ async def submit_local_file_job(payload: LocalFileTaskRequest) -> dict[str, Any]
         model=payload.model,
         language=payload.language,
         response_format=payload.response_format,
+        vad_filter=payload.vad_filter,
+        timestamp_granularities=payload.timestamp_granularities,
         result_dir=result_dir,
     )
     _start_local_file_task(
@@ -420,6 +442,8 @@ async def submit_local_file_job(payload: LocalFileTaskRequest) -> dict[str, Any]
         model=payload.model,
         language=payload.language,
         response_format=payload.response_format,
+        vad_filter=payload.vad_filter,
+        timestamp_granularities=payload.timestamp_granularities,
         result_dir=result_dir,
     )
     return task
@@ -431,6 +455,8 @@ async def upload_local_file_job(
     model: str = Form("large-v3"),
     language: str = Form("auto"),
     response_format: str = Form("verbose_json"),
+    vad_filter: bool = Form(False),
+    timestamp_granularities: list[str] = Form(["word"], alias="timestamp_granularities[]"),
 ) -> dict[str, Any]:
     filename = file.filename or "audio.wav"
     task_id, task_dir = _stage_task_dir(filename)
@@ -445,6 +471,8 @@ async def upload_local_file_job(
         model=model,
         language=language,
         response_format=response_format,
+        vad_filter=vad_filter,
+        timestamp_granularities=timestamp_granularities,
         result_dir=result_dir,
     )
     _write_json(
@@ -463,6 +491,8 @@ async def upload_local_file_job(
         model=model,
         language=language,
         response_format=response_format,
+        vad_filter=vad_filter,
+        timestamp_granularities=timestamp_granularities,
         result_dir=result_dir,
     )
     return task

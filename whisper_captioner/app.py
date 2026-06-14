@@ -27,6 +27,7 @@ from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QInputDialog,
     QListWidgetItem,
     QMainWindow,
     QMenu,
@@ -56,6 +57,7 @@ from whisper_captioner.chrome_control import (
     chrome_current_time,
     chrome_current_time_url,
     chrome_get_url,
+    chrome_media_tabs,
     chrome_pause,
     chrome_pause_url,
     chrome_play_from,
@@ -1817,14 +1819,34 @@ class MainWindow(QMainWindow):
         source = self.url_input.text().strip()
         queue_item = self.queue.currentItem()
         
-        # If the input URL is exactly what's currently in Chrome, or if it's empty, 
-        # we try to fetch the latest URL from Chrome to ensure it's up to date.
-        chrome_url = chrome_get_url()
-        if chrome_url and chrome_url.startswith(("http://", "https://")):
-            # If the user hasn't manually typed a different valid URL, and there is no 
-            # active queue item selected (or the input matches the old Chrome URL), override it.
-            if not source or source == self._last_auto_url or not source.startswith(("http://", "https://")):
-                source = chrome_url
+        should_detect_chrome = (
+            not source
+            or source == self._last_auto_url
+            or not source.startswith(("http://", "https://"))
+        )
+        if should_detect_chrome:
+            chrome_tabs = chrome_media_tabs()
+            if len(chrome_tabs) == 1:
+                source = chrome_tabs[0].url
+            elif len(chrome_tabs) > 1:
+                labels = [
+                    f"{index}. {tab.title or '未命名视频'} — {tab.url}"
+                    for index, tab in enumerate(chrome_tabs, start=1)
+                ]
+                selected_label, accepted = QInputDialog.getItem(
+                    self,
+                    "选择 Chrome 视频",
+                    "检测到多个 Chrome 视频窗口，请选择要生成字幕的视频：",
+                    labels,
+                    0,
+                    False,
+                )
+                if not accepted:
+                    self.log("Chrome video selection cancelled")
+                    return
+                source = chrome_tabs[labels.index(selected_label)].url
+
+            if source.startswith(("http://", "https://")):
                 self.log(f"Auto-detected Chrome URL: {source}")
                 self.url_input.setText(source)
                 self._last_auto_url = source
@@ -1904,12 +1926,43 @@ class MainWindow(QMainWindow):
         self.controlled_worker.first_segments.connect(self._start_rolling_playback)
         self.controlled_worker.more_segments.connect(self._add_rolling_segments)
         self.controlled_worker.progress.connect(self._update_progress)
+        self.controlled_worker.quality_updated.connect(self._update_subtitle_quality)
         self.controlled_worker.all_done.connect(self._on_rolling_done)
         self.controlled_worker.finished.connect(self.controlled_thread.quit)
         self.controlled_thread.finished.connect(self._clear_controlled_worker)
         if qwen3_asr_mode(mode) or mode.backend == "whisper_cpp":
             self.mac_gpu_monitor.start()
         self.controlled_thread.start()
+
+    def _update_subtitle_quality(self, report: object) -> None:
+        if not isinstance(report, dict):
+            return
+        diagnostics = report.get("diagnostics") or {}
+        language = diagnostics.get("language") or "未知"
+        language_policy = diagnostics.get("language_policy") or "未知"
+        word_timestamps = "可用" if diagnostics.get("word_timestamps") else "segment fallback"
+        coverage = float(report.get("speech_coverage", 0.0))
+        suspicious = report.get("suspicious_regions") or []
+        uncovered = report.get("uncovered_regions") or []
+        retries = report.get("retries") or []
+        omnivad = (diagnostics.get("omnivad_shadow") or {}).get("status", "未知")
+        alignment = (diagnostics.get("alignment") or {}).get("status", "disabled")
+        def region_text(items: list[dict]) -> str:
+            ranges = [
+                f"{float(item.get('start', 0)):.1f}-{float(item.get('end', 0)):.1f}s"
+                for item in items[:3]
+            ]
+            return "、".join(ranges) if ranges else "无"
+
+        text = (
+            f"字幕质量：{report.get('status', '未知')} | 语言 {language} ({language_policy}) | "
+            f"逐词时间戳 {word_timestamps} | 人声覆盖 {coverage:.1%}\n"
+            f"可疑 {len(suspicious)} 段 | 未覆盖 {len(uncovered)} 段 | "
+            f"补录 {len(retries)} 次 | OmniVAD {omnivad} | 对齐 {alignment}\n"
+            f"可疑区间：{region_text(suspicious)} | 未覆盖区间：{region_text(uncovered)}"
+        )
+        if hasattr(self, "quality_summary"):
+            self.quality_summary.setText(text)
 
     def _start_rolling_playback(self, segments: list[SubtitleSegment]) -> None:
         self._set_controlled_segments(segments)

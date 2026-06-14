@@ -14,7 +14,7 @@ import json
 import re
 from pathlib import Path
 
-from .models import SubtitleSegment
+from .models import ASRResult, SubtitleSegment, SubtitleWord
 
 
 SRT_BLOCK_RE = re.compile(
@@ -90,6 +90,87 @@ def load_segments(path: Path) -> list[SubtitleSegment]:
     if not isinstance(data, list):
         raise ValueError(f"Invalid subtitle cache at {path}: top-level JSON must be a list")
     return [segment_from_dict(item, path=path, index=index) for index, item in enumerate(data)]
+
+
+def word_to_dict(word: SubtitleWord) -> dict:
+    payload = {"start": word.start, "end": word.end, "text": word.text}
+    if word.probability is not None:
+        payload["probability"] = word.probability
+    return payload
+
+
+def word_from_dict(data: object, path: Path | None = None, index: int = -1) -> SubtitleWord:
+    source_path = path or Path("<memory>")
+    item = _validate_segment_mapping(data, source_path, index if index >= 0 else 0)
+    start = _coerce_segment_number(item["start"], "start", source_path, index)
+    end = _coerce_segment_number(item["end"], "end", source_path, index)
+    if end <= start:
+        raise ValueError(f"Invalid ASR cache at {source_path}: word #{index} has invalid duration")
+    probability = item.get("probability")
+    return SubtitleWord(
+        start=start,
+        end=end,
+        text=str(item["text"]),
+        probability=float(probability) if probability is not None else None,
+    )
+
+
+def asr_result_to_dict(result: ASRResult) -> dict:
+    return {
+        "schema_version": 2,
+        "language": result.language,
+        "words": [word_to_dict(word) for word in result.words],
+        "segments": [segment_to_dict(segment) for segment in result.segments],
+        "diagnostics": result.diagnostics,
+    }
+
+
+def asr_result_from_dict(data: object, path: Path | None = None) -> ASRResult:
+    source_path = path or Path("<memory>")
+    if isinstance(data, list):
+        segments = [
+            segment_from_dict(item, path=source_path, index=index)
+            for index, item in enumerate(data)
+        ]
+        return ASRResult(
+            language="",
+            words=[],
+            segments=segments,
+            diagnostics={"legacy_segment_cache": True, "capability_warnings": ["word timestamps unavailable"]},
+        )
+    if not isinstance(data, dict) or data.get("schema_version") != 2:
+        raise ValueError(f"Invalid ASR cache at {source_path}: unsupported schema")
+    words_data = data.get("words", [])
+    segments_data = data.get("segments", [])
+    if not isinstance(words_data, list) or not isinstance(segments_data, list):
+        raise ValueError(f"Invalid ASR cache at {source_path}: words and segments must be lists")
+    return ASRResult(
+        language=str(data.get("language", "")),
+        words=[
+            word_from_dict(item, path=source_path, index=index)
+            for index, item in enumerate(words_data)
+        ],
+        segments=[
+            segment_from_dict(item, path=source_path, index=index)
+            for index, item in enumerate(segments_data)
+        ],
+        diagnostics=dict(data.get("diagnostics") or {}),
+    )
+
+
+def save_asr_result(path: Path, result: ASRResult) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(asr_result_to_dict(result), ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_asr_result(path: Path) -> ASRResult:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid ASR cache at {path}: malformed JSON ({exc})") from exc
+    return asr_result_from_dict(data, path=path)
 
 
 def parse_srt_timestamp(value: str) -> float:

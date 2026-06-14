@@ -9,8 +9,10 @@ Chrome 浏览器控制模块
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import subprocess
 from typing import Optional
+from urllib.parse import urlparse
 
 
 VIDEO_PICKER_JS = (
@@ -27,6 +29,26 @@ VIDEO_PICKER_JS = (
     "const v = picked && picked.v;"
 )
 
+MEDIA_HOSTS = (
+    "youtube.com",
+    "youtu.be",
+    "bilibili.com",
+    "b23.tv",
+    "vimeo.com",
+    "twitch.tv",
+    "dailymotion.com",
+    "instagram.com",
+    "tiktok.com",
+    "rumble.com",
+    "odysee.com",
+)
+
+
+@dataclass(frozen=True)
+class ChromeMediaTab:
+    title: str
+    url: str
+
 
 def chrome_is_running() -> bool:
     proc = subprocess.run(
@@ -37,6 +59,56 @@ def chrome_is_running() -> bool:
         check=False,
     )
     return proc.returncode == 0
+
+
+def _is_likely_media_url(url: str) -> bool:
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = parsed.netloc.lower()
+    if any(host == domain or host.endswith(f".{domain}") for domain in MEDIA_HOSTS):
+        return True
+    path = parsed.path.lower()
+    return (
+        path.endswith((".mp3", ".mp4", ".m4a", ".wav", ".flac", ".webm"))
+        or "/watch" in path
+        or "/video/" in path
+        or "/videos/" in path
+        or "/play/" in path
+    )
+
+
+def _chrome_active_tabs() -> list[ChromeMediaTab]:
+    if not chrome_is_running():
+        return []
+    apple_script = (
+        'tell application "Google Chrome"\n'
+        '  set activeTabs to ""\n'
+        '  repeat with w in windows\n'
+        '    set t to active tab of w\n'
+        '    if activeTabs is not "" then set activeTabs to activeTabs & linefeed\n'
+        '    set activeTabs to activeTabs & (title of t) & (ASCII character 31) & (URL of t)\n'
+        '  end repeat\n'
+        '  return activeTabs\n'
+        'end tell\n'
+    )
+    proc = subprocess.run(
+        ["/usr/bin/osascript", "-e", apple_script],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    tabs: list[ChromeMediaTab] = []
+    for line in proc.stdout.splitlines():
+        title, separator, url = line.partition("\x1f")
+        if separator and url.strip():
+            tabs.append(ChromeMediaTab(title.strip(), url.strip()))
+    return tabs
+
+
+def chrome_media_tabs() -> list[ChromeMediaTab]:
+    return [tab for tab in _chrome_active_tabs() if _is_likely_media_url(tab.url)]
 
 
 def run_chrome_script(script: str) -> str:
@@ -219,19 +291,5 @@ def chrome_seek_url_relative(target_url: str, delta_seconds: float) -> Optional[
 
 
 def chrome_get_url() -> str:
-    if not chrome_is_running():
-        return ""
-    apple_script = (
-        'tell application "Google Chrome"\n'
-        '  if not (exists window 1) then return ""\n'
-        '  return URL of active tab of front window\n'
-        'end tell\n'
-    )
-    proc = subprocess.run(
-        ["/usr/bin/osascript", "-e", apple_script],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    return proc.stdout.strip()
+    tabs = chrome_media_tabs()
+    return tabs[0].url if tabs else ""

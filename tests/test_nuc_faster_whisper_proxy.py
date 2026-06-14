@@ -40,7 +40,8 @@ class FasterWhisperProxySourceTests(unittest.TestCase):
 
         self.assertIn('language.strip().lower() not in {"", "auto"}', source)
         self.assertIn('form_data["language"] = language', source)
-        self.assertIn('"vad_filter": "true"', source)
+        self.assertIn('"vad_filter": "true" if vad_filter else "false"', source)
+        self.assertIn('"timestamp_granularities[]": timestamp_granularities', source)
 
 
 if __name__ == "__main__":

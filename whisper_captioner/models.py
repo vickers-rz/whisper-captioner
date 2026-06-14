@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import (
@@ -82,6 +82,50 @@ class SubtitleSegment:
     start: float
     end: float
     text: str
+
+
+@dataclass(frozen=True)
+class SubtitleWord:
+    start: float
+    end: float
+    text: str
+    probability: float | None = None
+
+
+@dataclass(frozen=True)
+class SpeechRegion:
+    start: float
+    end: float
+    confidence: float | None = None
+    source: str = "ffmpeg"
+
+
+@dataclass
+class RetryRegion:
+    start: float
+    end: float
+    reason: str
+    attempts: int = 0
+
+
+@dataclass
+class QualityReport:
+    status: str
+    speech_coverage: float
+    uncovered_regions: list[RetryRegion] = field(default_factory=list)
+    suspicious_regions: list[RetryRegion] = field(default_factory=list)
+    retries: list[dict] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    diagnostics: dict = field(default_factory=dict)
+
+
+@dataclass
+class ASRResult:
+    language: str
+    words: list[SubtitleWord]
+    segments: list[SubtitleSegment]
+    diagnostics: dict = field(default_factory=dict)
+    schema_version: int = 2
 
 
 LLM_API_KEY_ENV_VARS = {

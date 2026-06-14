@@ -82,19 +82,44 @@ from whisper_captioner.llm_handler import (
     llm_proofread,
     llm_provider_ready,
 )
-from whisper_captioner.models import CaptionMode, LLMProvider, SubtitleSegment
+from whisper_captioner.external_backends import (
+    alignment_cache_key,
+    optional_alignment_backend,
+    run_omnivad_shadow,
+    save_alignment_result,
+)
+from whisper_captioner.models import (
+    ASRResult,
+    CaptionMode,
+    LLMProvider,
+    RetryRegion,
+    SubtitleSegment,
+    SubtitleWord,
+)
+from whisper_captioner.subtitle_reliability import (
+    LanguagePin,
+    audit_asr_result,
+    build_cues,
+    parse_silencedetect_regions,
+    parse_verbose_asr_response,
+    quality_report_to_dict,
+    merge_retry_regions,
+    replace_segments_in_regions,
+)
 from whisper_captioner.subtitle_io import (
     save_segments,
     save_segments_as_srt,
     save_segments_as_txt,
 )
 from whisper_captioner.subtitle_io import (
+    load_asr_result,
     load_segments,
     overlapping_segments,
     parse_srt,
     parse_sense_voice_output,
     parse_subtitle_file,
     save_segments,
+    save_asr_result,
     save_segments_as_srt,
     save_segments_as_txt,
     segment_from_dict,
@@ -471,6 +496,15 @@ def _stream_process_output(
     return output_lines
 
 
+def _should_retry_yt_dlp_cookie_read(cmd: list[str], output_lines: list[str]) -> bool:
+    if "--cookies-from-browser" not in cmd:
+        return False
+    if not cmd or "yt-dlp" not in Path(cmd[0]).name:
+        return False
+    output = "\n".join(output_lines).lower()
+    return "sign in to confirm you" in output and "not a bot" in output
+
+
 def _probe_audio_duration(audio_path: Path) -> float:
     result = subprocess.run(
         [
@@ -539,17 +573,18 @@ def validate_remote_asr_segments(segments: list[SubtitleSegment]) -> None:
         )
 
 
-def _transcribe_via_nuc_asr(
+def _transcribe_via_nuc_asr_result(
     audio_path: Path,
     base_url: str = "",
     model: str = "large-v3",
     language: str = NUC_ASR_AUTO_LANGUAGE,
     response_format: str = "verbose_json",
+    vad_filter: bool = False,
     timeout: int = 120,
     status_signal: Signal | None = None,
     heartbeat_interval: float = 10.0,
-) -> list[SubtitleSegment]:
-    """Send an audio file to the NUC faster-whisper-server and return segments."""
+) -> ASRResult:
+    """Send audio to NUC faster-whisper and retain word-level response data."""
     import urllib.request
     import uuid
 
@@ -563,7 +598,13 @@ def _transcribe_via_nuc_asr(
     filename = audio_path.name
 
     body_parts = []
-    for field_name, field_value in [("model", model), ("language", language), ("response_format", response_format)]:
+    for field_name, field_value in [
+        ("model", model),
+        ("language", language),
+        ("response_format", response_format),
+        ("vad_filter", "true" if vad_filter else "false"),
+        ("timestamp_granularities[]", "word"),
+    ]:
         body_parts.append(
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="{field_name}"\r\n\r\n'
@@ -630,18 +671,44 @@ def _transcribe_via_nuc_asr(
         if heartbeat_thread:
             heartbeat_thread.join(timeout=1)
 
-    segments: list[SubtitleSegment] = []
     if response_format == "verbose_json":
-        for seg in data.get("segments", []):
-            text = seg.get("text", "").strip()
-            if text:
-                segments.append(SubtitleSegment(seg["start"], seg["end"], text))
-    else:
-        text = data.get("text", "").strip()
-        if text:
-            duration = data.get("duration", 30.0)
-            segments.append(SubtitleSegment(0.0, duration, text))
-    return segments
+        return parse_verbose_asr_response(data, requested_words=True)
+    text = data.get("text", "").strip()
+    duration = float(data.get("duration", 30.0))
+    segments = [SubtitleSegment(0.0, duration, text)] if text else []
+    return ASRResult(
+        language=str(data.get("language") or ""),
+        words=[],
+        segments=segments,
+        diagnostics={
+            "capability_warnings": ["non-verbose ASR response has no word timestamps"],
+            "upstream_response": data,
+        },
+    )
+
+
+def _transcribe_via_nuc_asr(
+    audio_path: Path,
+    base_url: str = "",
+    model: str = "large-v3",
+    language: str = NUC_ASR_AUTO_LANGUAGE,
+    response_format: str = "verbose_json",
+    vad_filter: bool = False,
+    timeout: int = 120,
+    status_signal: Signal | None = None,
+    heartbeat_interval: float = 10.0,
+) -> list[SubtitleSegment]:
+    return _transcribe_via_nuc_asr_result(
+        audio_path,
+        base_url=base_url,
+        model=model,
+        language=language,
+        response_format=response_format,
+        vad_filter=vad_filter,
+        timeout=timeout,
+        status_signal=status_signal,
+        heartbeat_interval=heartbeat_interval,
+    ).segments
 
 
 def _transcribe_via_nuc_qwen3_asr_1p7b(
@@ -1545,6 +1612,17 @@ class QueueWorker(QObject):
                     ],
                     f"Preparing NUC ASR chunk {chunk_index + 1}/{chunk_count}",
                 )
+                voice_window = self._detect_voice_window(
+                    chunk_wav,
+                    remaining,
+                    f"NUC-{chunk_index + 1}",
+                )
+                if voice_window is None:
+                    self.status.emit(
+                        f"NUC ASR chunk {chunk_index + 1}/{chunk_count}: "
+                        "no stable voice window detected"
+                    )
+                    continue
                 chunk_segments = _transcribe_via_nuc_asr(
                     chunk_wav,
                     base_url=base_url,
@@ -1552,10 +1630,30 @@ class QueueWorker(QObject):
                     timeout=max(180, int(remaining * 4)),
                     status_signal=self.status,
                 )
-                validate_remote_asr_segments(chunk_segments)
-                for segment in chunk_segments:
+                issue = remote_asr_quality_issue(chunk_segments)
+                if issue:
+                    self.status.emit(
+                        f"NUC ASR chunk {chunk_index + 1}/{chunk_count} "
+                        f"looked unstable ({issue}); retrying with VAD"
+                    )
+                    chunk_segments = _transcribe_via_nuc_asr(
+                        chunk_wav,
+                        base_url=base_url,
+                        model=model,
+                        vad_filter=True,
+                        timeout=max(180, int(remaining * 4)),
+                        status_signal=self.status,
+                    )
+                    validate_remote_asr_segments(chunk_segments)
+                for segment_index, segment in enumerate(chunk_segments):
                     local_start = max(0.0, min(remaining, segment.start))
                     local_end = max(0.0, min(remaining, segment.end))
+                    if (
+                        segment_index == 0
+                        and local_start <= 0.1
+                        and voice_window.start >= 2.0
+                    ):
+                        local_start = min(local_end, voice_window.start)
                     if segment.text.strip() and local_end > local_start:
                         all_segments.append(
                             SubtitleSegment(
@@ -2171,21 +2269,7 @@ class QueueWorker(QObject):
         label: str,
     ) -> tuple[Path, float, float] | None:
         try:
-            output = self._run_capture(
-                [
-                    FFMPEG,
-                    "-hide_banner",
-                    "-i",
-                    str(chunk_wav),
-                    "-af",
-                    "silencedetect=noise=-35dB:d=0.3",
-                    "-f",
-                    "null",
-                    "-",
-                ],
-                f"Detecting speech window for chunk {label}",
-            )
-            window = parse_silencedetect_voice_window(output, duration)
+            window = self._detect_voice_window(chunk_wav, duration, label)
             if window is None:
                 return None
             if window.start <= 0.001 and window.duration >= duration - 0.001:
@@ -2220,6 +2304,32 @@ class QueueWorker(QObject):
         except Exception as exc:
             self.status.emit(f"Chunk {label}: VAD failed, using full chunk: {exc}")
             return chunk_wav, 0.0, duration
+
+    def _detect_voice_window(
+        self,
+        chunk_wav: Path,
+        duration: float,
+        label: str,
+    ) -> VoiceWindow | None:
+        output = self._run_capture(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-i",
+                str(chunk_wav),
+                "-af",
+                "silencedetect=noise=-35dB:d=0.3",
+                "-f",
+                "null",
+                "-",
+            ],
+            f"Detecting speech window for chunk {label}",
+        )
+        return parse_silencedetect_voice_window(
+            output,
+            duration,
+            leading_guard=0.0,
+        )
 
     def _transcribe_local_sense_voice_cpp_chunked(self, wav: Path) -> list[SubtitleSegment]:
         duration = self._get_duration(wav)
@@ -2481,6 +2591,7 @@ class RollingPrefetchWorker(QObject):
     progress = Signal(int, int)  # (current_chunk, total_chunks)
     all_done = Signal()
     native_subtitles_detected = Signal(list, str)  # (segments, message)
+    quality_updated = Signal(object)
     finished = Signal()
 
     def __init__(
@@ -2510,6 +2621,13 @@ class RollingPrefetchWorker(QObject):
         self._used_nuc_asr = False
         self._has_emitted_segments = False
         self._parallel_qwen_worker: QueueWorker | None = None
+        self._last_asr_result: ASRResult | None = None
+        self._retry_records: list[dict] = []
+        explicit_language = next(
+            (value for flag, value in zip(self.mode.args, self.mode.args[1:]) if flag == "-l"),
+            "auto",
+        )
+        self._language_pin = LanguagePin(explicit_language=explicit_language)
 
     def run(self) -> None:
         try:
@@ -2762,30 +2880,6 @@ class RollingPrefetchWorker(QObject):
             if self._stop:
                 return
 
-            final_cache = self._final_subtitle_cache_path(job_cache_dir)
-            cached_segments = self._load_current_final_cache(final_cache)
-            if cached_segments is not None:
-                try:
-                    self.status.emit(f"Loaded final subtitle cache: {final_cache}")
-                    raw_segments = self._load_all_raw_segments(job_cache_dir)
-                    if raw_segments:
-                        self._export_subtitles(raw_segments, raw_output_base)
-                        self.status.emit(
-                            f"Raw subtitles written: {raw_output_base.with_suffix('.srt')}"
-                        )
-                    elif not self._llm_polish_ready():
-                        self._export_subtitles(cached_segments, raw_output_base)
-                        self.status.emit(
-                            f"Raw subtitles written: {raw_output_base.with_suffix('.srt')}"
-                        )
-                    if self._llm_polish_ready():
-                        self._export_final_subtitles(cached_segments, output_base)
-                    self.first_segments.emit(cached_segments)
-                    self.all_done.emit()
-                    return
-                except Exception as exc:
-                    self.status.emit(f"Final subtitle cache unreadable, rebuilding: {exc}")
-
             # 2. Reuse or build the persistent URL audio cache.
             audio = prepare_url_audio_cache(
                 self.url,
@@ -2823,6 +2917,43 @@ class RollingPrefetchWorker(QObject):
             self.status.emit(
                 f"Audio duration: {duration:.1f}s — processing in {num_chunks} chunk(s) of {self.chunk_seconds}s"
             )
+
+            final_cache = self._final_subtitle_cache_path(job_cache_dir)
+            cached_segments = self._load_current_final_cache(final_cache)
+            if cached_segments is not None:
+                try:
+                    raw_segments = self._load_all_raw_segments(job_cache_dir)
+                    quality_report = self._audit_and_cache_quality(
+                        audio,
+                        duration,
+                        job_cache_dir,
+                        raw_segments or cached_segments,
+                    )
+                    self.quality_updated.emit(quality_report_to_dict(quality_report))
+                    if quality_report.status == "incomplete_speech_coverage":
+                        self.status.emit(
+                            "Cached subtitles failed current quality audit; rebuilding affected chunks"
+                        )
+                        cached_segments = None
+                    else:
+                        self.status.emit(f"Loaded final subtitle cache: {final_cache}")
+                        if raw_segments:
+                            self._export_subtitles(raw_segments, raw_output_base)
+                            self.status.emit(
+                                f"Raw subtitles written: {raw_output_base.with_suffix('.srt')}"
+                            )
+                        elif not self._llm_polish_ready():
+                            self._export_subtitles(cached_segments, raw_output_base)
+                            self.status.emit(
+                                f"Raw subtitles written: {raw_output_base.with_suffix('.srt')}"
+                            )
+                        if self._llm_polish_ready():
+                            self._export_final_subtitles(cached_segments, output_base)
+                        self.first_segments.emit(cached_segments)
+                        self.all_done.emit()
+                        return
+                except Exception as exc:
+                    self.status.emit(f"Final subtitle cache unreadable, rebuilding: {exc}")
 
             # 4. Chunk → transcribe → cache. LLM proofreading runs once on the full transcript.
             offset = 0.0
@@ -2882,6 +3013,7 @@ class RollingPrefetchWorker(QObject):
                         break
 
                     self.status.emit(f"Transcribing chunk {chunk_index}")
+                    self._last_asr_result = None
                     srt_path = self._transcribe_chunk(chunk_wav, chunk_out, chunk_index)
                     if self._stop:
                         break
@@ -2894,16 +3026,57 @@ class RollingPrefetchWorker(QObject):
                             remaining,
                         ):
                             repaired_segments = self._repair_sparse_chunk_with_subchunks(
-                                chunk_wav, chunk_out, chunk_index, remaining
+                                chunk_wav,
+                                chunk_out,
+                                chunk_index,
+                                remaining,
+                                original_segments=raw_segments,
                             )
                             if repaired_segments:
                                 raw_segments = repaired_segments
+                                if self._last_asr_result is None:
+                                    self._last_asr_result = ASRResult(
+                                        language=self._language_pin.language,
+                                        words=[],
+                                        segments=repaired_segments,
+                                        diagnostics={
+                                            "capability_warnings": [
+                                                "word timestamps unavailable after local repair"
+                                            ],
+                                            "locally_repaired": True,
+                                        },
+                                    )
                         # Shift timestamps to absolute position in the full audio.
                         segments = [
                             SubtitleSegment(s.start + offset, s.end + offset, s.text)
                             for s in raw_segments
                         ]
                         save_segments(raw_cache, segments)
+                        result_for_cache = self._last_asr_result or ASRResult(
+                            language=self._language_pin.language,
+                            words=[],
+                            segments=raw_segments,
+                            diagnostics={
+                                "capability_warnings": ["segment-only backend or legacy result"]
+                            },
+                        )
+                        save_asr_result(
+                            job_cache_dir / f"chunk-{chunk_index:04d}-asr-v2.json",
+                            ASRResult(
+                                language=result_for_cache.language,
+                                words=[
+                                    SubtitleWord(
+                                        word.start + offset,
+                                        word.end + offset,
+                                        word.text,
+                                        word.probability,
+                                    )
+                                    for word in result_for_cache.words
+                                ],
+                                segments=segments,
+                                diagnostics=result_for_cache.diagnostics,
+                            ),
+                        )
                         rebuilt_raw_cache = True
                         self.status.emit(f"Chunk {chunk_index}: saved Whisper cache")
                     else:
@@ -2932,6 +3105,13 @@ class RollingPrefetchWorker(QObject):
                 if rebuilt_raw_cache:
                     self._discard_derived_subtitle_caches(job_cache_dir)
                 all_raw_segments = self._load_all_raw_segments(job_cache_dir)
+                quality_report = self._audit_and_cache_quality(
+                    audio,
+                    duration,
+                    job_cache_dir,
+                    all_raw_segments,
+                )
+                self.quality_updated.emit(quality_report_to_dict(quality_report))
                 if all_raw_segments:
                     self._export_subtitles(all_raw_segments, raw_output_base)
                     self.status.emit(f"Raw subtitles written: {raw_output_base.with_suffix('.srt')}")
@@ -3069,15 +3249,58 @@ class RollingPrefetchWorker(QObject):
             request_wav, vad_offset = self._prepare_remote_vad_chunk(chunk_wav, chunk_label)
             if request_wav is None:
                 segments = []
+                self._last_asr_result = ASRResult(
+                    language=self._language_pin.language,
+                    words=[],
+                    segments=[],
+                    diagnostics={"capability_warnings": ["ffmpeg found no stable voice window"]},
+                )
             else:
-                segments = [
-                    SubtitleSegment(segment.start + vad_offset, segment.end + vad_offset, segment.text)
-                    for segment in _transcribe_via_nuc_asr(
-                        request_wav,
-                        base_url=str(self.mode.model),
-                        model=nuc_asr_model,
+                result = _transcribe_via_nuc_asr_result(
+                    request_wav,
+                    base_url=str(self.mode.model),
+                    model=nuc_asr_model,
+                    language=self._language_pin.request_language,
+                    vad_filter=False,
+                    status_signal=self.status,
+                )
+                shifted_words = [
+                    SubtitleWord(
+                        word.start + vad_offset,
+                        word.end + vad_offset,
+                        word.text,
+                        word.probability,
                     )
+                    for word in result.words
                 ]
+                shifted_segments = [
+                    SubtitleSegment(
+                        segment.start + vad_offset,
+                        segment.end + vad_offset,
+                        segment.text,
+                    )
+                    for segment in result.segments
+                ]
+                self._language_pin.observe(
+                    result.language,
+                    result.diagnostics.get("language_probability"),
+                    _probe_audio_duration(request_wav),
+                )
+                segments, cue_warnings = build_cues(shifted_words, shifted_segments)
+                diagnostics = dict(result.diagnostics)
+                diagnostics.setdefault("capability_warnings", []).extend(cue_warnings)
+                diagnostics["language_policy"] = {
+                    "requested": self._language_pin.request_language,
+                    "detected": result.language,
+                    "pinned": self._language_pin.language,
+                    "confidence": self._language_pin.confidence,
+                }
+                self._last_asr_result = ASRResult(
+                    language=result.language,
+                    words=shifted_words,
+                    segments=segments,
+                    diagnostics=diagnostics,
+                )
             srt_path = chunk_out.with_suffix(".srt")
             save_segments_as_srt(srt_path, segments)
             return srt_path
@@ -3115,6 +3338,131 @@ class RollingPrefetchWorker(QObject):
             f"Transcribing chunk {chunk_label}",
         )
         return chunk_out.with_suffix(".srt")
+
+    def _audit_and_cache_quality(
+        self,
+        audio: Path,
+        duration: float,
+        job_cache_dir: Path,
+        fallback_segments: list[SubtitleSegment],
+    ):
+        result_files = sorted(job_cache_dir.glob("chunk-*-asr-v2.json"))
+        words: list[SubtitleWord] = []
+        segments: list[SubtitleSegment] = []
+        warnings: list[str] = []
+        languages: list[str] = []
+        for path in result_files:
+            try:
+                result = load_asr_result(path)
+            except Exception as exc:
+                warnings.append(f"{path.name} unreadable: {exc}")
+                continue
+            words.extend(result.words)
+            segments.extend(result.segments)
+            if result.language:
+                languages.append(result.language)
+            warnings.extend(result.diagnostics.get("capability_warnings", []))
+        if not segments:
+            segments = fallback_segments
+            warnings.append("quality audit used legacy segment cache")
+        combined = ASRResult(
+            language=self._language_pin.language or (languages[0] if languages else ""),
+            words=sorted(words, key=lambda item: (item.start, item.end)),
+            segments=sorted(segments, key=lambda item: (item.start, item.end)),
+            diagnostics={"capability_warnings": list(dict.fromkeys(warnings))},
+        )
+        try:
+            silencedetect_output = self._run_cmd_capture(
+                [
+                    FFMPEG,
+                    "-hide_banner",
+                    "-i",
+                    str(audio),
+                    "-af",
+                    "silencedetect=noise=-35dB:d=0.3",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                "Auditing speech coverage",
+            )
+            speech_regions = parse_silencedetect_regions(silencedetect_output, duration)
+        except Exception as exc:
+            speech_regions = []
+            combined.diagnostics["capability_warnings"].append(f"ffmpeg VAD audit failed: {exc}")
+        _write_json_local(
+            job_cache_dir / "speech-regions.json",
+            {
+                "schema_version": 2,
+                "source": "ffmpeg",
+                "parameters": {"noise": "-35dB", "minimum_silence": 0.3},
+                "regions": [
+                    {
+                        "start": region.start,
+                        "end": region.end,
+                        "confidence": region.confidence,
+                        "source": region.source,
+                    }
+                    for region in speech_regions
+                ],
+            },
+        )
+        report = audit_asr_result(combined, speech_regions, duration=duration)
+        report.retries = list(self._retry_records)
+
+        shadow = run_omnivad_shadow(audio, job_cache_dir / "omnivad")
+        report.diagnostics["omnivad_shadow"] = {
+            "status": shadow.status,
+            "region_count": len(shadow.regions),
+            "warning": shadow.warning,
+        }
+        if shadow.warning:
+            report.warnings.append(shadow.warning)
+            if report.status == "passed":
+                report.status = "passed_with_warnings"
+
+        alignment_status = {"status": "disabled"}
+        if _env_bool("WHISPER_CAPTIONER_ALIGNMENT_ENABLED", False):
+            backend = optional_alignment_backend()
+            if backend is None or not backend.available:
+                alignment_status = {"status": "unavailable", "warning": "alignment CLI unavailable"}
+                report.warnings.append("alignment CLI unavailable")
+            elif not os.environ.get("LATTIFAI_API_KEY", "").strip():
+                alignment_status = {
+                    "status": "unauthenticated",
+                    "warning": "LATTIFAI_API_KEY is not configured",
+                }
+                report.warnings.append("LattifAI is installed but not authenticated")
+            elif not combined.words:
+                try:
+                    transcript = "\n".join(segment.text for segment in combined.segments)
+                    key = alignment_cache_key(audio, transcript, backend)
+                    aligned = backend.align(audio, transcript, job_cache_dir / f"alignment-{key}")
+                    save_alignment_result(job_cache_dir / f"alignment-{key}.json", aligned)
+                    alignment_status = {"status": "completed", "backend": backend.name}
+                except Exception as exc:
+                    alignment_status = {"status": "failed", "warning": str(exc)}
+                    report.warnings.append(f"alignment failed: {exc}")
+            else:
+                alignment_status = {"status": "not_needed", "reason": "reliable word timestamps available"}
+        report.diagnostics["alignment"] = alignment_status
+        report.diagnostics["language"] = combined.language
+        report.diagnostics["language_policy"] = (
+            "explicit" if self._language_pin.explicit_language not in {"", "auto"} else "detect-once-then-pin"
+        )
+        _write_json_local(
+            job_cache_dir / "quality-report.json",
+            {
+                "schema_version": 2,
+                "pipeline_version": SUBTITLE_PIPELINE_VERSION,
+                **quality_report_to_dict(report),
+            },
+        )
+        self.status.emit(
+            f"Subtitle quality: {report.status}; speech coverage={report.speech_coverage:.1%}; "
+            f"suspicious={len(report.suspicious_regions)} uncovered={len(report.uncovered_regions)}"
+        )
+        return report
 
     def _prepare_remote_vad_chunk(
         self,
@@ -3180,11 +3528,12 @@ class RollingPrefetchWorker(QObject):
         chunk_out: Path,
         chunk_index: int,
         chunk_duration: float,
+        original_segments: list[SubtitleSegment] | None = None,
     ) -> list[SubtitleSegment]:
-        if self.mode.backend not in {"mlx_whisper", "mlx_audio"} or chunk_duration <= 12:
+        if self.mode.backend not in {"mlx_whisper", "mlx_audio", "nuc_asr"} or chunk_duration <= 12:
             return []
         self.status.emit(
-            f"Chunk {chunk_index}: retrying sparse result with smaller MLX subchunks"
+            f"Chunk {chunk_index}: retrying sparse result with smaller subchunks"
         )
         half = chunk_duration / 2
         repaired: list[SubtitleSegment] = []
@@ -3223,7 +3572,103 @@ class RollingPrefetchWorker(QObject):
                 SubtitleSegment(s.start + start_offset, s.end + start_offset, s.text)
                 for s in sub_segments
             )
-        return self._clamp_chunk_segments(repaired, chunk_duration)
+        repaired = self._clamp_chunk_segments(repaired, chunk_duration)
+        suspicious_regions = []
+        for segment in original_segments or []:
+            span = segment.end - segment.start
+            density = len(re.sub(r"\s+", "", segment.text)) / span if span > 0 else 0.0
+            if span >= 6.0 and density < 1.5:
+                suspicious_regions.append(
+                    RetryRegion(segment.start, segment.end, "low text density")
+                )
+            elif span > 5.25:
+                suspicious_regions.append(RetryRegion(segment.start, segment.end, "long cue"))
+        if suspicious_regions:
+            retry_regions = merge_retry_regions(
+                suspicious_regions,
+                guard=2.0,
+                duration=chunk_duration,
+            )
+            repaired = replace_segments_in_regions(
+                original_segments or [],
+                repaired,
+                retry_regions,
+            )
+        else:
+            retry_regions = [RetryRegion(0.0, chunk_duration, "sparse chunk")]
+        self._retry_records.extend(
+            {
+                "chunk": chunk_index,
+                "start": region.start,
+                "end": region.end,
+                "reason": region.reason,
+                "attempt": 1,
+                "model": _nuc_asr_model_for_mode(self.mode)
+                if self.mode.backend == "nuc_asr"
+                else self.mode.model_name,
+            }
+            for region in retry_regions
+        )
+        if (
+            self.mode.backend == "nuc_asr"
+            and _nuc_asr_model_for_mode(self.mode) != "large-v3"
+            and self._chunk_cache_looks_bad(repaired, chunk_duration)
+        ):
+            self.status.emit(
+                f"Chunk {chunk_index}: turbo retry remains suspicious; reviewing with large-v3"
+            )
+            reviewed = _transcribe_via_nuc_asr_result(
+                chunk_wav,
+                base_url=str(self.mode.model),
+                model="large-v3",
+                language=self._language_pin.request_language,
+                vad_filter=False,
+                status_signal=self.status,
+            )
+            reviewed_cues, _ = build_cues(reviewed.words, reviewed.segments)
+            adopted_review = False
+            if (
+                not self._chunk_cache_looks_bad(reviewed_cues, chunk_duration)
+                and self._candidate_text_score(reviewed_cues)
+                >= self._candidate_text_score(repaired)
+            ):
+                repaired = reviewed_cues
+                adopted_review = True
+            else:
+                self.status.emit(
+                    f"Chunk {chunk_index}: retaining turbo repair because large-v3 review is not better"
+                )
+            reviewed.diagnostics["review_model"] = "large-v3"
+            if adopted_review:
+                self._last_asr_result = ASRResult(
+                    reviewed.language,
+                    reviewed.words,
+                    repaired,
+                    reviewed.diagnostics,
+                )
+            self._retry_records.extend(
+                {
+                    "chunk": chunk_index,
+                    "start": region.start,
+                    "end": region.end,
+                    "reason": region.reason,
+                    "attempt": 2,
+                    "model": "large-v3",
+                }
+                for region in retry_regions
+            )
+        return repaired
+
+    @staticmethod
+    def _candidate_text_score(segments: list[SubtitleSegment]) -> tuple[int, int, int]:
+        compact = "".join(re.sub(r"\s+", "", segment.text) for segment in segments)
+        replacement_chars = compact.count("�")
+        repeated = sum(
+            1
+            for previous, current in zip(segments, segments[1:])
+            if previous.text.strip() == current.text.strip()
+        )
+        return (-replacement_chars, -repeated, len(compact))
 
     @staticmethod
     def _clamp_chunk_segments(segments: list[SubtitleSegment], chunk_duration: float) -> list[SubtitleSegment]:
@@ -3246,6 +3691,18 @@ class RollingPrefetchWorker(QObject):
         total_text = sum(len(segment.text.strip()) for segment in segments)
         if len(segments) <= 2 and speech_span < chunk_duration * 0.25 and total_text < 40:
             return True
+        for segment in segments:
+            segment_duration = segment.end - segment.start
+            compact_text = re.sub(r"\s+", "", segment.text)
+            if (
+                segment_duration >= 6.0
+                and len(compact_text) >= 2
+                and len(compact_text) / segment_duration < 1.5
+            ):
+                return True
+        for previous, current in zip(segments, segments[1:]):
+            if current.start - previous.end >= 6.0:
+                return True
         last_text = segments[-1].text.strip()
         if len(last_text) > 30:
             words = last_text.split()
@@ -3296,6 +3753,22 @@ class RollingPrefetchWorker(QObject):
         if data.get("pipeline_signature") != self._pipeline_signature():
             self.status.emit("Final subtitle cache belongs to a different pipeline; rebuilding")
             return None
+        quality_path = cache_path.parent / "quality-report.json"
+        if not quality_path.exists():
+            self.status.emit("Final subtitle cache has no v2 quality report; rebuilding")
+            return None
+        try:
+            quality_data = json.loads(quality_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self.status.emit("Final subtitle quality report is unreadable; rebuilding")
+            return None
+        if (
+            quality_data.get("schema_version") != 2
+            or quality_data.get("pipeline_version") != SUBTITLE_PIPELINE_VERSION
+        ):
+            self.status.emit("Final subtitle quality report is stale; rebuilding")
+            return None
+        self.quality_updated.emit(quality_data)
         segments_data = data.get("segments", [])
         if not isinstance(segments_data, list):
             raise ValueError(
@@ -3560,30 +4033,37 @@ class RollingPrefetchWorker(QObject):
         return _probe_audio_duration(audio_path)
 
     def _run_cmd(self, cmd: list[str], label: str) -> None:
-        self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
-        self.proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(OUTPUT_DIR)
-        )
-        try:
-            output_lines = _stream_process_output(
-                self.proc,
-                status_signal=self.status,
-                stop_flag=lambda: self._stop,
-                stop_message="Rolling prefetch stopped",
+        for attempt in range(2):
+            self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")
+            self.proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(OUTPUT_DIR)
             )
-            returncode = self.proc.wait()
-            if returncode != 0 and not self._stop:
+            try:
+                output_lines = _stream_process_output(
+                    self.proc,
+                    status_signal=self.status,
+                    stop_flag=lambda: self._stop,
+                    stop_message="Rolling prefetch stopped",
+                )
+                returncode = self.proc.wait()
+                if returncode == 0 or self._stop:
+                    return
+                if attempt == 0 and _should_retry_yt_dlp_cookie_read(cmd, output_lines):
+                    self.status.emit(
+                        "yt-dlp received an incomplete Chrome cookie snapshot; retrying once"
+                    )
+                    time.sleep(1.0)
+                    continue
+
                 cmd_name = cmd[0]
                 error_context = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
-
-                # Provide better error messages for yt-dlp failures
                 if "yt-dlp" in cmd_name or "yt-dlp" in " ".join(cmd):
                     error_msg = f"yt-dlp failed to download the URL.\n\nLast output:\n{error_context}\n\nPossible reasons:\n- URL is not supported by yt-dlp (e.g., GitHub docs, Wikipedia)\n- Video is region-restricted or requires login\n- Chrome cookies are unavailable, expired, or locked by the browser\n- URL format is incorrect"
                     raise RuntimeError(error_msg)
 
                 raise RuntimeError(f"command failed: {cmd_name}\n\nOutput:\n{error_context}")
-        finally:
-            self.proc = None
+            finally:
+                self.proc = None
 
     def _run_cmd_capture(self, cmd: list[str], label: str) -> str:
         self.status.emit(f"{label}: {' '.join(shlex.quote(part) for part in cmd)}")

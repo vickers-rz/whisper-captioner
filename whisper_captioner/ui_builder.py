@@ -104,6 +104,9 @@ def build_main_window_ui(window) -> None:
     window.status_summary = QLabel("就绪")
     window.status_summary.setWordWrap(True)
     window.status_summary.setObjectName("StatusSummary")
+    window.quality_summary = QLabel("字幕质量：等待任务")
+    window.quality_summary.setWordWrap(True)
+    window.quality_summary.setObjectName("QualitySummary")
 
     window.log_level_combo = QComboBox()
     window.log_level_combo.addItem("安静", "quiet")
@@ -406,6 +409,7 @@ def build_main_window_ui(window) -> None:
     root_layout.addWidget(tabs)
     root_layout.addWidget(window.progress_bar)
     root_layout.addWidget(window.status_summary)
+    root_layout.addWidget(window.quality_summary)
     root_layout.addWidget(window.status)
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)

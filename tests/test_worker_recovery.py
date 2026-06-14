@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import time
@@ -7,11 +8,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from whisper_captioner.models import MODES, SubtitleSegment
+from whisper_captioner.config import SUBTITLE_PIPELINE_VERSION
 from whisper_captioner.workers import (
     QueueRunConfig,
     QueueWorker,
     RollingPrefetchWorker,
     _nuc_asr_model_for_mode,
+    _should_retry_yt_dlp_cookie_read,
     controlled_cache_dir,
     parse_silencedetect_voice_window,
     prepare_url_audio_cache,
@@ -23,6 +26,26 @@ from whisper_captioner.cache import controlled_cache_dir_name
 
 
 class WorkerRecoveryTest(unittest.TestCase):
+    def test_yt_dlp_bot_challenge_with_browser_cookies_is_retryable(self):
+        command = [
+            "/opt/homebrew/bin/yt-dlp",
+            "--cookies-from-browser",
+            "chrome",
+            "https://www.youtube.com/watch?v=example",
+        ]
+        output = [
+            "Extracted 25 cookies from chrome",
+            "ERROR: Sign in to confirm you’re not a bot.",
+        ]
+
+        self.assertTrue(_should_retry_yt_dlp_cookie_read(command, output))
+        self.assertFalse(
+            _should_retry_yt_dlp_cookie_read(
+                ["/opt/homebrew/bin/yt-dlp", "https://example.com"],
+                output,
+            )
+        )
+
     def test_remote_asr_quality_rejects_repetition_hallucination(self):
         segments = [
             SubtitleSegment(index, index + 1, "请不吝点赞 订阅 打赏支持明镜与点点栏目")
@@ -213,6 +236,16 @@ class WorkerRecoveryTest(unittest.TestCase):
             output_base = root / "LLM优化字幕"
 
             result = worker._run_full_document_polish(root, output_base)
+            (root / "quality-report.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "pipeline_version": SUBTITLE_PIPELINE_VERSION,
+                        "status": "passed",
+                    }
+                ),
+                encoding="utf-8",
+            )
             cached = worker._load_current_final_cache(
                 worker._final_subtitle_cache_path(root)
             )
@@ -479,6 +512,23 @@ class WorkerRecoveryTest(unittest.TestCase):
 
         self.assertEqual(result, wav)
         self.assertIn("Reusing URL audio cache", status.messages[-1])
+
+    def test_long_low_density_asr_segment_is_treated_as_sparse(self):
+        segments = [
+            SubtitleSegment(0.0, 1.5, "正常开头"),
+            SubtitleSegment(1.5, 11.3, "那这段呢其实是参考了"),
+            SubtitleSegment(11.3, 14.0, "正常结尾字幕"),
+        ]
+
+        self.assertTrue(RollingPrefetchWorker._chunk_cache_looks_bad(segments, 30.0))
+
+    def test_long_internal_asr_gap_is_treated_as_sparse(self):
+        segments = [
+            SubtitleSegment(0.0, 4.0, "前段文本"),
+            SubtitleSegment(12.0, 18.0, "后段文本"),
+        ]
+
+        self.assertTrue(RollingPrefetchWorker._chunk_cache_looks_bad(segments, 30.0))
 
     def test_prune_local_audio_cache_removes_oldest_first(self):
         with tempfile.TemporaryDirectory() as directory:
