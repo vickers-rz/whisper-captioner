@@ -82,7 +82,11 @@ from whisper_captioner.llm_handler import (
     llm_proofread,
     llm_provider_ready,
 )
-from whisper_captioner.external_backends import run_omnivad_shadow
+from whisper_captioner.external_backends import (
+    fuse_gemini_with_whisper,
+    gemini_transcribe_audio,
+    run_omnivad_shadow,
+)
 from whisper_captioner.models import (
     ASRResult,
     CaptionMode,
@@ -2595,6 +2599,8 @@ class RollingPrefetchWorker(QObject):
         llm_api_url: str = "", llm_model_id: str = "",
         remote_vad_enabled: bool | None = None,
         run_config: QueueRunConfig | None = None,
+        gemini_fusion_enabled: bool = False,
+        gemini_api_key: str = "",
     ) -> None:
         super().__init__()
         self.url = url
@@ -2610,6 +2616,8 @@ class RollingPrefetchWorker(QObject):
             if remote_vad_enabled is None
             else remote_vad_enabled
         )
+        self.gemini_fusion_enabled = gemini_fusion_enabled
+        self.gemini_api_key = gemini_api_key
         self._stop = False
         self.proc: Optional[subprocess.Popen[str]] = None
         self._temp_paths: list[Path] = []
@@ -3366,6 +3374,35 @@ class RollingPrefetchWorker(QObject):
             segments=sorted(segments, key=lambda item: (item.start, item.end)),
             diagnostics={"capability_warnings": list(dict.fromkeys(warnings))},
         )
+
+        # --- Gemini + Whisper dual-model fusion ---
+        if self.gemini_fusion_enabled and self.gemini_api_key and combined.words:
+            gemini_result = gemini_transcribe_audio(
+                audio, self.gemini_api_key, model="gemini-2.5-flash",
+            )
+            combined.diagnostics["gemini_fusion"] = {
+                "status": gemini_result.status,
+                "model": gemini_result.model,
+                "elapsed": gemini_result.elapsed,
+            }
+            if gemini_result.status == "completed" and gemini_result.lines:
+                fused = fuse_gemini_with_whisper(gemini_result.lines, combined.words)
+                if fused:
+                    combined.diagnostics["gemini_fusion"]["fused_segments"] = len(fused)
+                    combined.diagnostics["gemini_fusion"]["source"] = "gemini-text + whisper-timestamps"
+                    combined.segments = fused
+                    self.status.emit(
+                        f"Gemini+Whisper fusion: {len(gemini_result.lines)} Gemini lines → "
+                        f"{len(fused)} fused segments "
+                        f"({gemini_result.elapsed:.1f}s)"
+                    )
+            elif gemini_result.status == "failed":
+                combined.diagnostics["gemini_fusion"]["warning"] = gemini_result.warning
+                self.status.emit(f"Gemini fusion skipped: {gemini_result.warning}")
+        elif self.gemini_fusion_enabled and not combined.words:
+            combined.diagnostics["gemini_fusion"] = {
+                "status": "skipped", "warning": "word timestamps unavailable",
+            }
         try:
             silencedetect_output = self._run_cmd_capture(
                 [

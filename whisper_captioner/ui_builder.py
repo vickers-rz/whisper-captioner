@@ -195,6 +195,9 @@ def build_main_window_ui(window) -> None:
     window.subtitle_earlier_button = QPushButton("Sub -0.5s")
     window.subtitle_later_button = QPushButton("Sub +0.5s")
     window.subtitle_sync_button = QPushButton("同步当前行")
+    window.gemini_fusion_checkbox = QCheckBox(
+        "启用 Gemini + Whisper 双模型融合（Gemini 高精度文本 + Whisper 逐词时间戳）"
+    )
     window.llm_group = QGroupBox("LLM 校对")
     window.llm_group.setCheckable(True)
     window.llm_group.setChecked(False)
@@ -370,6 +373,7 @@ def build_main_window_ui(window) -> None:
     llm_layout.addWidget(window.llm_test_button)
     llm_layout.addWidget(window.qwen_chat_start_button)
     llm_layout.addWidget(window.qwen_chat_open_button)
+    settings_layout.addWidget(window.gemini_fusion_checkbox)
     settings_layout.addWidget(window.llm_group)
     audio_route_card = QGroupBox("SoundSource / Loopback")
     audio_route_layout = QVBoxLayout(audio_route_card)

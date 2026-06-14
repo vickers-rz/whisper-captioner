@@ -332,6 +332,9 @@ class MainWindow(QMainWindow):
         elif self.mode_combo.count():
             self.mode_combo.setCurrentIndex(0)
         self.llm_group.setChecked(settings.value("llm/enabled", True, type=bool))
+        self.gemini_fusion_checkbox.setChecked(
+            settings.value("llm/gemini_fusion_enabled", False, type=bool)
+        )
         saved_provider = str(settings.value("llm/provider", "gemini_flash"))
         idx = self.llm_provider_combo.findData(saved_provider)
         if idx >= 0:
@@ -383,6 +386,7 @@ class MainWindow(QMainWindow):
         key = self.llm_provider_combo.currentData()
         settings = QSettings("WhisperCaptioner", "App")
         settings.setValue("llm/enabled", self.llm_group.isChecked())
+        settings.setValue("llm/gemini_fusion_enabled", self.gemini_fusion_checkbox.isChecked())
         settings.setValue(f"llm/apikey/{key}", self.llm_api_key_input.text())
         if key == "custom":
             settings.setValue("llm/custom_url", self.llm_custom_url_input.text().strip())
@@ -1912,12 +1916,16 @@ class MainWindow(QMainWindow):
         self._set_status_summary(f"网址受控字幕准备中 | 模式 {mode.label}")
         self.controlled_thread = QThread()
         run_config = self._queue_run_config()
+        gemini_fusion = self.gemini_fusion_checkbox.isChecked()
+        gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
         self.controlled_worker = RollingPrefetchWorker(
             source, mode,
             llm_provider=llm_provider, llm_api_key=llm_api_key,
             llm_api_url=llm_api_url, llm_model_id=llm_model_id,
             remote_vad_enabled=run_config.remote_vad_enabled,
             run_config=run_config,
+            gemini_fusion_enabled=gemini_fusion and bool(gemini_key),
+            gemini_api_key=gemini_key,
         )
         self.controlled_worker.moveToThread(self.controlled_thread)
         self.controlled_thread.started.connect(self.controlled_worker.run)
