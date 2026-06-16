@@ -7,7 +7,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from whisper_captioner.models import ASRResult, MODES, SubtitleSegment, SubtitleWord
+from whisper_captioner.models import (
+    ASRResult,
+    MODES,
+    SpeechRegion,
+    SubtitleSegment,
+    SubtitleWord,
+)
 from whisper_captioner.config import SUBTITLE_PIPELINE_VERSION
 from whisper_captioner.workers import (
     QueueRunConfig,
@@ -126,6 +132,11 @@ class WorkerRecoveryTest(unittest.TestCase):
                     "_transcribe_file_via_nuc_chunks",
                     return_value=asr_result,
                 ),
+                patch.object(
+                    worker,
+                    "_repair_nuc_speech_gaps",
+                    return_value=asr_result,
+                ),
                 patch("whisper_captioner.workers._probe_audio_duration", return_value=1.0),
                 patch("whisper_captioner.workers.validate_remote_asr_segments"),
                 patch(
@@ -146,6 +157,63 @@ class WorkerRecoveryTest(unittest.TestCase):
             self.assertTrue(any(name.endswith("-Whisper原始-asr.json") for name in names))
             self.assertTrue(any(name.endswith("-Gemini原文.txt") for name in names))
             self.assertTrue(any(name.endswith("-fusion-diagnostics.json") for name in names))
+
+    def test_queue_nuc_gap_repair_replaces_only_uncovered_speech(self):
+        mode = next(mode for mode in MODES if mode.key == "nuc_asr")
+        worker = QueueWorker(["input.mp3"], mode)
+        original = ASRResult(
+            "en",
+            [
+                SubtitleWord(0.0, 0.5, "before"),
+                SubtitleWord(5.0, 5.5, "after"),
+            ],
+            [
+                SubtitleSegment(0.0, 2.0, "before text"),
+                SubtitleSegment(5.0, 7.0, "after text"),
+            ],
+            {},
+        )
+        repaired = ASRResult(
+            "en",
+            [
+                SubtitleWord(2.2, 2.5, "Questions"),
+                SubtitleWord(2.5, 2.8, "six"),
+            ],
+            [SubtitleSegment(2.2, 3.5, "Questions six to ten.")],
+            {},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "audio.wav"
+            audio.write_bytes(b"audio")
+            with (
+                patch("whisper_captioner.workers._probe_audio_duration", return_value=7.0),
+                patch.object(worker, "_run_capture", return_value=""),
+                patch.object(worker, "_run"),
+                patch(
+                    "whisper_captioner.workers.parse_silencedetect_regions",
+                    return_value=[
+                        SpeechRegion(0.0, 2.0),
+                        SpeechRegion(2.2, 3.5),
+                        SpeechRegion(5.0, 7.0),
+                    ],
+                ),
+                patch(
+                    "whisper_captioner.workers._transcribe_via_nuc_asr_result",
+                    return_value=repaired,
+                ),
+            ):
+                result = worker._repair_nuc_speech_gaps(
+                    audio,
+                    original,
+                    base_url="http://nuc",
+                    model="large-v3",
+                )
+
+        text = " ".join(segment.text for segment in result.segments)
+        self.assertIn("before text", text)
+        self.assertIn("Questions six to ten.", text)
+        self.assertIn("after text", text)
+        self.assertEqual(result.diagnostics["speech_gap_repair"]["status"], "completed")
 
     def test_yt_dlp_bot_challenge_with_browser_cookies_is_retryable(self):
         command = [
@@ -182,6 +250,19 @@ class WorkerRecoveryTest(unittest.TestCase):
         self.assertIsNotNone(issue)
         with self.assertRaisesRegex(RuntimeError, "repetition hallucination"):
             validate_remote_asr_segments(segments)
+
+    def test_remote_asr_quality_rejects_repetition_inside_one_segment(self):
+        repeated = ", ".join(["based on a true story"] * 20)
+        segments = [
+            SubtitleSegment(0.0, 4.0, "A normal sentence."),
+            SubtitleSegment(58.58, 59.98, f"based on a true story, {repeated}."),
+            SubtitleSegment(61.12, 62.04, "Question 3."),
+        ]
+
+        issue = remote_asr_quality_issue(segments)
+
+        self.assertIsNotNone(issue)
+        self.assertIn("one segment repeats", issue)
 
     def test_remote_asr_quality_accepts_normal_transcript(self):
         segments = [

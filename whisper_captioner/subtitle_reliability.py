@@ -351,6 +351,24 @@ def audit_asr_result(
         most_repeated = max((compact_texts.count(text) for text in set(compact_texts)), default=0)
         if most_repeated >= 8 and most_repeated / len(compact_texts) >= 0.3:
             suspicious.append(RetryRegion(0.0, duration or result.segments[-1].end, "repetition hallucination"))
+    for index, segment in enumerate(segments):
+        normalized_text = re.sub(r"[\W_]+", "", segment.text, flags=re.UNICODE).lower()
+        if len(normalized_text) < 4:
+            continue
+        nearby = [
+            other
+            for other in segments[index + 1:index + 5]
+            if other.start - segment.start <= 6.0
+            and re.sub(r"[\W_]+", "", other.text, flags=re.UNICODE).lower() == normalized_text
+        ]
+        if len(nearby) >= 2:
+            suspicious.append(
+                RetryRegion(
+                    segment.start,
+                    nearby[-1].end,
+                    "local repetition hallucination",
+                )
+            )
 
     if result.words and result.segments:
         word_start, word_end = result.words[0].start, result.words[-1].end

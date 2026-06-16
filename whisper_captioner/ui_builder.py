@@ -196,7 +196,16 @@ def build_main_window_ui(window) -> None:
     window.subtitle_later_button = QPushButton("Sub +0.5s")
     window.subtitle_sync_button = QPushButton("同步当前行")
     window.gemini_fusion_checkbox = QCheckBox(
-        "高精度字幕：Whisper large-v3 底稿 + Gemini 高置信度文本校正"
+        "高精度双模型字幕"
+    )
+    window.fusion_provider_combo = QComboBox()
+    window.fusion_provider_combo.addItem(
+        "Mac WhisperKit 词级时间轴 + NUC Qwen3-ASR 全文校正",
+        "whisperkit_qwen",
+    )
+    window.fusion_provider_combo.addItem(
+        "NUC Whisper large-v3 底稿 + Gemini 文本校正",
+        "gemini",
     )
     window.gemini_api_key_input = QLineEdit()
     window.gemini_api_key_input.setPlaceholderText(
@@ -380,6 +389,7 @@ def build_main_window_ui(window) -> None:
     llm_layout.addWidget(window.qwen_chat_start_button)
     llm_layout.addWidget(window.qwen_chat_open_button)
     settings_layout.addWidget(window.gemini_fusion_checkbox)
+    settings_layout.addWidget(window.fusion_provider_combo)
     gemini_key_row = QHBoxLayout()
     gemini_key_row.addWidget(QLabel("Gemini API Key："))
     gemini_key_row.addWidget(window.gemini_api_key_input)

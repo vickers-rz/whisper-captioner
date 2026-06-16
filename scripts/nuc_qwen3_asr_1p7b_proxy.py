@@ -200,9 +200,13 @@ def _clean_transcript(text: str) -> str:
     clean = " ".join(text.split()).strip()
     if not clean:
         return ""
-    clean = re.sub(r"^\s*language\s+[A-Za-z]+\s*<asr_text>\s*", "", clean, flags=re.IGNORECASE)
-    clean = re.sub(r"^\s*<asr_text>\s*", "", clean, flags=re.IGNORECASE)
-    return clean.strip()
+    clean = re.sub(
+        r"(?:\blanguage\s+[\w-]+\s*)?<asr_text>\s*",
+        " ",
+        clean,
+        flags=re.IGNORECASE,
+    )
+    return " ".join(clean.split()).strip()
 
 
 def _repetition_hallucination_reason(text: str) -> str | None:

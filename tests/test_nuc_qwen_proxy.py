@@ -188,5 +188,24 @@ class QwenProxyRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3, post.await_count)
 
 
+class QwenTranscriptCleaningTests(unittest.TestCase):
+    def test_removes_control_markers_from_start_and_middle(self) -> None:
+        raw = (
+            "language English<asr_text>Hello world. "
+            "The sentence was split.language English<asr_text>Across chunks."
+        )
+
+        self.assertEqual(
+            "Hello world. The sentence was split. Across chunks.",
+            proxy._clean_transcript(raw),
+        )
+
+    def test_preserves_spoken_language_word_without_protocol_marker(self) -> None:
+        self.assertEqual(
+            "The English language is widely used.",
+            proxy._clean_transcript("The English language is widely used."),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

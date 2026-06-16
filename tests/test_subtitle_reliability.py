@@ -79,6 +79,27 @@ class SubtitleReliabilityTests(unittest.TestCase):
         self.assertEqual(report.status, "incomplete_speech_coverage")
         self.assertTrue(any("low text density" in item.reason for item in report.suspicious_regions))
 
+    def test_audit_detects_local_repetition_hallucination(self) -> None:
+        result = ASRResult(
+            language="en",
+            words=[],
+            segments=[
+                SubtitleSegment(10.0, 10.5, "Thank you."),
+                SubtitleSegment(10.6, 10.8, "Thank you."),
+                SubtitleSegment(10.9, 11.0, "Thank you."),
+                SubtitleSegment(11.1, 11.2, "Thank you."),
+                SubtitleSegment(12.0, 13.0, "Questions eleven to fifteen."),
+            ],
+        )
+        report = audit_asr_result(result, [SpeechRegion(10, 13)], duration=13)
+        self.assertEqual(report.status, "incomplete_speech_coverage")
+        self.assertTrue(
+            any(
+                "local repetition hallucination" in item.reason
+                for item in report.suspicious_regions
+            )
+        )
+
     def test_retry_regions_apply_guard_and_merge(self) -> None:
         merged = merge_retry_regions(
             [

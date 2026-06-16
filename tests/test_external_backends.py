@@ -12,14 +12,89 @@ from unittest.mock import MagicMock, patch
 from whisper_captioner.external_backends import (
     _merge_adjacent_duplicate_segments,
     _fusion_confidence,
+    baseline_token_coverage,
     fuse_gemini_with_whisper,
     gemini_transcribe_audio,
+    parse_parakeet_report,
+    parse_whisperkit_report,
     run_omnivad_shadow,
 )
 from whisper_captioner.models import SubtitleSegment, SubtitleWord
 
 
 class ExternalBackendTests(unittest.TestCase):
+    def test_parakeet_subword_tokens_become_word_timestamps(self) -> None:
+        result = parse_parakeet_report(
+            {
+                "sentences": [
+                    {
+                        "text": " going on a holiday.",
+                        "start": 4.32,
+                        "end": 5.2,
+                        "tokens": [
+                            {"text": " going", "start": 4.32, "end": 4.48, "confidence": 1},
+                            {"text": " on", "start": 4.48, "end": 4.64, "confidence": 1},
+                            {"text": " a", "start": 4.64, "end": 4.72, "confidence": 0.95},
+                            {"text": " h", "start": 4.72, "end": 4.80, "confidence": 1},
+                            {"text": "ol", "start": 4.80, "end": 4.88, "confidence": 1},
+                            {"text": "id", "start": 4.88, "end": 5.04, "confidence": 1},
+                            {"text": "ay", "start": 5.04, "end": 5.12, "confidence": 1},
+                            {"text": ".", "start": 5.12, "end": 5.20, "confidence": 1},
+                        ],
+                    }
+                ]
+            }
+        )
+        self.assertEqual(
+            [word.text for word in result.words],
+            ["going", "on", "a", "holiday."],
+        )
+        self.assertEqual((result.words[-1].start, result.words[-1].end), (4.72, 5.2))
+
+    def test_whisperkit_report_preserves_word_timestamps(self) -> None:
+        result = parse_whisperkit_report(
+            {
+                "language": "en",
+                "segments": [
+                    {
+                        "start": 3.56,
+                        "end": 5.46,
+                        "text": "<|3.56|> going on a holiday<|5.46|>",
+                        "words": [
+                            {
+                                "start": 4.20,
+                                "end": 4.46,
+                                "word": " going",
+                                "probability": 1.0,
+                            },
+                            {
+                                "start": 4.46,
+                                "end": 4.62,
+                                "word": " on",
+                                "probability": 1.0,
+                            },
+                            {
+                                "start": 4.62,
+                                "end": 4.64,
+                                "word": " a",
+                                "probability": 0.75,
+                            },
+                            {
+                                "start": 4.64,
+                                "end": 5.0,
+                                "word": " holiday",
+                                "probability": 1.0,
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(result.language, "en")
+        self.assertEqual([word.text.strip() for word in result.words], ["going", "on", "a", "holiday"])
+        self.assertEqual(result.segments[0].text, "going on a holiday")
+        self.assertEqual(result.diagnostics["word_timestamp_source"], "whisperkit-report")
+
     def test_omnivad_missing_falls_back_without_exception(self) -> None:
         with patch.dict(
             "os.environ",
@@ -247,6 +322,85 @@ class ExternalBackendTests(unittest.TestCase):
             ["First line.", "missing section", "Last line."],
         )
 
+    def test_candidate_that_drops_baseline_tokens_is_blocked(self) -> None:
+        baseline = [
+            SubtitleSegment(0.0, 1.0, "Now, what would you like to do about the courses?"),
+            SubtitleSegment(2.0, 3.0, "Questions eleven to fifteen."),
+        ]
+        candidate = [SubtitleSegment(2.0, 3.0, "Questions eleven to fifteen.")]
+        coverage = baseline_token_coverage(baseline, candidate)
+        self.assertLess(coverage["coverage"], 0.985)
+        self.assertTrue(coverage["missing_runs"])
+
+    def test_fusion_blocks_when_high_confidence_rewrite_drops_baseline_section(self) -> None:
+        words = [
+            SubtitleWord(0.0, 0.2, "now"),
+            SubtitleWord(0.2, 0.4, "what"),
+            SubtitleWord(0.4, 0.6, "would"),
+            SubtitleWord(0.6, 0.8, "you"),
+            SubtitleWord(0.8, 1.0, "like"),
+            SubtitleWord(1.0, 1.2, "to"),
+            SubtitleWord(1.2, 1.4, "do"),
+            SubtitleWord(1.4, 1.6, "about"),
+            SubtitleWord(2.0, 2.2, "questions"),
+            SubtitleWord(2.2, 2.4, "eleven"),
+            SubtitleWord(2.4, 2.6, "to"),
+            SubtitleWord(2.6, 2.8, "fifteen"),
+        ]
+        whisper = [
+            SubtitleSegment(0.0, 1.6, "Now, what would you like to do about"),
+            SubtitleSegment(2.0, 2.8, "Questions eleven to fifteen."),
+        ]
+        result = fuse_gemini_with_whisper(
+            ["Questions eleven to fifteen."],
+            words,
+            whisper_segments=whisper,
+        )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(
+            [segment.text for segment in result.segments],
+            ["Now, what would you like to do about", "Questions eleven to fifteen."],
+        )
+        self.assertFalse(
+            result.diagnostics["baseline_token_coverage"]["missing_runs"]
+        )
+
+    def test_real_ielts_fixture_preserves_known_whisper_only_phrases(self) -> None:
+        root = Path(
+            "/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/1729839784568919"
+        )
+        asr_path = root / "1729839784568919-20260614-194754-Whisper原始-asr.json"
+        whisper_path = root / "1729839784568919-20260614-194754-Whisper原始.srt"
+        gemini_path = root / "1729839784568919-20260614-194754-Gemini原文.txt"
+        if not (asr_path.exists() and whisper_path.exists() and gemini_path.exists()):
+            self.skipTest("local IELTS regression fixture is unavailable")
+        from whisper_captioner.subtitle_io import parse_srt
+
+        data = json.loads(asr_path.read_text(encoding="utf-8"))
+        words = [
+            SubtitleWord(
+                float(item["start"]),
+                float(item["end"]),
+                str(item["text"]),
+                item.get("probability"),
+            )
+            for item in data["words"]
+        ]
+        result = fuse_gemini_with_whisper(
+            [
+                line.strip()
+                for line in gemini_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ],
+            words,
+            whisper_segments=parse_srt(whisper_path),
+        )
+        text = " ".join(segment.text for segment in result.segments)
+        self.assertIn("going on a holiday", text)
+        self.assertIn("Questions six to ten", text)
+        self.assertIn("Question 4", text)
+        self.assertEqual(result.status, "blocked")
+
     def test_file_api_upload_poll_generate_and_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             audio = Path(directory) / "long.wav"
@@ -312,6 +466,42 @@ class ExternalBackendTests(unittest.TestCase):
                 result = gemini_transcribe_audio(audio, "secret")
         self.assertEqual(result.status, "failed")
         self.assertIn("truncated", result.warning)
+
+    def test_gemini_generation_timeout_fails_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "short.wav"
+            audio.write_bytes(b"x")
+
+            def hang_forever(*_args, **_kwargs):
+                import time
+
+                time.sleep(5)
+
+            client = MagicMock()
+            client.models.generate_content.side_effect = hang_forever
+            fake_types = SimpleNamespace(
+                HttpOptions=lambda **kwargs: kwargs,
+                GenerateContentConfig=lambda **kwargs: kwargs,
+            )
+            fake_google = types.ModuleType("google")
+            fake_google.genai = SimpleNamespace(
+                Client=MagicMock(return_value=client),
+                types=fake_types,
+            )
+            progress: list[str] = []
+            with patch.dict(
+                sys.modules,
+                {"google": fake_google, "google.genai": fake_google.genai},
+            ):
+                result = gemini_transcribe_audio(
+                    audio,
+                    "secret",
+                    timeout=0.01,
+                    progress_callback=progress.append,
+                )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("timed out", result.warning)
+        self.assertIn("Gemini generation started", progress)
 
 if __name__ == "__main__":
     unittest.main()

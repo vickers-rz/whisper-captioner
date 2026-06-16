@@ -258,6 +258,9 @@ class MainWindow(QMainWindow):
         self.overlay_less_opacity_button.clicked.connect(lambda: self.overlay.adjust_opacity(-0.05))
         self.overlay_reset_button.clicked.connect(self.overlay._reset_position)
         self.gemini_fusion_checkbox.toggled.connect(self._on_gemini_fusion_toggled)
+        self.fusion_provider_combo.currentIndexChanged.connect(
+            self._on_fusion_provider_changed
+        )
         self.gemini_api_key_clear_button.clicked.connect(self._clear_gemini_api_key)
         self.history_refresh_button.clicked.connect(self.refresh_asr_history)
         self.history_search_input.textChanged.connect(self.refresh_asr_history)
@@ -340,6 +343,14 @@ class MainWindow(QMainWindow):
         self.gemini_fusion_checkbox.setChecked(
             settings.value("llm/gemini_fusion_enabled", False, type=bool)
         )
+        fusion_provider = str(
+            settings.value("asr/high_accuracy_fusion_provider", "whisperkit_qwen")
+        )
+        if fusion_provider == "parakeet_qwen":
+            fusion_provider = "whisperkit_qwen"
+        fusion_provider_index = self.fusion_provider_combo.findData(fusion_provider)
+        if fusion_provider_index >= 0:
+            self.fusion_provider_combo.setCurrentIndex(fusion_provider_index)
         legacy_gemini_key = str(settings.value("llm/gemini_api_key", "")).strip()
         try:
             if legacy_gemini_key:
@@ -379,6 +390,7 @@ class MainWindow(QMainWindow):
         )
         self._on_log_level_changed()
         self._on_llm_provider_changed()
+        self._on_fusion_provider_changed()
 
     def _apply_window_style(self) -> None:
         self.setStyleSheet(WINDOW_STYLESHEET)
@@ -403,6 +415,10 @@ class MainWindow(QMainWindow):
         settings = QSettings("WhisperCaptioner", "App")
         settings.setValue("llm/enabled", self.llm_group.isChecked())
         settings.setValue("llm/gemini_fusion_enabled", self.gemini_fusion_checkbox.isChecked())
+        settings.setValue(
+            "asr/high_accuracy_fusion_provider",
+            self.fusion_provider_combo.currentData(),
+        )
         settings.remove("llm/gemini_api_key")
         gemini_key = self.gemini_api_key_input.text().strip()
         if gemini_key and not os.environ.get("GEMINI_API_KEY", "").strip():
@@ -1802,8 +1818,16 @@ class MainWindow(QMainWindow):
             gemini_key = self.gemini_api_key_input.text().strip()
         self.queue_worker = QueueWorker(
             items, mode, self._queue_run_config(prepared_wavs),
-            gemini_fusion_enabled=fusion_checked and bool(gemini_key),
+            gemini_fusion_enabled=(
+                fusion_checked
+                and (
+                    self.fusion_provider_combo.currentData()
+                    == "whisperkit_qwen"
+                    or bool(gemini_key)
+                )
+            ),
             gemini_api_key=gemini_key,
+            fusion_provider=str(self.fusion_provider_combo.currentData()),
         )
         self.queue_worker.moveToThread(self.queue_thread)
         self.queue_thread.started.connect(self.queue_worker.run)
@@ -1978,8 +2002,16 @@ class MainWindow(QMainWindow):
                 llm_api_url=llm_api_url, llm_model_id=llm_model_id,
                 remote_vad_enabled=run_config.remote_vad_enabled,
                 run_config=run_config,
-                gemini_fusion_enabled=bool(gemini_key),
+                gemini_fusion_enabled=(
+                    self.gemini_fusion_checkbox.isChecked()
+                    and (
+                        self.fusion_provider_combo.currentData()
+                        == "whisperkit_qwen"
+                        or bool(gemini_key)
+                    )
+                ),
                 gemini_api_key=gemini_key,
+                fusion_provider=str(self.fusion_provider_combo.currentData()),
             )
             self.controlled_worker.moveToThread(self.controlled_thread)
             self.controlled_thread.started.connect(self.controlled_worker.run)
@@ -2002,6 +2034,18 @@ class MainWindow(QMainWindow):
     def _check_gemini_fusion_ready(self) -> tuple[bool, str]:
         """Return (should_proceed, gemini_key) after possibly showing a dialog."""
         if not self.gemini_fusion_checkbox.isChecked():
+            return True, ""
+        if self.fusion_provider_combo.currentData() == "whisperkit_qwen":
+            executable = "whisperkit-cli"
+            if not shutil.which(executable) and not Path(sys.executable).with_name(
+                executable
+            ).exists():
+                QMessageBox.critical(
+                    self,
+                    "本地 ASR 不可用",
+                    f"没有找到 {executable}，无法启动双模型转写。",
+                )
+                return False, ""
             return True, ""
         # Environment takes priority, followed by Keychain and current input.
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -2059,15 +2103,37 @@ class MainWindow(QMainWindow):
 
     def _on_gemini_fusion_toggled(self, checked: bool) -> None:
         if not checked:
+            self.mode_combo.setEnabled(True)
             return
-        target_key = "nuc_asr"
+        self._select_and_lock_fusion_mode()
+
+    def _select_and_lock_fusion_mode(self) -> None:
+        provider = self.fusion_provider_combo.currentData()
+        target_key = {
+            "whisperkit_qwen": "dual_whisperkit_qwen",
+            "gemini": "nuc_asr",
+        }.get(provider, "nuc_asr")
         idx = self.mode_combo.findData(target_key)
-        if idx >= 0 and self.mode_combo.currentData() != target_key:
-            self.mode_combo.setCurrentIndex(idx)
-            mode = self.current_mode()
-            self.log(
-                f"Gemini 双模型融合已启用，自动切换 ASR 模式为 {mode.label}"
-            )
+        if idx >= 0:
+            if self.mode_combo.currentData() != target_key:
+                self.mode_combo.setCurrentIndex(idx)
+                self.log(
+                    f"高精度双模型融合已启用，自动切换 ASR 模式为 "
+                    f"{self.current_mode().label}"
+                )
+            self.mode_combo.setEnabled(False)
+
+    def _on_fusion_provider_changed(self, *_args) -> None:
+        provider = self.fusion_provider_combo.currentData()
+        uses_gemini = provider == "gemini"
+        self.gemini_api_key_input.setVisible(uses_gemini)
+        self.gemini_api_key_clear_button.setVisible(uses_gemini)
+        QSettings("WhisperCaptioner", "App").setValue(
+            "asr/high_accuracy_fusion_provider",
+            provider,
+        )
+        if self.gemini_fusion_checkbox.isChecked():
+            self._select_and_lock_fusion_mode()
 
     def _on_gemini_fusion_blocked(self, reason: str) -> None:
         box = QMessageBox(self)

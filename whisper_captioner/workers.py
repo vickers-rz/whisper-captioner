@@ -55,6 +55,7 @@ from whisper_captioner.config import (
     MLX_TERMS_SCRIPT,
     MODELS_DIR,
     NUC_OLLAMA_HOST,
+    NUC_QWEN3_ASR_PORT,
     NUC_REMOTE_ASR_ROOT,
     NUC_SSH_PORT,
     NUC_SSH_USER,
@@ -85,10 +86,13 @@ from whisper_captioner.llm_handler import (
 from whisper_captioner.external_backends import (
     GEMINI_FUSION_VERSION,
     GEMINI_PROMPT_VERSION,
+    WHISPERKIT_FUSION_VERSION,
     fuse_gemini_with_whisper,
     gemini_fusion_cache_key,
     gemini_transcribe_audio,
+    parakeet_transcribe_audio,
     run_omnivad_shadow,
+    whisperkit_transcribe_audio,
 )
 from whisper_captioner.models import (
     ASRResult,
@@ -546,6 +550,24 @@ def _nuc_asr_model_for_mode(mode: CaptionMode) -> str:
 
 def remote_asr_quality_issue(segments: list[SubtitleSegment]) -> str | None:
     texts = [" ".join(segment.text.split()) for segment in segments if segment.text.strip()]
+    for text in texts:
+        tokens = re.findall(r"\w+(?:['’-]\w+)*", text.lower(), flags=re.UNICODE)
+        if len(tokens) < 12:
+            continue
+        for offset in range(min(12, len(tokens) - 5)):
+            for phrase_length in range(2, min(12, (len(tokens) - offset) // 3) + 1):
+                phrase = tokens[offset:offset + phrase_length]
+                repeats = 1
+                cursor = offset + phrase_length
+                while tokens[cursor:cursor + phrase_length] == phrase:
+                    repeats += 1
+                    cursor += phrase_length
+                if repeats >= 3 and (cursor - offset) / len(tokens) >= 0.75:
+                    return (
+                        f"one segment repeats {repeats} times "
+                        f"({' '.join(phrase[:8])!r})"
+                    )
+
     if len(texts) < 20:
         return None
 
@@ -763,18 +785,55 @@ def _transcribe_via_nuc_qwen3_asr_1p7b(
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
 
+    def clean_qwen_text(value: object) -> str:
+        clean = " ".join(str(value or "").split()).strip()
+        clean = re.sub(
+            r"(?:\blanguage\s+[\w-]+\s*)?<asr_text>\s*",
+            " ",
+            clean,
+            flags=re.IGNORECASE,
+        )
+        return " ".join(clean.split()).strip()
+
     segments: list[SubtitleSegment] = []
     if response_format == "verbose_json":
         for seg in data.get("segments", []):
-            text = seg.get("text", "").strip()
+            text = clean_qwen_text(seg.get("text"))
             if text:
                 segments.append(SubtitleSegment(seg["start"], seg["end"], text))
     else:
-        text = data.get("text", "").strip()
+        text = clean_qwen_text(data.get("text"))
         if text:
             duration = data.get("duration", 30.0)
             segments.append(SubtitleSegment(0.0, duration, text))
     return segments
+
+
+def _transcribe_qwen_full_text_with_status(
+    audio_path: Path,
+    *,
+    status_signal: Signal,
+    timeout: int,
+    language: str = "en",
+) -> list[SubtitleSegment]:
+    status_signal.emit("NUC Qwen3-ASR full-text transcription started")
+    started = time.monotonic()
+    try:
+        result = _transcribe_via_nuc_qwen3_asr_1p7b(
+            audio_path,
+            f"http://{NUC_OLLAMA_HOST}:{NUC_QWEN3_ASR_PORT}",
+            language,
+            "verbose_json",
+            timeout,
+        )
+    except Exception as exc:
+        status_signal.emit(f"NUC Qwen3-ASR full-text transcription failed: {exc}")
+        raise
+    status_signal.emit(
+        f"NUC Qwen3-ASR full-text transcription completed: "
+        f"{len(result)} segment(s) in {time.monotonic() - started:.1f}s"
+    )
+    return result
 
 
 def qwen3_event_label(text: str) -> bool:
@@ -1450,6 +1509,7 @@ class QueueWorker(QObject):
         config: QueueRunConfig | None = None,
         gemini_fusion_enabled: bool = False,
         gemini_api_key: str = "",
+        fusion_provider: str = "gemini",
     ) -> None:
         super().__init__()
         self.items = items
@@ -1463,6 +1523,7 @@ class QueueWorker(QObject):
         self._used_nuc_asr = False
         self.gemini_fusion_enabled = gemini_fusion_enabled
         self.gemini_api_key = gemini_api_key
+        self.fusion_provider = fusion_provider
         self.history = ASRHistoryStore()
 
     def run(self) -> None:
@@ -1720,6 +1781,192 @@ class QueueWorker(QObject):
             diagnostics={"word_timestamp_source": "nuc_faster_whisper_chunks"},
         )
 
+    def _repair_nuc_speech_gaps(
+        self,
+        wav: Path,
+        result: ASRResult,
+        *,
+        base_url: str,
+        model: str,
+    ) -> ASRResult:
+        duration = _probe_audio_duration(wav)
+        try:
+            vad_output = self._run_capture(
+                [
+                    FFMPEG,
+                    "-hide_banner",
+                    "-i",
+                    str(wav),
+                    "-af",
+                    "silencedetect=noise=-35dB:d=0.3",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                "Auditing NUC Whisper speech gaps",
+            )
+            speech_regions = parse_silencedetect_regions(vad_output, duration)
+        except Exception as exc:
+            self.status.emit(f"NUC Whisper gap audit unavailable: {exc}")
+            return result
+
+        report = audit_asr_result(result, speech_regions, duration=duration)
+        target_regions = merge_retry_regions(
+            report.uncovered_regions,
+            guard=0.0,
+            merge_gap=0.75,
+            duration=duration,
+        )
+        target_regions = [
+            region
+            for region in target_regions
+            if region.end - region.start >= 0.5
+        ][:12]
+        if not target_regions:
+            result.diagnostics["speech_gap_repair"] = {
+                "status": "not-needed",
+                "speech_coverage": report.speech_coverage,
+            }
+            return result
+
+        repaired_segments: list[SubtitleSegment] = []
+        repaired_words: list[SubtitleWord] = []
+        attempts: list[dict[str, Any]] = []
+        with tempfile.TemporaryDirectory(prefix="whisper-captioner-gap-repair-") as directory:
+            repair_dir = Path(directory)
+            for index, target_region in enumerate(target_regions, start=1):
+                if self._stop:
+                    raise RuntimeError("Queue stopped")
+                region = RetryRegion(
+                    max(0.0, target_region.start - 2.0),
+                    min(duration, target_region.end + 2.0),
+                    target_region.reason,
+                )
+                region_duration = region.end - region.start
+                repair_wav = repair_dir / f"gap-{index:03d}.wav"
+                self._run(
+                    [
+                        FFMPEG,
+                        "-hide_banner",
+                        "-y",
+                        "-ss",
+                        f"{region.start:.3f}",
+                        "-t",
+                        f"{region_duration:.3f}",
+                        "-i",
+                        str(wav),
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        str(repair_wav),
+                    ],
+                    f"Preparing Whisper gap repair {index}/{len(target_regions)} "
+                    f"({region.start:.2f}-{region.end:.2f}s)",
+                )
+                local = _transcribe_via_nuc_asr_result(
+                    repair_wav,
+                    base_url=base_url,
+                    model=model,
+                    language=result.language or NUC_ASR_AUTO_LANGUAGE,
+                    vad_filter=True,
+                    timeout=max(120, int(region_duration * 8)),
+                    status_signal=self.status,
+                )
+                local_segments = [
+                    SubtitleSegment(
+                        max(target_region.start, region.start + segment.start),
+                        min(target_region.end, region.start + segment.end),
+                        segment.text,
+                    )
+                    for segment in local.segments
+                    if (
+                        segment.text.strip()
+                        and region.start + segment.end > target_region.start
+                        and region.start + segment.start < target_region.end
+                    )
+                ]
+                local_words = [
+                    SubtitleWord(
+                        max(target_region.start, region.start + word.start),
+                        min(target_region.end, region.start + word.end),
+                        word.text,
+                        word.probability,
+                    )
+                    for word in local.words
+                    if (
+                        word.text.strip()
+                        and region.start + word.end > target_region.start
+                        and region.start + word.start < target_region.end
+                    )
+                ]
+                local_segments = [
+                    segment for segment in local_segments if segment.end > segment.start
+                ]
+                local_words = [word for word in local_words if word.end > word.start]
+                accepted = bool(local_segments)
+                if accepted:
+                    repaired_segments.extend(local_segments)
+                    repaired_words.extend(local_words)
+                attempts.append(
+                    {
+                        "start": target_region.start,
+                        "end": target_region.end,
+                        "request_start": region.start,
+                        "request_end": region.end,
+                        "reason": target_region.reason,
+                        "accepted": accepted,
+                        "segment_count": len(local_segments),
+                        "word_count": len(local_words),
+                    }
+                )
+                self.status.emit(
+                    f"Whisper gap repair {index}/{len(target_regions)}: "
+                    f"{'accepted' if accepted else 'no usable text'}"
+                )
+
+        accepted_regions = [
+            region
+            for region, attempt in zip(target_regions, attempts)
+            if attempt["accepted"]
+        ]
+        if not accepted_regions:
+            result.diagnostics["speech_gap_repair"] = {
+                "status": "no-improvement",
+                "speech_coverage": report.speech_coverage,
+                "attempts": attempts,
+            }
+            return result
+
+        segments = replace_segments_in_regions(
+            result.segments,
+            repaired_segments,
+            accepted_regions,
+        )
+        words = [
+            word
+            for word in result.words
+            if not any(
+                word.end > region.start and word.start < region.end
+                for region in accepted_regions
+            )
+        ]
+        words.extend(repaired_words)
+        words.sort(key=lambda word: (word.start, word.end))
+        diagnostics = dict(result.diagnostics)
+        diagnostics["speech_gap_repair"] = {
+            "status": "completed",
+            "speech_coverage_before": report.speech_coverage,
+            "attempts": attempts,
+        }
+        return ASRResult(
+            language=result.language,
+            words=words,
+            segments=segments,
+            diagnostics=diagnostics,
+        )
+
     def _transcribe_local_file_via_nuc_qwen_job(self, wav: Path, *, base_url: str) -> list[SubtitleSegment]:
         import urllib.request
 
@@ -1875,7 +2122,155 @@ class QueueWorker(QObject):
                 segments = self._transcribe_local_sense_voice_cpp_chunked(wav)
                 save_segments_as_txt(base.with_suffix(".txt"), segments)
                 save_segments_as_srt(base.with_suffix(".srt"), segments)
+            elif self.mode.backend in {"parakeet", "whisperkit"}:
+                transcribe = (
+                    parakeet_transcribe_audio
+                    if self.mode.backend == "parakeet"
+                    else whisperkit_transcribe_audio
+                )
+                result = transcribe(
+                    wav,
+                    progress_callback=lambda msg: self.status.emit(msg),
+                )
+                segments, cue_warnings = build_cues(result.words, result.segments)
+                result.segments = segments
+                result.diagnostics.setdefault("capability_warnings", []).extend(
+                    cue_warnings
+                )
+                save_asr_result(base.with_name(f"{base.name}-asr.json"), result)
+                save_segments_as_txt(base.with_suffix(".txt"), segments)
+                save_segments_as_srt(base.with_suffix(".srt"), segments)
             elif self.mode.backend == "nuc_asr":
+                if self.gemini_fusion_enabled and self.fusion_provider in {
+                    "whisperkit_qwen",
+                }:
+                    baseline_name = "WhisperKit"
+                    self.status.emit(
+                        f"High-accuracy dual ASR: starting Mac {baseline_name} word timeline "
+                        "and NUC Qwen3-ASR full-text transcription in parallel"
+                    )
+                    started = time.monotonic()
+                    with ThreadPoolExecutor(
+                        max_workers=2,
+                        thread_name_prefix="whisperkit-qwen-fusion",
+                    ) as executor:
+                        whisperkit_future = executor.submit(
+                            whisperkit_transcribe_audio,
+                            wav,
+                            progress_callback=lambda msg: self.status.emit(msg),
+                        )
+                        qwen_future = executor.submit(
+                            _transcribe_qwen_full_text_with_status,
+                            wav,
+                            status_signal=self.status,
+                            timeout=max(900, int(_probe_audio_duration(wav) * 4)),
+                        )
+                        pending = {whisperkit_future, qwen_future}
+                        while pending:
+                            completed, pending = wait(
+                                pending,
+                                timeout=10,
+                                return_when=FIRST_COMPLETED,
+                            )
+                            if not completed:
+                                running = []
+                                if whisperkit_future in pending:
+                                    running.append(baseline_name)
+                                if qwen_future in pending:
+                                    running.append("NUC Qwen3-ASR")
+                                self.status.emit(
+                                    "Dual ASR still running: " + ", ".join(running)
+                                )
+                        asr_result = whisperkit_future.result()
+                        try:
+                            qwen_segments = qwen_future.result()
+                        except Exception:
+                            qwen_segments = []
+                    qwen_lines = [
+                        segment.text.strip()
+                        for segment in qwen_segments
+                        if segment.text.strip()
+                    ]
+                    segments = asr_result.segments
+                    baseline_label = "WhisperKit原始"
+                    raw_base = base.with_name(f"{base.name}-{baseline_label}")
+                    save_segments_as_txt(raw_base.with_suffix(".txt"), segments)
+                    save_segments_as_srt(raw_base.with_suffix(".srt"), segments)
+                    save_asr_result(
+                        base.with_name(f"{base.name}-{baseline_label}-asr.json"),
+                        asr_result,
+                    )
+                    qwen_text = "\n".join(qwen_lines)
+                    base.with_name(f"{base.name}-Qwen原文.txt").write_text(
+                        qwen_text,
+                        encoding="utf-8",
+                    )
+                    fusion = (
+                        fuse_gemini_with_whisper(
+                            qwen_lines,
+                            asr_result.words,
+                            whisper_segments=asr_result.segments,
+                        )
+                        if qwen_lines
+                        else None
+                    )
+                    if fusion and fusion.status == "completed" and fusion.segments:
+                        segments = fusion.segments
+                    _write_json_local(
+                        base.with_name(f"{base.name}-fusion-diagnostics.json"),
+                        {
+                            "baseline": {
+                                "provider": "whisperkit-cli",
+                                "model": asr_result.diagnostics.get("model_path", ""),
+                                "word_count": len(asr_result.words),
+                                "segment_count": len(asr_result.segments),
+                                "diagnostics": asr_result.diagnostics,
+                            },
+                            "correction": {
+                                "provider": "nuc-qwen3-asr-1.7b",
+                                "line_count": len(qwen_lines),
+                            },
+                            "fusion": {
+                                "status": fusion.status if fusion else "skipped",
+                                "confidence": fusion.confidence if fusion else 0.0,
+                                "warnings": fusion.warnings if fusion else ["Qwen unavailable"],
+                                "diagnostics": fusion.diagnostics if fusion else {},
+                                "algorithm_version": WHISPERKIT_FUSION_VERSION,
+                            },
+                            "elapsed": time.monotonic() - started,
+                        },
+                    )
+                    self.status.emit(
+                        f"WhisperKit+Qwen fusion finished in "
+                        f"{time.monotonic() - started:.1f}s "
+                        f"(confidence={fusion.confidence:.2f}, status={fusion.status})"
+                        if fusion
+                        else "Qwen unavailable; preserved local word-timestamp baseline"
+                    )
+                    save_segments_as_txt(base.with_suffix(".txt"), segments)
+                    save_segments_as_srt(base.with_suffix(".srt"), segments)
+                    txt = base.with_suffix(".txt")
+                    if txt.exists():
+                        self.caption.emit(
+                            txt.read_text(encoding="utf-8", errors="ignore")[-1200:]
+                        )
+                    self.output_ready.emit(source, str(base))
+                    self.status.emit(f"Done: {base}")
+                    self.history.upsert(
+                        source,
+                        title=source_title,
+                        audio_cache_key=(
+                            wav.parent.name
+                            if wav.parent.parent == LOCAL_AUDIO_CACHE_DIR
+                            else ""
+                        ),
+                        audio_cache_wav=str(wav) if wav.exists() else "",
+                        last_mode_key=self.mode.key,
+                        last_mode_label=self.mode.label,
+                        output_base=str(base),
+                        status="ready",
+                    )
+                    return True
                 self._used_nuc_asr = True
                 nuc_asr_model = _nuc_asr_model_for_mode(self.mode)
                 self.status.emit(
@@ -1887,6 +2282,12 @@ class QueueWorker(QObject):
                 )
                 asr_result = self._transcribe_file_via_nuc_chunks(
                     wav,
+                    base_url=str(self.mode.model),
+                    model=nuc_asr_model,
+                )
+                asr_result = self._repair_nuc_speech_gaps(
+                    wav,
+                    asr_result,
                     base_url=str(self.mode.model),
                     model=nuc_asr_model,
                 )
@@ -1908,8 +2309,17 @@ class QueueWorker(QObject):
                     self.status.emit(
                         f"Gemini+Whisper fusion: sending {duration:.0f}s audio to Gemini 2.5 Flash..."
                     )
+                    gemini_timeout = 180 if duration <= 600 else 240
                     gemini_result = gemini_transcribe_audio(
-                        wav, self.gemini_api_key, model="gemini-2.5-flash",
+                        wav,
+                        self.gemini_api_key,
+                        model="gemini-2.5-flash",
+                        timeout=gemini_timeout,
+                        upload_timeout=120,
+                        processing_timeout=600,
+                        progress_callback=lambda msg: self.status.emit(
+                            f"Gemini+Whisper fusion: {msg}"
+                        ),
                     )
                     gemini_text_path = base.with_name(f"{base.name}-Gemini原文.txt")
                     diagnostics_path = base.with_name(
@@ -1925,7 +2335,7 @@ class QueueWorker(QObject):
                             asr_result.words,
                             whisper_segments=asr_result.segments,
                         )
-                        if fusion.status in {"completed", "partial"} and fusion.segments:
+                        if fusion.status == "completed" and fusion.segments:
                             segments = fusion.segments
                             self.status.emit(
                                 f"Gemini+Whisper fusion: {len(gemini_result.lines)} Gemini lines → "
@@ -2734,6 +3144,7 @@ class RollingPrefetchWorker(QObject):
         run_config: QueueRunConfig | None = None,
         gemini_fusion_enabled: bool = False,
         gemini_api_key: str = "",
+        fusion_provider: str = "gemini",
     ) -> None:
         super().__init__()
         self.url = url
@@ -2751,6 +3162,7 @@ class RollingPrefetchWorker(QObject):
         )
         self.gemini_fusion_enabled = gemini_fusion_enabled
         self.gemini_api_key = gemini_api_key
+        self.fusion_provider = fusion_provider
         self._stop = False
         self.proc: Optional[subprocess.Popen[str]] = None
         self._temp_paths: list[Path] = []
@@ -3301,7 +3713,12 @@ class RollingPrefetchWorker(QObject):
             self.llm_api_url,
             "full-document-polish-v2",
             self.gemini_fusion_enabled,
-            GEMINI_FUSION_VERSION,
+            self.fusion_provider,
+            (
+                WHISPERKIT_FUSION_VERSION
+                if self.fusion_provider == "whisperkit_qwen"
+                else GEMINI_FUSION_VERSION
+            ),
         )
         return job_cache_dir / f"all-polished-{polish_key}.json"
 
@@ -3320,7 +3737,11 @@ class RollingPrefetchWorker(QObject):
         return all_segments
 
     def _final_subtitle_cache_path(self, job_cache_dir: Path) -> Path:
-        variant = "gemini-fusion" if self.gemini_fusion_enabled else "whisper"
+        variant = (
+            f"{self.fusion_provider}-fusion"
+            if self.gemini_fusion_enabled
+            else "whisper"
+        )
         return job_cache_dir / f"final-subtitles-{variant}.json"
 
     def _discard_derived_subtitle_caches(self, job_cache_dir: Path) -> None:
@@ -3404,6 +3825,26 @@ class RollingPrefetchWorker(QObject):
                 leading_trim=0.0,
                 trailing_trim=0.0,
                 chunk_duration=self._sense_voice_chunk_window_seconds(),
+            )
+            srt_path = chunk_out.with_suffix(".srt")
+            save_segments_as_srt(srt_path, segments)
+            return srt_path
+        if self.mode.backend in {"parakeet", "whisperkit"}:
+            transcribe = (
+                parakeet_transcribe_audio
+                if self.mode.backend == "parakeet"
+                else whisperkit_transcribe_audio
+            )
+            result = transcribe(
+                chunk_wav,
+                progress_callback=lambda msg: self.status.emit(msg),
+            )
+            segments, _warnings = build_cues(result.words, result.segments)
+            self._last_asr_result = ASRResult(
+                language=result.language,
+                words=result.words,
+                segments=segments,
+                diagnostics=result.diagnostics,
             )
             srt_path = chunk_out.with_suffix(".srt")
             save_segments_as_srt(srt_path, segments)
@@ -3550,6 +3991,92 @@ class RollingPrefetchWorker(QObject):
         if not self.gemini_fusion_enabled:
             combined.diagnostics["gemini_fusion"] = {"status": "disabled"}
             return combined
+        if self.fusion_provider == "whisperkit_qwen":
+            algorithm_version = WHISPERKIT_FUSION_VERSION
+            cache_path = job_cache_dir / (
+                f"{self.fusion_provider}-fusion-{algorithm_version}.json"
+            )
+            if cache_path.exists():
+                cached = load_asr_result(cache_path)
+                self.status.emit(
+                    f"Loaded WhisperKit+Qwen fusion cache: {cache_path.name}"
+                )
+                return cached
+            baseline_name = "WhisperKit"
+            self.status.emit(
+                f"High-accuracy dual ASR: starting {baseline_name} and "
+                "NUC Qwen3-ASR in parallel"
+            )
+            with ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="whisperkit-qwen-fusion",
+            ) as executor:
+                whisperkit_future = executor.submit(
+                    whisperkit_transcribe_audio,
+                    audio,
+                    progress_callback=lambda msg: self.status.emit(msg),
+                )
+                qwen_future = executor.submit(
+                    _transcribe_qwen_full_text_with_status,
+                    audio,
+                    status_signal=self.status,
+                    timeout=max(900, int(_probe_audio_duration(audio) * 4)),
+                )
+                pending = {whisperkit_future, qwen_future}
+                while pending:
+                    completed, pending = wait(
+                        pending,
+                        timeout=10,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not completed:
+                        running = []
+                        if whisperkit_future in pending:
+                            running.append(baseline_name)
+                        if qwen_future in pending:
+                            running.append("NUC Qwen3-ASR")
+                        self.status.emit(
+                            "Dual ASR still running: " + ", ".join(running)
+                        )
+                baseline = whisperkit_future.result()
+                try:
+                    qwen_segments = qwen_future.result()
+                except Exception:
+                    qwen_segments = []
+            qwen_lines = [
+                segment.text.strip()
+                for segment in qwen_segments
+                if segment.text.strip()
+            ]
+            fusion = (
+                fuse_gemini_with_whisper(
+                    qwen_lines,
+                    baseline.words,
+                    whisper_segments=baseline.segments,
+                )
+                if qwen_lines
+                else None
+            )
+            if fusion and fusion.status == "completed" and fusion.segments:
+                baseline.segments = fusion.segments
+            baseline.diagnostics["whisperkit_qwen_fusion"] = {
+                "status": fusion.status if fusion else "skipped",
+                "confidence": fusion.confidence if fusion else 0.0,
+                "warnings": fusion.warnings if fusion else ["Qwen unavailable"],
+                "diagnostics": fusion.diagnostics if fusion else {},
+                "algorithm_version": algorithm_version,
+            }
+            save_asr_result(cache_path, baseline)
+            save_segments(job_cache_dir / "fused-segments.json", baseline.segments)
+            (job_cache_dir / "qwen-full-transcript.txt").write_text(
+                "\n".join(qwen_lines),
+                encoding="utf-8",
+            )
+            _write_json_local(
+                job_cache_dir / "fusion-diagnostics.json",
+                baseline.diagnostics["whisperkit_qwen_fusion"],
+            )
+            return baseline
         if not self.gemini_api_key:
             combined.diagnostics["gemini_fusion"] = {
                 "status": "skipped",
@@ -3583,7 +4110,23 @@ class RollingPrefetchWorker(QObject):
             except Exception as exc:
                 self.status.emit(f"Fusion cache unreadable; rebuilding: {exc}")
 
-        gemini_result = gemini_transcribe_audio(audio, self.gemini_api_key, model=model)
+        duration = getattr(combined, "duration", 0.0) or 0.0
+        gemini_timeout = 180 if duration <= 600 else 240
+        self.status.emit(
+            f"Gemini+Whisper fusion: sending audio to Gemini 2.5 Flash "
+            f"(timeout={gemini_timeout}s)"
+        )
+        gemini_result = gemini_transcribe_audio(
+            audio,
+            self.gemini_api_key,
+            model=model,
+            timeout=gemini_timeout,
+            upload_timeout=120,
+            processing_timeout=600,
+            progress_callback=lambda msg: self.status.emit(
+                f"Gemini+Whisper fusion: {msg}"
+            ),
+        )
         fusion_diagnostics = {
             "status": gemini_result.status,
             "model": gemini_result.model,
@@ -3615,7 +4158,7 @@ class RollingPrefetchWorker(QObject):
             alignment=fusion.diagnostics,
         )
         combined.diagnostics["gemini_fusion"] = fusion_diagnostics
-        if fusion.status in {"completed", "partial"} and fusion.segments:
+        if fusion.status == "completed" and fusion.segments:
             combined.segments = fusion.segments
             self.status.emit(
                 f"Gemini+Whisper fusion: {len(gemini_result.lines)} lines -> "
