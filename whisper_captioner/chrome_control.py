@@ -48,6 +48,10 @@ MEDIA_HOSTS = (
 class ChromeMediaTab:
     title: str
     url: str
+    window_index: int = -1
+    tab_index: int = -1
+    is_front_window: bool = False
+    is_active_tab: bool = False
 
 
 def chrome_is_running() -> bool:
@@ -83,12 +87,18 @@ def _chrome_active_tabs() -> list[ChromeMediaTab]:
         return []
     apple_script = (
         'tell application "Google Chrome"\n'
+        '  set frontWindowIndex to -1\n'
+        '  try\n'
+        '    set frontWindowIndex to index of front window\n'
+        '  end try\n'
         '  set activeTabs to ""\n'
         '  repeat with w in windows\n'
+        '    set windowIndex to index of w\n'
+        '    set activeTabIndex to active tab index of w\n'
         '    repeat with tabIndex from 1 to (count of tabs of w)\n'
         '      set t to tab tabIndex of w\n'
         '      if activeTabs is not "" then set activeTabs to activeTabs & linefeed\n'
-        '      set activeTabs to activeTabs & (title of t) & (ASCII character 31) & (URL of t)\n'
+        '      set activeTabs to activeTabs & (title of t) & (ASCII character 31) & (URL of t) & (ASCII character 31) & (windowIndex as string) & (ASCII character 31) & (tabIndex as string) & (ASCII character 31) & ((windowIndex is frontWindowIndex) as string) & (ASCII character 31) & ((tabIndex is activeTabIndex) as string)\n'
         '    end repeat\n'
         '  end repeat\n'
         '  return activeTabs\n'
@@ -103,14 +113,41 @@ def _chrome_active_tabs() -> list[ChromeMediaTab]:
     )
     tabs: list[ChromeMediaTab] = []
     for line in proc.stdout.splitlines():
-        title, separator, url = line.partition("\x1f")
-        if separator and url.strip():
-            tabs.append(ChromeMediaTab(title.strip(), url.strip()))
+        parts = line.split("\x1f")
+        if len(parts) < 2:
+            continue
+        title = parts[0].strip()
+        url = parts[1].strip()
+        if not url:
+            continue
+        window_index = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else -1
+        tab_index = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else -1
+        is_front_window = len(parts) > 4 and parts[4].strip().lower() == "true"
+        is_active_tab = len(parts) > 5 and parts[5].strip().lower() == "true"
+        tabs.append(
+            ChromeMediaTab(
+                title=title,
+                url=url,
+                window_index=window_index,
+                tab_index=tab_index,
+                is_front_window=is_front_window,
+                is_active_tab=is_active_tab,
+            )
+        )
     return tabs
 
 
 def chrome_media_tabs() -> list[ChromeMediaTab]:
-    return [tab for tab in _chrome_active_tabs() if _is_likely_media_url(tab.url)]
+    tabs = [tab for tab in _chrome_active_tabs() if _is_likely_media_url(tab.url)]
+    tabs.sort(
+        key=lambda tab: (
+            0 if tab.is_front_window and tab.is_active_tab else 1,
+            0 if tab.is_front_window else 1,
+            tab.window_index if tab.window_index >= 0 else 10**6,
+            tab.tab_index if tab.tab_index >= 0 else 10**6,
+        )
+    )
+    return tabs
 
 
 def run_chrome_script(script: str) -> str:

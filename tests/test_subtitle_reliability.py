@@ -69,6 +69,18 @@ class SubtitleReliabilityTests(unittest.TestCase):
         self.assertTrue(all(current.start >= previous.end for previous, current in zip(cues, cues[1:])))
         self.assertTrue(all(cue.end - cue.start <= 5.0 for cue in cues))
 
+    def test_batched_words_can_rebuild_coarse_segments(self) -> None:
+        words = [
+            SubtitleWord(0.0, 0.3, "第一句。"),
+            SubtitleWord(1.4, 1.8, "第二句。"),
+        ]
+        coarse = [SubtitleSegment(0.0, 2.0, "第一句。第二句。")]
+
+        cues, warnings = build_cues(words, coarse)
+
+        self.assertFalse(warnings)
+        self.assertEqual([cue.text for cue in cues], ["第一句。", "第二句。"])
+
     def test_audit_detects_covered_but_low_density_span(self) -> None:
         result = ASRResult(
             language="zh",

@@ -9,6 +9,9 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 NETWORK_NAME="${NETWORK_NAME:-qwen3-asr-net}"
 SCHEDULER_CONTAINER="${SCHEDULER_CONTAINER:-nuc-service-scheduler}"
 ASR_IDLE_SECONDS="${ASR_IDLE_SECONDS:-900}"
+ASR_BACKEND_IMAGE="${ASR_BACKEND_IMAGE:-nuc-faster-whisper-server:fw-1.2.1-batched}"
+ASR_BACKEND_COMMAND="${ASR_BACKEND_COMMAND:-/root/faster-whisper-server/.venv/bin/uvicorn --factory faster_whisper_server.main:create_app}"
+ASR_BATCHED_IMAGE="${ASR_BATCHED_IMAGE:-nuc-faster-whisper-server:fw-1.2.1-batched}"
 QWEN_MAX_DIRECT_UPLOAD_MB="${QWEN_MAX_DIRECT_UPLOAD_MB:-64}"
 QWEN_CHUNK_SECONDS="${QWEN_CHUNK_SECONDS:-30}"
 QWEN_CHUNK_OVERLAP_SECONDS="${QWEN_CHUNK_OVERLAP_SECONDS:-2}"
@@ -17,6 +20,10 @@ QWEN_EMPTY_RETRY_MIN_DBFS="${QWEN_EMPTY_RETRY_MIN_DBFS:--50}"
 sudo mkdir -p "${SERVICE_DIR}"
 sudo cp "${SCRIPT_DIR}/nuc_qwen3_asr_1p7b_proxy.py" "${SERVICE_DIR}/proxy.py"
 sudo cp "${SCRIPT_DIR}/nuc_service_scheduler.py" "${SERVICE_DIR}/scheduler.py"
+if [[ -f "${SCRIPT_DIR}/nuc_faster_whisper_batched_server.Dockerfile" ]]; then
+  sudo cp "${SCRIPT_DIR}/nuc_faster_whisper_batched_server.Dockerfile" "${SERVICE_DIR}/Dockerfile.faster-whisper-batched"
+  sudo docker build -t "${ASR_BATCHED_IMAGE}" -f "${SERVICE_DIR}/Dockerfile.faster-whisper-batched" "${SERVICE_DIR}"
+fi
 sudo docker network create "${NETWORK_NAME}" >/dev/null 2>&1 || true
 
 sudo docker rm -f nuc-qwen3-asr-7b-vllm >/dev/null 2>&1 || true
@@ -38,7 +45,8 @@ sudo docker run -d \
   -e ASR_HEALTH_URL=http://host.docker.internal:8000/health \
   -e ASR_BUSY_URL=http://host.docker.internal:8000/busy \
   -e ASR_BACKEND_HEALTH_URL=http://nuc-asr-backend:8000/health \
-  -e ASR_BACKEND_IMAGE=fedirz/faster-whisper-server:latest-cuda \
+  -e ASR_BACKEND_IMAGE="${ASR_BACKEND_IMAGE}" \
+  -e ASR_BACKEND_COMMAND="${ASR_BACKEND_COMMAND}" \
   -e ASR_BACKEND_NETWORK="${NETWORK_NAME}" \
   -e ASR_BACKEND_HOST_PORT=18000 \
   -e ASR_MODEL_CACHE_DIR=/srv/ai-models/whisper-cache \

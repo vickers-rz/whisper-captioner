@@ -119,6 +119,29 @@ QWEN3_ASR_06B_4BIT_MLX_MODEL = "mlx-community/Qwen3-ASR-0.6B-4bit"
 QWEN3_ASR_1P7B_8BIT_MLX_MODEL = "mlx-community/Qwen3-ASR-1.7B-8bit"
 
 
+def resolve_cached_hf_snapshot(repo_id: str | Path) -> str | Path:
+    if not isinstance(repo_id, str) or "/" not in repo_id:
+        return repo_id
+    cache_root = HF_CACHE_DIR / "hub" / f"models--{repo_id.replace('/', '--')}"
+    snapshots_dir = cache_root / "snapshots"
+    if not snapshots_dir.exists():
+        return repo_id
+
+    ref_path = cache_root / "refs" / "main"
+    if ref_path.exists():
+        revision = ref_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if revision:
+            snapshot_dir = snapshots_dir / revision
+            if snapshot_dir.exists():
+                return snapshot_dir
+
+    snapshots = [path for path in snapshots_dir.iterdir() if path.is_dir()]
+    if not snapshots:
+        return repo_id
+    snapshots.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return snapshots[0]
+
+
 def apply_resource_environment() -> None:
     APP_RESOURCE_DIR.mkdir(parents=True, exist_ok=True)
     HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)

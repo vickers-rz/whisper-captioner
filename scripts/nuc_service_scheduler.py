@@ -41,6 +41,10 @@ ASR_BACKEND_START_TIMEOUT = float(os.environ.get("ASR_BACKEND_START_TIMEOUT", "1
 ASR_IDLE_SECONDS = float(os.environ.get("ASR_IDLE_SECONDS", "900"))
 QWEN_BUSY_URL = os.environ.get("QWEN_BUSY_URL", "http://nuc-qwen3-asr-1p7b-proxy:8000/busy")
 ASR_BACKEND_IMAGE = os.environ.get("ASR_BACKEND_IMAGE", "fedirz/faster-whisper-server:latest-cuda")
+ASR_BACKEND_COMMAND = os.environ.get(
+    "ASR_BACKEND_COMMAND",
+    "/root/faster-whisper-server/.venv/bin/uvicorn --factory faster_whisper_server.main:create_app",
+).split()
 ASR_BACKEND_NETWORK = os.environ.get("ASR_BACKEND_NETWORK", "qwen3-asr-net")
 ASR_BACKEND_HOST_PORT = int(os.environ.get("ASR_BACKEND_HOST_PORT", "18000"))
 ASR_MODEL_CACHE_DIR = os.environ.get("ASR_MODEL_CACHE_DIR", "/srv/ai-models/whisper-cache")
@@ -114,7 +118,7 @@ def _recreate_asr_backend(model: str) -> Any:
     try:
         return docker_client.containers.run(
             ASR_BACKEND_IMAGE,
-            ["uv", "run", "uvicorn", "--factory", "faster_whisper_server.main:create_app"],
+            ASR_BACKEND_COMMAND,
             name=ASR_BACKEND_CONTAINER,
             detach=True,
             network=ASR_BACKEND_NETWORK,

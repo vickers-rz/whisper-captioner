@@ -6,6 +6,9 @@ NETWORK_NAME="${NETWORK_NAME:-qwen3-asr-net}"
 ASR_BACKEND_CONTAINER="${ASR_BACKEND_CONTAINER:-nuc-asr-backend}"
 ASR_PROXY_CONTAINER="${ASR_PROXY_CONTAINER:-nuc-asr}"
 ASR_IMAGE="${ASR_IMAGE:-fedirz/faster-whisper-server:latest-cuda}"
+ASR_BATCHED_IMAGE="${ASR_BATCHED_IMAGE:-nuc-faster-whisper-server:fw-1.2.1-batched}"
+ASR_USE_BATCHED_IMAGE="${ASR_USE_BATCHED_IMAGE:-1}"
+ASR_BACKEND_COMMAND="${ASR_BACKEND_COMMAND:-/root/faster-whisper-server/.venv/bin/uvicorn --factory faster_whisper_server.main:create_app}"
 ASR_PROXY_IMAGE="${ASR_PROXY_IMAGE:-nuc-asr-busy-proxy:latest}"
 UPSTREAM_PROXY_PORT="${UPSTREAM_PROXY_PORT:-8000}"
 UPSTREAM_BACKEND_PORT="${UPSTREAM_BACKEND_PORT:-18000}"
@@ -26,7 +29,14 @@ fi
 if [[ -f "${SOURCE_DIR}/nuc_asr_busy_proxy.Dockerfile" ]]; then
   sudo cp "${SOURCE_DIR}/nuc_asr_busy_proxy.Dockerfile" "${SERVICE_DIR}/Dockerfile.asr-busy-proxy"
 fi
+if [[ -f "${SOURCE_DIR}/nuc_faster_whisper_batched_server.Dockerfile" ]]; then
+  sudo cp "${SOURCE_DIR}/nuc_faster_whisper_batched_server.Dockerfile" "${SERVICE_DIR}/Dockerfile.faster-whisper-batched"
+fi
 sudo docker build -t "${ASR_PROXY_IMAGE}" -f "${SERVICE_DIR}/Dockerfile.asr-busy-proxy" "${SERVICE_DIR}"
+if [[ "${ASR_USE_BATCHED_IMAGE}" == "1" ]]; then
+  sudo docker build -t "${ASR_BATCHED_IMAGE}" -f "${SERVICE_DIR}/Dockerfile.faster-whisper-batched" "${SERVICE_DIR}"
+  ASR_IMAGE="${ASR_BATCHED_IMAGE}"
+fi
 sudo docker network create "${NETWORK_NAME}" >/dev/null 2>&1 || true
 
 if sudo docker ps --format '{{.Names}}' | grep -qx "${ASR_PROXY_CONTAINER}"; then
@@ -60,7 +70,7 @@ sudo docker run -d \
   -e HF_ENDPOINT=https://hf-mirror.com \
   -v /srv/ai-models/whisper-cache:/root/.cache/huggingface \
   "${ASR_IMAGE}" \
-  uv run uvicorn --factory faster_whisper_server.main:create_app
+  ${ASR_BACKEND_COMMAND}
 
 sudo docker run -d \
   --name "${ASR_PROXY_CONTAINER}" \

@@ -19,6 +19,44 @@ except ModuleNotFoundError:
     sys.modules["docker"] = docker_stub
     docker_module = docker_stub
 
+for missing_name in ("httpx", "fastapi", "pydantic"):
+    if missing_name in sys.modules:
+        continue
+    if missing_name == "httpx":
+        module = types.ModuleType("httpx")
+        module.AsyncClient = mock.Mock
+        module.HTTPError = Exception
+    elif missing_name == "fastapi":
+        module = types.ModuleType("fastapi")
+
+        class FastAPI:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def get(self, *_args, **_kwargs):
+                return lambda func: func
+
+            def post(self, *_args, **_kwargs):
+                return lambda func: func
+
+        module.FastAPI = FastAPI
+
+        class HTTPException(Exception):
+            def __init__(self, status_code: int, detail: str = "") -> None:
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        module.HTTPException = HTTPException
+    else:
+        module = types.ModuleType("pydantic")
+
+        class BaseModel:
+            pass
+
+        module.BaseModel = BaseModel
+    sys.modules[missing_name] = module
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts" / "nuc_service_scheduler.py"
@@ -52,6 +90,10 @@ class NucSchedulerModelTests(unittest.TestCase):
         with self.assertRaises(scheduler.HTTPException) as raised:
             scheduler._normalize_asr_model("unknown/model")
         self.assertEqual(raised.exception.status_code, 400)
+
+    def test_backend_command_bypasses_uv_run_lock_sync(self) -> None:
+        self.assertIn(".venv/bin/uvicorn", scheduler.ASR_BACKEND_COMMAND[0])
+        self.assertNotIn("uv", scheduler.ASR_BACKEND_COMMAND[:1])
 
     def test_ensure_reuses_matching_container_without_recreate(self) -> None:
         container = FakeContainer("large-v3")

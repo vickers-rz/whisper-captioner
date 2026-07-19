@@ -154,6 +154,7 @@ async def _transcribe_local_file_to_result(
     language: str,
     response_format: str,
     vad_filter: bool,
+    batch_size: int,
     timestamp_granularities: list[str],
     result_dir: Path,
 ) -> dict[str, Any]:
@@ -165,6 +166,7 @@ async def _transcribe_local_file_to_result(
         "language": language,
         "response_format": response_format,
         "vad_filter": vad_filter,
+        "batch_size": batch_size,
         "timestamp_granularities": timestamp_granularities,
         "audio_path": str(audio_path),
         "received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -185,6 +187,7 @@ async def _transcribe_local_file_to_result(
                         "model": model,
                         "response_format": response_format,
                         "vad_filter": "true" if vad_filter else "false",
+                        "batch_size": str(batch_size),
                         "timestamp_granularities[]": timestamp_granularities,
                     }
                     if language.strip().lower() not in {"", "auto"}:
@@ -231,6 +234,7 @@ class LocalFileTaskRequest(BaseModel):
     language: str = "auto"
     response_format: str = "verbose_json"
     vad_filter: bool = False
+    batch_size: int = 0
     timestamp_granularities: list[str] = Field(default_factory=lambda: ["word"])
 
 
@@ -243,6 +247,7 @@ def _create_task_record(
     language: str,
     response_format: str,
     vad_filter: bool,
+    batch_size: int,
     timestamp_granularities: list[str],
     result_dir: Path,
 ) -> dict[str, Any]:
@@ -256,6 +261,7 @@ def _create_task_record(
         language=language,
         response_format=response_format,
         vad_filter=vad_filter,
+        batch_size=batch_size,
         timestamp_granularities=timestamp_granularities,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -272,6 +278,7 @@ def _start_local_file_task(
     language: str,
     response_format: str,
     vad_filter: bool,
+    batch_size: int,
     timestamp_granularities: list[str],
     result_dir: Path,
 ) -> None:
@@ -290,6 +297,7 @@ def _start_local_file_task(
                 language=language,
                 response_format=response_format,
                 vad_filter=vad_filter,
+                batch_size=batch_size,
                 timestamp_granularities=timestamp_granularities,
                 result_dir=result_dir,
             )
@@ -384,6 +392,7 @@ async def transcribe(
     language: str = Form("auto"),
     response_format: str = Form("verbose_json"),
     vad_filter: bool = Form(False),
+    batch_size: int = Form(0),
     timestamp_granularities: list[str] = Form(["word"], alias="timestamp_granularities[]"),
 ) -> Any:
     audio_bytes = await file.read()
@@ -403,6 +412,7 @@ async def transcribe(
         "result_dir": str(result_dir),
         "audio_path": str(audio_path),
         "timestamp_granularities": timestamp_granularities,
+        "batch_size": batch_size,
     }
     _write_json(result_dir / "metadata.json", metadata)
     return await _transcribe_local_file_to_result(
@@ -412,6 +422,7 @@ async def transcribe(
         language=language,
         response_format=response_format,
         vad_filter=vad_filter,
+        batch_size=batch_size,
         timestamp_granularities=timestamp_granularities,
         result_dir=result_dir,
     )
@@ -432,6 +443,7 @@ async def submit_local_file_job(payload: LocalFileTaskRequest) -> dict[str, Any]
         language=payload.language,
         response_format=payload.response_format,
         vad_filter=payload.vad_filter,
+        batch_size=payload.batch_size,
         timestamp_granularities=payload.timestamp_granularities,
         result_dir=result_dir,
     )
@@ -443,6 +455,7 @@ async def submit_local_file_job(payload: LocalFileTaskRequest) -> dict[str, Any]
         language=payload.language,
         response_format=payload.response_format,
         vad_filter=payload.vad_filter,
+        batch_size=payload.batch_size,
         timestamp_granularities=payload.timestamp_granularities,
         result_dir=result_dir,
     )
@@ -456,6 +469,7 @@ async def upload_local_file_job(
     language: str = Form("auto"),
     response_format: str = Form("verbose_json"),
     vad_filter: bool = Form(False),
+    batch_size: int = Form(0),
     timestamp_granularities: list[str] = Form(["word"], alias="timestamp_granularities[]"),
 ) -> dict[str, Any]:
     filename = file.filename or "audio.wav"
@@ -472,6 +486,7 @@ async def upload_local_file_job(
         language=language,
         response_format=response_format,
         vad_filter=vad_filter,
+        batch_size=batch_size,
         timestamp_granularities=timestamp_granularities,
         result_dir=result_dir,
     )
@@ -482,6 +497,7 @@ async def upload_local_file_job(
             "audio_path": str(audio_path),
             "size_bytes": audio_path.stat().st_size,
             "received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "batch_size": batch_size,
         },
     )
     _start_local_file_task(
@@ -492,6 +508,7 @@ async def upload_local_file_job(
         language=language,
         response_format=response_format,
         vad_filter=vad_filter,
+        batch_size=batch_size,
         timestamp_granularities=timestamp_granularities,
         result_dir=result_dir,
     )

@@ -76,6 +76,7 @@ from whisper_captioner.config import (
     WHISPER_CLI,
     WHISPER_STREAM,
     YT_DLP,
+    resolve_cached_hf_snapshot,
 )
 from whisper_captioner.llm_handler import (
     llm_fuse_with_reference,
@@ -149,6 +150,11 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolved_model_ref(model: str | Path) -> str:
+    resolved = resolve_cached_hf_snapshot(model)
+    return str(resolved)
+
+
 @dataclass(frozen=True)
 class QueueRunConfig:
     prepared_wavs: dict[str, str] | None = None
@@ -157,6 +163,7 @@ class QueueRunConfig:
     qwen_parallel_enabled: bool = True
     adaptive_split_enabled: bool = True
     remote_vad_enabled: bool = True
+    nuc_native_batch_size: int = 0
     cpp_threads: int = 6
     cpp_flash_attn: bool = True
 
@@ -170,6 +177,9 @@ class QueueRunConfig:
             "qwen_parallel_enabled": _env_bool("WHISPER_CAPTIONER_QWEN_PARALLEL", True),
             "adaptive_split_enabled": _env_bool("WHISPER_CAPTIONER_ADAPTIVE_SPLIT", True),
             "remote_vad_enabled": _env_bool("WHISPER_CAPTIONER_REMOTE_VAD", True),
+            "nuc_native_batch_size": max(
+                0, int(os.environ.get("WHISPER_CAPTIONER_NUC_NATIVE_BATCH_SIZE", "8"))
+            ),
             "cpp_threads": max(
                 1, min(8, int(os.environ.get("WHISPER_CAPTIONER_CPP_THREADS", "6")))
             ),
@@ -443,6 +453,82 @@ def prepare_url_audio_cache(
             _safe_unlink(candidate)
 
 
+def prepare_url_gemini_ogg_cache(
+    source: str,
+    *,
+    run_command: Any,
+    status_signal: Signal,
+) -> Path:
+    cache_dir = url_audio_cache_dir(source)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    ogg = cache_dir / "gemini-audio.ogg"
+    meta_path = cache_dir / "gemini-audio-metadata.json"
+    if ogg.exists() and ogg.stat().st_size > 0:
+        now = time.time()
+        os.utime(cache_dir, (now, now))
+        status_signal.emit(f"Reusing Gemini OGG audio cache: {ogg}")
+        return ogg
+
+    token = uuid.uuid4().hex
+    downloaded_template = cache_dir / f".gemini-webm-{token}.%(ext)s"
+    temp_ogg = cache_dir / f".gemini-audio-{token}.ogg"
+    try:
+        run_command(
+            [
+                YT_DLP,
+                "-f",
+                "bestaudio[ext=webm]/bestaudio",
+                "--cookies-from-browser",
+                "chrome",
+                "-o",
+                str(downloaded_template),
+                source,
+            ],
+            "Downloading Gemini webm audio cache",
+        )
+        candidates = sorted(cache_dir.glob(f".gemini-webm-{token}.*"))
+        audio = next((path for path in candidates if path.suffix.lower() == ".webm"), None)
+        if audio is None:
+            audio = next((path for path in candidates if path.is_file()), None)
+        if audio is None:
+            raise RuntimeError("yt-dlp did not produce a Gemini audio file")
+        run_command(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-y",
+                "-i",
+                str(audio),
+                "-vn",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "64k",
+                str(temp_ogg),
+            ],
+            "Preparing Gemini OGG audio cache",
+        )
+        temp_ogg.replace(ogg)
+        _write_json_local(
+            meta_path,
+            {
+                "kind": "url-gemini-ogg",
+                "source": source,
+                "identity": canonical_media_url(source),
+                "downloaded_audio": audio.name,
+                "ogg": str(ogg),
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            },
+        )
+        now = time.time()
+        os.utime(cache_dir, (now, now))
+        return ogg
+    finally:
+        _safe_unlink(temp_ogg)
+        for candidate in cache_dir.glob(f".gemini-webm-{token}.*"):
+            _safe_unlink(candidate)
+
+
 def controlled_cache_dir(
     url: str,
     backend: str,
@@ -597,6 +683,28 @@ def validate_remote_asr_segments(segments: list[SubtitleSegment]) -> None:
         )
 
 
+def rebuild_batched_nuc_asr_segments(result: ASRResult, *, batch_size: int) -> ASRResult:
+    """Use word timestamps as authority for native-batched NUC ASR output."""
+    if batch_size <= 1:
+        return result
+    if not result.words:
+        raise RuntimeError("NUC native batch ASR returned no word timestamps")
+    segments, warnings = build_cues(result.words, result.segments)
+    diagnostics = dict(result.diagnostics)
+    diagnostics["native_batch_size"] = batch_size
+    diagnostics["batched_segments_rebuilt_from_words"] = True
+    diagnostics["upstream_segment_count"] = len(result.segments)
+    diagnostics["rebuilt_segment_count"] = len(segments)
+    if warnings:
+        diagnostics.setdefault("capability_warnings", []).extend(warnings)
+    return ASRResult(
+        language=result.language,
+        words=result.words,
+        segments=segments,
+        diagnostics=diagnostics,
+    )
+
+
 def _transcribe_via_nuc_asr_result(
     audio_path: Path,
     base_url: str = "",
@@ -604,6 +712,7 @@ def _transcribe_via_nuc_asr_result(
     language: str = NUC_ASR_AUTO_LANGUAGE,
     response_format: str = "verbose_json",
     vad_filter: bool = False,
+    batch_size: int = 0,
     timeout: int = 120,
     status_signal: Signal | None = None,
     heartbeat_interval: float = 10.0,
@@ -633,6 +742,12 @@ def _transcribe_via_nuc_asr_result(
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="{field_name}"\r\n\r\n'
             f"{field_value}\r\n"
+        )
+    if batch_size > 1:
+        body_parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="batch_size"\r\n\r\n'
+            f"{batch_size}\r\n"
         )
     body_parts.append(
         f"--{boundary}\r\n"
@@ -696,7 +811,10 @@ def _transcribe_via_nuc_asr_result(
             heartbeat_thread.join(timeout=1)
 
     if response_format == "verbose_json":
-        return parse_verbose_asr_response(data, requested_words=True)
+        return rebuild_batched_nuc_asr_segments(
+            parse_verbose_asr_response(data, requested_words=True),
+            batch_size=batch_size,
+        )
     text = data.get("text", "").strip()
     duration = float(data.get("duration", 30.0))
     segments = [SubtitleSegment(0.0, duration, text)] if text else []
@@ -718,6 +836,7 @@ def _transcribe_via_nuc_asr(
     language: str = NUC_ASR_AUTO_LANGUAGE,
     response_format: str = "verbose_json",
     vad_filter: bool = False,
+    batch_size: int = 0,
     timeout: int = 120,
     status_signal: Signal | None = None,
     heartbeat_interval: float = 10.0,
@@ -729,6 +848,7 @@ def _transcribe_via_nuc_asr(
         language=language,
         response_format=response_format,
         vad_filter=vad_filter,
+        batch_size=batch_size,
         timeout=timeout,
         status_signal=status_signal,
         heartbeat_interval=heartbeat_interval,
@@ -1609,6 +1729,51 @@ class QueueWorker(QObject):
         _write_json_local(meta_path, metadata)
         return wav
 
+    def _prepare_local_gemini_ogg_cache(self, source: str) -> Path:
+        source_path = Path(source).expanduser().resolve()
+        if source_path.suffix.lower() != ".webm":
+            raise RuntimeError("Gemini OGG cache is only prepared directly from local .webm files")
+        cache_dir = local_audio_cache_dir_for_source(source)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        ogg = cache_dir / "gemini-audio.ogg"
+        meta_path = cache_dir / "gemini-audio-metadata.json"
+        source_stat = source_path.stat()
+        metadata = {
+            "kind": "local-webm-gemini-ogg",
+            "source": str(source_path),
+            "size": source_stat.st_size,
+            "mtime": int(source_stat.st_mtime),
+            "ogg": str(ogg),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        if ogg.exists() and ogg.stat().st_size > 0:
+            self.status.emit(f"Reusing Gemini OGG audio cache: {ogg}")
+            _write_json_local(meta_path, metadata)
+            return ogg
+        temp_ogg = cache_dir / f".gemini-audio-{uuid.uuid4().hex}.ogg"
+        try:
+            self._run(
+                [
+                    FFMPEG,
+                    "-hide_banner",
+                    "-y",
+                    "-i",
+                    str(source_path),
+                    "-vn",
+                    "-c:a",
+                    "libopus",
+                    "-b:a",
+                    "64k",
+                    str(temp_ogg),
+                ],
+                "Preparing Gemini OGG audio",
+            )
+            temp_ogg.replace(ogg)
+        finally:
+            _safe_unlink(temp_ogg)
+        _write_json_local(meta_path, metadata)
+        return ogg
+
     def _prepared_wav(self, source: str) -> Path | None:
         prepared = (self.config.prepared_wavs or {}).get(source)
         if not prepared:
@@ -1625,10 +1790,31 @@ class QueueWorker(QObject):
         *,
         base_url: str,
         model: str = "large-v3",
+        batch_size: int = 0,
     ) -> list[SubtitleSegment]:
+        return self._transcribe_local_file_via_nuc_result_job(
+            wav,
+            base_url=base_url,
+            model=model,
+            batch_size=batch_size,
+        ).segments
+
+    def _transcribe_local_file_via_nuc_result_job(
+        self,
+        wav: Path,
+        *,
+        base_url: str,
+        model: str = "large-v3",
+        batch_size: int = 0,
+    ) -> ASRResult:
         import urllib.request
 
-        self.status.emit(f"Uploading cached WAV to NUC via HTTP: {wav.name}")
+        if batch_size > 1:
+            self.status.emit(
+                f"Uploading cached WAV to NUC via HTTP with native batch_size={batch_size}: {wav.name}"
+            )
+        else:
+            self.status.emit(f"Uploading cached WAV to NUC via HTTP: {wav.name}")
         boundary = uuid.uuid4().hex
         audio_data = wav.read_bytes()
         body_parts = []
@@ -1636,11 +1822,19 @@ class QueueWorker(QObject):
             ("model", model),
             ("language", NUC_ASR_AUTO_LANGUAGE),
             ("response_format", "verbose_json"),
+            ("vad_filter", "true" if batch_size > 1 else "false"),
+            ("timestamp_granularities[]", "word"),
         ]:
             body_parts.append(
                 f"--{boundary}\r\n"
                 f'Content-Disposition: form-data; name="{field_name}"\r\n\r\n'
                 f"{field_value}\r\n"
+            )
+        if batch_size > 1:
+            body_parts.append(
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="batch_size"\r\n\r\n'
+                f"{batch_size}\r\n"
             )
         body_parts.append(
             f"--{boundary}\r\n"
@@ -1659,7 +1853,12 @@ class QueueWorker(QObject):
         task_id = str(task.get("id") or task.get("task_id") or "")
         if not task_id:
             raise RuntimeError(f"NUC local-file upload job did not return task id: {task}")
-        return self._wait_for_nuc_job(task_id, base_url=base_url, filename=wav.name, busy_endpoint="/busy")
+        return self._wait_for_nuc_asr_result_job(
+            task_id,
+            base_url=base_url,
+            filename=wav.name,
+            busy_endpoint="/busy",
+        )
 
     def _transcribe_file_via_nuc_chunks(
         self,
@@ -2053,6 +2252,59 @@ class QueueWorker(QObject):
                 )
         raise RuntimeError("Queue stopped")
 
+    def _wait_for_nuc_asr_result_job(
+        self,
+        task_id: str,
+        *,
+        base_url: str,
+        filename: str,
+        busy_endpoint: str | None,
+    ) -> ASRResult:
+        started = time.monotonic()
+        last_status = ""
+        while not self._stop:
+            task = _load_json_url(f"{base_url}/jobs/{task_id}", timeout=20)
+            status = str(task.get("status") or "unknown")
+            result_dir = task.get("result_dir")
+            if status != last_status:
+                if result_dir:
+                    self.status.emit(f"NUC ASR job {task_id}: {status} ({result_dir})")
+                else:
+                    self.status.emit(f"NUC ASR job {task_id}: {status}")
+                last_status = status
+            if status == "completed":
+                result = task.get("result")
+                if not isinstance(result, dict):
+                    raise RuntimeError(f"NUC ASR job missing result payload: {task}")
+                self.status.emit(
+                    f"NUC ASR job completed in {time.monotonic() - started:.0f}s; result dir: {result.get('nuc_result_dir', result_dir)}"
+                )
+                return rebuild_batched_nuc_asr_segments(
+                    parse_verbose_asr_response(result, requested_words=True),
+                    batch_size=int(task.get("batch_size") or result.get("batch_size") or 0),
+                )
+            if status == "failed":
+                raise RuntimeError(f"NUC ASR job failed: {task.get('error')}")
+            time.sleep(5)
+            if not busy_endpoint:
+                self.status.emit(
+                    f"NUC ASR job {task_id}: still {status} after {time.monotonic() - started:.0f}s"
+                )
+                continue
+            try:
+                busy = _load_json_url(f"{base_url}{busy_endpoint}", timeout=10)
+            except Exception as exc:
+                self.status.emit(f"NUC ASR heartbeat unavailable: {exc}")
+                continue
+            current = busy.get("current_request") or {}
+            elapsed = current.get("elapsed_seconds")
+            remote_name = current.get("filename") or filename
+            if isinstance(elapsed, (int, float)):
+                self.status.emit(
+                    f"NUC ASR heartbeat: busy={busy.get('busy')} active={busy.get('active_requests')} elapsed={elapsed:.0f}s file={remote_name}"
+                )
+        raise RuntimeError("Queue stopped")
+
     def _process(self, source: str) -> bool:
         if not self.mode.available:
             self.status.emit(f"Missing model: {self.mode.model}")
@@ -2095,7 +2347,7 @@ class QueueWorker(QObject):
                     self._run(
                         [
                             MLX_AUDIO_STT,
-                            "--model", str(self.mode.model),
+                            "--model", _resolved_model_ref(self.mode.model),
                             "--audio", str(wav),
                             "--output-path", str(base),
                             "--format", "txt",
@@ -2277,20 +2529,55 @@ class QueueWorker(QObject):
                     f"Transcribing with NUC remote ASR (faster-whisper CUDA, {nuc_asr_model})..."
                 )
                 duration = _probe_audio_duration(wav)
-                self.status.emit(
-                    f"NUC remote ASR will process {duration:.1f}s audio in 60s chunks"
-                )
-                asr_result = self._transcribe_file_via_nuc_chunks(
-                    wav,
-                    base_url=str(self.mode.model),
-                    model=nuc_asr_model,
-                )
-                asr_result = self._repair_nuc_speech_gaps(
-                    wav,
-                    asr_result,
-                    base_url=str(self.mode.model),
-                    model=nuc_asr_model,
-                )
+                native_batch_size = self.config.nuc_native_batch_size
+                if native_batch_size > 1:
+                    self.status.emit(
+                        f"NUC remote ASR will process {duration:.1f}s audio as one upload with native batch_size={native_batch_size}"
+                    )
+                    try:
+                        asr_result = self._transcribe_local_file_via_nuc_result_job(
+                            wav,
+                            base_url=str(self.mode.model),
+                            model=nuc_asr_model,
+                            batch_size=native_batch_size,
+                        )
+                        asr_result = self._repair_nuc_speech_gaps(
+                            wav,
+                            asr_result,
+                            base_url=str(self.mode.model),
+                            model=nuc_asr_model,
+                        )
+                        validate_remote_asr_segments(asr_result.segments)
+                    except Exception as exc:
+                        self.status.emit(
+                            "NUC native batch ASR failed quality checks; "
+                            f"falling back to chunked upload: {exc}"
+                        )
+                        asr_result = self._transcribe_file_via_nuc_chunks(
+                            wav,
+                            base_url=str(self.mode.model),
+                            model=nuc_asr_model,
+                        )
+                        asr_result.diagnostics["native_batch_fallback"] = {
+                            "batch_size": native_batch_size,
+                            "reason": str(exc) or type(exc).__name__,
+                            "fallback": "chunked_upload",
+                        }
+                else:
+                    self.status.emit(
+                        f"NUC remote ASR will process {duration:.1f}s audio in 60s chunks"
+                    )
+                    asr_result = self._transcribe_file_via_nuc_chunks(
+                        wav,
+                        base_url=str(self.mode.model),
+                        model=nuc_asr_model,
+                    )
+                    asr_result = self._repair_nuc_speech_gaps(
+                        wav,
+                        asr_result,
+                        base_url=str(self.mode.model),
+                        model=nuc_asr_model,
+                    )
                 segments = asr_result.segments
                 validate_remote_asr_segments(segments)
                 raw_base = base.with_name(f"{base.name}-Whisper原始")
@@ -2306,12 +2593,27 @@ class QueueWorker(QObject):
 
                 # --- Gemini + Whisper fusion ---
                 if self.gemini_fusion_enabled and self.gemini_api_key and asr_result.words:
+                    gemini_audio = wav
+                    try:
+                        if source.startswith(("http://", "https://")):
+                            gemini_audio = prepare_url_gemini_ogg_cache(
+                                source,
+                                run_command=self._run,
+                                status_signal=self.status,
+                            )
+                        elif Path(source).expanduser().suffix.lower() == ".webm":
+                            gemini_audio = self._prepare_local_gemini_ogg_cache(source)
+                    except Exception as exc:
+                        self.status.emit(
+                            f"Gemini OGG audio cache unavailable; falling back to WAV: {exc}"
+                        )
                     self.status.emit(
-                        f"Gemini+Whisper fusion: sending {duration:.0f}s audio to Gemini 2.5 Flash..."
+                        f"Gemini+Whisper fusion: sending {gemini_audio.name} "
+                        f"({duration:.0f}s) to Gemini 2.5 Flash..."
                     )
                     gemini_timeout = 180 if duration <= 600 else 240
                     gemini_result = gemini_transcribe_audio(
-                        wav,
+                        gemini_audio,
                         self.gemini_api_key,
                         model="gemini-2.5-flash",
                         timeout=gemini_timeout,
@@ -2353,6 +2655,7 @@ class QueueWorker(QObject):
                                     "status": gemini_result.status,
                                     "model": gemini_result.model,
                                     "elapsed": gemini_result.elapsed,
+                                    "audio": str(gemini_audio),
                                     "diagnostics": gemini_result.diagnostics,
                                 },
                                 "fusion": {
@@ -2373,6 +2676,7 @@ class QueueWorker(QObject):
                                     "status": gemini_result.status,
                                     "model": gemini_result.model,
                                     "warning": gemini_result.warning,
+                                    "audio": str(gemini_audio),
                                     "diagnostics": gemini_result.diagnostics,
                                 },
                                 "fusion": {"status": "skipped"},
@@ -3171,6 +3475,8 @@ class RollingPrefetchWorker(QObject):
         self._parallel_qwen_worker: QueueWorker | None = None
         self._last_asr_result: ASRResult | None = None
         self._retry_records: list[dict] = []
+        self._native_subtitle_decision = "use_native"
+        self._native_subtitle_decision_event = threading.Event()
         explicit_language = next(
             (value for flag, value in zip(self.mode.args, self.mode.args[1:]) if flag == "-l"),
             "auto",
@@ -3197,10 +3503,18 @@ class RollingPrefetchWorker(QObject):
 
     def stop(self) -> None:
         self._stop = True
+        self._native_subtitle_decision = "cancel"
+        self._native_subtitle_decision_event.set()
         if self._parallel_qwen_worker is not None:
             self._parallel_qwen_worker.stop()
         _terminate_process(self.proc)
         self.proc = None
+
+    def set_native_subtitle_decision(self, decision: str) -> None:
+        if decision not in {"use_native", "continue_asr", "cancel"}:
+            decision = "use_native"
+        self._native_subtitle_decision = decision
+        self._native_subtitle_decision_event.set()
 
     def _track_temp_path(self, path: Path) -> Path:
         self._temp_paths.append(path)
@@ -3412,13 +3726,23 @@ class RollingPrefetchWorker(QObject):
                 self.status.emit(
                     f"Native subtitles written: {native_output_base.with_suffix('.srt')}"
                 )
+                self._native_subtitle_decision = "use_native"
+                self._native_subtitle_decision_event.clear()
                 self.native_subtitles_detected.emit(
                     native_segments,
                     "检测到视频自带中文字幕，已下载、保存并载入。"
                     f"\n\n字幕文件：{native_output_base.with_suffix('.srt')}"
-                    "\n\n已跳过 Whisper 和 LLM 识别以节省资源。"
+                    "\n\n你可以直接使用这份字幕，也可以继续运行 ASR 重新识别。"
                 )
-                return
+                while not self._stop and not self._native_subtitle_decision_event.wait(0.2):
+                    pass
+                if self._stop or self._native_subtitle_decision == "cancel":
+                    self.status.emit("Native subtitle flow cancelled by user")
+                    return
+                if self._native_subtitle_decision == "use_native":
+                    self.status.emit("Using native subtitles; skipping ASR by user choice")
+                    return
+                self.status.emit("Native subtitles detected, but continuing with ASR by user choice")
 
             # 1. Pause Chrome
             self.status.emit("Pausing Chrome while captions are prepared")
@@ -3434,6 +3758,22 @@ class RollingPrefetchWorker(QObject):
                 run_command=self._run_cmd,
                 status_signal=self.status,
             )
+            gemini_audio: Path | None = None
+            if (
+                self.gemini_fusion_enabled
+                and self.fusion_provider == "gemini"
+                and self.gemini_api_key
+            ):
+                try:
+                    gemini_audio = prepare_url_gemini_ogg_cache(
+                        self.url,
+                        run_command=self._run_cmd,
+                        status_signal=self.status,
+                    )
+                except Exception as exc:
+                    self.status.emit(
+                        f"Gemini OGG audio cache unavailable; falling back to WAV: {exc}"
+                    )
             audio_link = job_cache_dir / "source-audio.wav"
             audio_link.unlink(missing_ok=True)
             try:
@@ -3446,6 +3786,7 @@ class RollingPrefetchWorker(QObject):
                     "url": self.url,
                     "canonical_url": self.cache_url,
                     "audio_cache_wav": str(audio),
+                    "gemini_audio_ogg": str(gemini_audio) if gemini_audio else "",
                     "backend": self.mode.backend,
                     "model": self.mode.model_name,
                     "pipeline_chunk_seconds": self.chunk_seconds,
@@ -3475,6 +3816,7 @@ class RollingPrefetchWorker(QObject):
                         audio,
                         job_cache_dir,
                         raw_segments or cached_segments,
+                        gemini_audio=gemini_audio,
                     )
                     quality_report = self._audit_and_cache_quality(
                         audio, duration, job_cache_dir, prepared_result
@@ -3659,6 +4001,7 @@ class RollingPrefetchWorker(QObject):
                     audio,
                     job_cache_dir,
                     all_raw_segments,
+                    gemini_audio=gemini_audio,
                 )
                 quality_report = self._audit_and_cache_quality(
                     audio,
@@ -3764,7 +4107,7 @@ class RollingPrefetchWorker(QObject):
                 output_text = self._run_cmd_capture(
                     [
                         MLX_AUDIO_STT,
-                        "--model", str(self.mode.model),
+                        "--model", _resolved_model_ref(self.mode.model),
                         "--audio", str(chunk_wav),
                         "--output-path", str(output_path),
                         "--format", "txt",
@@ -3783,7 +4126,7 @@ class RollingPrefetchWorker(QObject):
             self._run_cmd(
                 [
                     MLX_AUDIO_STT,
-                    "--model", str(self.mode.model),
+                    "--model", _resolved_model_ref(self.mode.model),
                     "--audio", str(chunk_wav),
                     "--output-path", str(output_path),
                     "--format", "srt",
@@ -3986,6 +4329,8 @@ class RollingPrefetchWorker(QObject):
         audio: Path,
         job_cache_dir: Path,
         fallback_segments: list[SubtitleSegment],
+        *,
+        gemini_audio: Path | None = None,
     ) -> ASRResult:
         combined = self._load_combined_asr_result(job_cache_dir, fallback_segments)
         if not self.gemini_fusion_enabled:
@@ -4112,12 +4457,13 @@ class RollingPrefetchWorker(QObject):
 
         duration = getattr(combined, "duration", 0.0) or 0.0
         gemini_timeout = 180 if duration <= 600 else 240
+        gemini_upload_audio = gemini_audio if gemini_audio and gemini_audio.exists() else audio
         self.status.emit(
-            f"Gemini+Whisper fusion: sending audio to Gemini 2.5 Flash "
+            f"Gemini+Whisper fusion: sending {gemini_upload_audio.name} to Gemini 2.5 Flash "
             f"(timeout={gemini_timeout}s)"
         )
         gemini_result = gemini_transcribe_audio(
-            audio,
+            gemini_upload_audio,
             self.gemini_api_key,
             model=model,
             timeout=gemini_timeout,
@@ -4133,6 +4479,7 @@ class RollingPrefetchWorker(QObject):
             "prompt_version": GEMINI_PROMPT_VERSION,
             "algorithm_version": GEMINI_FUSION_VERSION,
             "elapsed": gemini_result.elapsed,
+            "gemini_audio": str(gemini_upload_audio),
             "transport": gemini_result.diagnostics,
         }
         if gemini_result.status != "completed" or not gemini_result.lines:

@@ -14,6 +14,95 @@ Or:
 bash /Users/vickers/Documents/whisper-captioner/run.sh
 ```
 
+## Forensic Transcript TUI
+
+Double-click [ForensicSubtitle.command](ForensicSubtitle.command), or run it in
+Terminal, to open the resumable forensic subtitle menu:
+
+```bash
+/Users/vickers/Documents/whisper-captioner/ForensicSubtitle.command
+```
+
+The first two menu entries are independent of the complete forensic pipeline:
+
+- `Gemini URL -> full transcript` sends the public YouTube URL directly to
+  Gemini with an audio-only transcription contract. It does not invoke yt-dlp
+  and does not request summaries, timestamps, or visual analysis output.
+- `Local OGG/audio -> NUC ASR` normalizes the local file to 16 kHz mono WAV and
+  offers Qwen3-ASR 1.7B (text accuracy first, explicitly pseudo-timestamped),
+  faster-whisper large-v3 (word timestamps), or both sequentially.
+
+The same entries are callable from Terminal:
+
+```bash
+/Users/vickers/Documents/whisper-captioner/ForensicSubtitle.command gemini-url \
+  'https://www.youtube.com/watch?v=VIDEO_ID'
+
+/Users/vickers/Documents/whisper-captioner/ForensicSubtitle.command nuc-local \
+  '/path/to/audio.ogg'
+```
+
+It asks before reading Chrome cookies, stores the Gemini key only in the
+environment or macOS Keychain, and writes `pipeline-manifest.json` beside every
+job. OCR is sampled from short video ranges and only adjudicates disputed text;
+NUC word timestamps remain the sole timing authority. See
+`docs/final_forensic_subtitle_pipeline.md` for the current workflow.
+
+When Chrome cookies are enabled, the command snapshots only the selected
+profile's primary `Cookies` database into a private temporary directory. This
+avoids a current yt-dlp failure mode where a newer nested Chrome/Glic extension
+database is mistaken for the main cookie store. The snapshot is removed when
+the pipeline process exits. The default profile is `Default`; set
+`FORENSIC_CHROME_PROFILE` or answer the TUI prompt to use another profile.
+
+## Deterministic Forensic Command
+
+For the complete double-click TUI, open:
+
+```text
+/Users/vickers/Documents/whisper-captioner/ForensicSubtitle.command
+```
+
+The menu runs or resumes the full pipeline described in
+`docs/final_forensic_subtitle_pipeline.md`, shows recent job state, opens the
+artifact directory, tails the last run, and performs environment diagnostics.
+The Gemini key is read from `GEMINI_API_KEY` or the existing macOS Keychain
+entry; a newly entered key is never written to logs or manifests.
+
+The current final workflow is available as a non-interactive command. First
+probe for burned subtitles without downloading the full video:
+
+```bash
+python /Users/vickers/Documents/whisper-captioner/scripts/forensic_subtitle_command.py \
+  probe-hard-subs 'https://www.youtube.com/watch?v=VIDEO_ID' \
+  --output-dir artifacts/probe \
+  --cookies-from-chrome
+```
+
+After producing the NUC word-level ASR JSON and Gemini OGG transcript, create
+a Gemini-text backfill that preserves the initial local-SRT timestamps, a
+time-windowed disagreement report, and a deterministic final SRT:
+
+```bash
+python /Users/vickers/Documents/whisper-captioner/scripts/forensic_subtitle_command.py \
+  finalize \
+  --nuc-asr /path/to/nuc-word-asr.json \
+  --gemini /path/to/gemini-transcript.txt \
+  --output-dir artifacts/final
+```
+
+`finalize` never changes the Gemini text: it chooses display breaks from
+punctuation, cue length, reading duration, and NUC word timing. Its outputs are
+`gemini-backfilled-local-timeline.srt`, `transcript-differences.json`,
+`final-timeline.json`, and `final.srt`.
+
+For shell-level orchestration of the Python stages, use
+`scripts/forensic_subtitle_pipeline.sh`. It exposes `probe`, `finalize`, and
+`targeted-ocr`; run it without arguments for the complete argument list. The
+`targeted-ocr` command samples only local video windows named by
+`transcript-differences.json`, then stores the OCR evidence without changing
+the NUC time axis.
+
 ## Current Architecture
 
 The project has been split out of the original single-file prototype:

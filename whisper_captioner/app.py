@@ -1463,7 +1463,7 @@ class MainWindow(QMainWindow):
             if thread is not None and thread.isRunning()
         ]
 
-    def wait_for_threads(self, timeout_ms: int = 25000) -> bool:
+    def wait_for_threads(self, timeout_ms: int = 25000, *, force_terminate: bool = False) -> bool:
         deadline = time.monotonic() + timeout_ms / 1000
         for thread in self.active_threads():
             remaining = max(100, int((deadline - time.monotonic()) * 1000))
@@ -1471,8 +1471,21 @@ class MainWindow(QMainWindow):
             if not thread.wait(remaining):
                 self.log("A worker is still finishing; waiting to avoid Qt thread crash.")
                 if not thread.wait(5000):
-                    return False
+                    if force_terminate:
+                        self.log("A worker did not exit in time; force-terminating Qt thread.")
+                        thread.terminate()
+                        if not thread.wait(3000):
+                            self.log("Force-terminated thread still did not exit cleanly.")
+                            return False
+                    else:
+                        return False
         return not self.active_threads()
+
+    def force_shutdown_threads(self, timeout_ms: int = 30000) -> bool:
+        if self.wait_for_threads(timeout_ms=timeout_ms, force_terminate=False):
+            return True
+        self.log("Graceful Qt thread shutdown timed out; escalating to forced termination.")
+        return self.wait_for_threads(timeout_ms=8000, force_terminate=True)
 
     def _clear_realtime(self) -> None:
         if self.realtime_worker:
@@ -1908,7 +1921,10 @@ class MainWindow(QMainWindow):
                 source = chrome_tabs[0].url
             elif len(chrome_tabs) > 1:
                 labels = [
-                    f"{index}. {tab.title or '未命名视频'} — {tab.url}"
+                    (
+                        f"{index}. {'[当前] ' if tab.is_front_window and tab.is_active_tab else ''}"
+                        f"{tab.title or '未命名视频'} — {tab.url}"
+                    )
                     for index, tab in enumerate(chrome_tabs, start=1)
                 ]
                 selected_label, accepted = QInputDialog.getItem(
@@ -2222,6 +2238,42 @@ class MainWindow(QMainWindow):
     def _handle_native_subtitles_detected(self, segments: list[SubtitleSegment], message: str) -> None:
         self.progress_bar.setVisible(False)
         self.controlled_timer.stop()
+        self.log(message)
+
+        box = QMessageBox(self)
+        box.setWindowTitle("检测到视频自带字幕")
+        box.setText(message)
+        box.setIcon(QMessageBox.Icon.Information)
+        use_native_btn = box.addButton("使用自带字幕", QMessageBox.ButtonRole.AcceptRole)
+        continue_asr_btn = box.addButton("继续 ASR 识别", QMessageBox.ButtonRole.ActionRole)
+        cancel_btn = box.addButton("取消任务", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(use_native_btn)
+        box.exec()
+
+        decision = "use_native"
+        if box.clickedButton() == continue_asr_btn:
+            decision = "continue_asr"
+        elif box.clickedButton() == cancel_btn:
+            decision = "cancel"
+
+        worker = self.controlled_worker
+        if worker is not None:
+            worker.set_native_subtitle_decision(decision)
+
+        if decision == "continue_asr":
+            self.overlay.set_caption("已检测到自带字幕，继续进行 ASR 识别。")
+            self.overlay.show()
+            self._set_status_summary("已检测到自带字幕，继续 ASR")
+            self.log("Native subtitles detected; continuing ASR by user choice")
+            return
+
+        if decision == "cancel":
+            self.stop_all()
+            self.overlay.set_caption("任务已取消")
+            self._set_status_summary("已取消网址受控字幕任务")
+            self.log("Native subtitle flow cancelled by user")
+            return
+
         self._set_controlled_segments(segments)
         self._refresh_transcript_list()
         self._rolling_all_done = True
@@ -2233,9 +2285,7 @@ class MainWindow(QMainWindow):
         self.controlled_timer.start()
         self._tick_controlled_captions()
         self.overlay.set_caption("视频自带字幕已加载")
-        self.log(message)
         self._set_status_summary("已加载视频自带字幕")
-        QMessageBox.information(self, "检测到视频自带字幕", message)
 
     def _add_rolling_segments(self, new_segments: list[SubtitleSegment]) -> None:
         self._extend_controlled_segments(new_segments)
@@ -2435,11 +2485,14 @@ class MainWindow(QMainWindow):
 class App:
     def __init__(self) -> None:
         self.qt = QApplication(sys.argv)
+        self.qt.setQuitOnLastWindowClosed(False)
         self.qt.setApplicationName("Whisper Captioner")
         self.overlay = SubtitleOverlay()
         self.window = MainWindow(self.overlay)
         self.tray = QSystemTrayIcon(QIcon.fromTheme("audio-input-microphone"))
         self._quit_pending = False
+        self._shutdown_started = False
+        self._quit_deadline: float | None = None
         self.tray.setToolTip("Whisper 字幕助手")
         self._build_menu()
         self.qt.aboutToQuit.connect(self.shutdown)
@@ -2488,16 +2541,20 @@ class App:
         self.tray.activated.connect(lambda reason: self.window.show() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
 
     def shutdown(self) -> None:
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
         self.window.stop_all()
         self.window.qwen_chat_service.stop()
         self.window._flush_ui_logs()
         self.window._flush_file_logs()
-        self.window.wait_for_threads()
+        self.window.force_shutdown_threads()
 
     def quit(self) -> None:
         if self._quit_pending:
             return
         self._quit_pending = True
+        self._quit_deadline = time.monotonic() + 30
         self.window.stop_all()
         self.window.qwen_chat_service.stop()
         self.window._set_status_summary("正在等待任务安全退出")
@@ -2505,6 +2562,13 @@ class App:
 
     def _finish_quit_when_ready(self) -> None:
         if self.window.wait_for_threads(timeout_ms=1000):
+            self.window._flush_ui_logs()
+            self.window._flush_file_logs()
+            self.qt.quit()
+            return
+        if self._quit_deadline is not None and time.monotonic() >= self._quit_deadline:
+            self.window.log("等待后台线程退出超时，开始强制结束仍存活的 Qt 线程。")
+            self.window.force_shutdown_threads(timeout_ms=5000)
             self.window._flush_ui_logs()
             self.window._flush_file_logs()
             self.qt.quit()

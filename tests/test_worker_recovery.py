@@ -23,6 +23,7 @@ from whisper_captioner.workers import (
     _should_retry_yt_dlp_cookie_read,
     controlled_cache_dir,
     parse_silencedetect_voice_window,
+    prepare_url_gemini_ogg_cache,
     prepare_url_audio_cache,
     prune_local_audio_cache,
     remote_asr_quality_issue,
@@ -715,6 +716,61 @@ class WorkerRecoveryTest(unittest.TestCase):
         self.assertEqual(result, wav)
         self.assertIn("Reusing URL audio cache", status.messages[-1])
 
+    def test_prepare_url_gemini_ogg_cache_downloads_webm_then_converts(self):
+        class Status:
+            def emit(self, _message):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache_dir = root / "url-cache"
+            calls = []
+
+            def fake_run(command, _label):
+                calls.append(command)
+                if command[0].endswith("yt-dlp"):
+                    output_template = command[command.index("-o") + 1]
+                    Path(output_template.replace("%(ext)s", "webm")).write_bytes(b"webm")
+                else:
+                    Path(command[-1]).write_bytes(b"ogg")
+
+            with patch("whisper_captioner.workers.url_audio_cache_dir", return_value=cache_dir):
+                result = prepare_url_gemini_ogg_cache(
+                    "https://example.com/video",
+                    run_command=fake_run,
+                    status_signal=Status(),
+                )
+
+            self.assertEqual(result.name, "gemini-audio.ogg")
+            self.assertEqual(result.read_bytes(), b"ogg")
+            self.assertIn("bestaudio[ext=webm]/bestaudio", calls[0])
+            self.assertIn("libopus", calls[1])
+
+    def test_local_webm_gemini_ogg_cache_converts_source_directly(self):
+        mode = next(mode for mode in MODES if mode.key == "nuc_asr_turbo")
+        worker = QueueWorker([], mode)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "input.webm"
+            source.write_bytes(b"webm")
+            cache_dir = root / "cache"
+            calls = []
+
+            def fake_run(command, _label):
+                calls.append(command)
+                Path(command[-1]).write_bytes(b"ogg")
+
+            with (
+                patch("whisper_captioner.workers.local_audio_cache_dir_for_source", return_value=cache_dir),
+                patch.object(worker, "_run", side_effect=fake_run),
+            ):
+                result = worker._prepare_local_gemini_ogg_cache(str(source))
+
+            self.assertEqual(result.name, "gemini-audio.ogg")
+            self.assertEqual(result.read_bytes(), b"ogg")
+            self.assertEqual(calls[0][calls[0].index("-i") + 1], str(source.resolve()))
+            self.assertIn("libopus", calls[0])
+
     def test_long_low_density_asr_segment_is_treated_as_sparse(self):
         segments = [
             SubtitleSegment(0.0, 1.5, "正常开头"),
@@ -791,6 +847,7 @@ class WorkerRecoveryTest(unittest.TestCase):
                 "WHISPER_CAPTIONER_QWEN_CHUNK_SECONDS": "5",
                 "WHISPER_CAPTIONER_QWEN_PARALLEL": "1",
                 "WHISPER_CAPTIONER_ADAPTIVE_SPLIT": "true",
+                "WHISPER_CAPTIONER_NUC_NATIVE_BATCH_SIZE": "8",
                 "WHISPER_CAPTIONER_CPP_THREADS": "12",
                 "WHISPER_CAPTIONER_CPP_FLASH_ATTN": "false",
             },
@@ -801,6 +858,7 @@ class WorkerRecoveryTest(unittest.TestCase):
         self.assertEqual(config.qwen_chunk_seconds, 10.0)
         self.assertTrue(config.qwen_parallel_enabled)
         self.assertTrue(config.adaptive_split_enabled)
+        self.assertEqual(config.nuc_native_batch_size, 8)
         self.assertEqual(config.cpp_threads, 8)
         self.assertFalse(config.cpp_flash_attn)
 
@@ -809,6 +867,7 @@ class WorkerRecoveryTest(unittest.TestCase):
             config = QueueRunConfig.from_environment()
         self.assertTrue(config.adaptive_split_enabled)
         self.assertTrue(config.remote_vad_enabled)
+        self.assertEqual(config.nuc_native_batch_size, 8)
 
     def test_cpp_runtime_args_use_selected_threads_and_flash_attention(self):
         enabled = QueueRunConfig(cpp_threads=6, cpp_flash_attn=True)

@@ -75,6 +75,8 @@ def run_omnivad_shadow(audio_path: Path, output_dir: Path) -> OmniVADShadowResul
 
 GEMINI_TRANSCRIBE_PROMPT = (
     "Transcribe this audio. Output ONLY the transcription text. "
+    "For all Chinese text, use Mainland China standard Simplified Chinese characters only; "
+    "convert any Traditional Chinese forms to Simplified Chinese. "
     "Break the text into natural sentences or logical segments, one per line. "
     "Do NOT add timestamps, speaker labels, or any formatting. "
     "Do NOT add any commentary before or after the transcription. "
@@ -336,6 +338,14 @@ def _call_with_timeout(
     raise value  # type: ignore[misc]
 
 
+def _diagnostic_model_dump(value: object) -> object:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json", exclude_none=True)  # type: ignore[no-any-return]
+    if hasattr(value, "to_dict"):
+        return value.to_dict()  # type: ignore[no-any-return]
+    return str(value)[:4000]
+
+
 def gemini_transcribe_audio(
     audio_path: Path,
     api_key: str,
@@ -345,6 +355,7 @@ def gemini_transcribe_audio(
     max_tokens: int = 8192,
     upload_timeout: int = 120,
     processing_timeout: int = 600,
+    force_file_api: bool = False,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> GeminiTranscribeResult:
     """Send audio to Gemini for text-only transcription (no timestamps)."""
@@ -369,7 +380,7 @@ def gemini_transcribe_audio(
     diagnostics: dict = {"transport": "inline", "cleanup": "not-needed"}
     try:
         file_size = audio_path.stat().st_size
-        use_file_api = file_size > GEMINI_INLINE_MAX_BYTES
+        use_file_api = force_file_api or file_size > GEMINI_INLINE_MAX_BYTES
         output_limit = max(max_tokens, 60000) if use_file_api else max_tokens
         client = genai.Client(
             api_key=api_key,
@@ -419,7 +430,7 @@ def gemini_transcribe_audio(
                     "Gemini File API status poll",
                 )
             progress("Gemini File API file is ACTIVE")
-            contents = [uploaded_file, prompt]
+            contents = [prompt, uploaded_file]
         else:
             progress("Gemini inline payload prepared")
             contents = [{
@@ -451,6 +462,7 @@ def gemini_transcribe_audio(
         elapsed = time.time() - t0
         diagnostics["generation_elapsed"] = elapsed
         progress(f"Gemini generation completed in {elapsed:.1f}s")
+        diagnostics["response"] = _diagnostic_model_dump(response)
         text = (response.text or "").strip()
         finish_reason = ""
         candidates = getattr(response, "candidates", None) or []
