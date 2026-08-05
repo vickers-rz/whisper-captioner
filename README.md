@@ -25,9 +25,32 @@ Terminal, to open the resumable forensic subtitle menu:
 
 The first two menu entries are independent of the complete forensic pipeline:
 
-- `Gemini URL -> full transcript` sends the public YouTube URL directly to
-  Gemini with an audio-only transcription contract. It does not invoke yt-dlp
-  and does not request summaries, timestamps, or visual analysis output.
+- `Gemini URL -> full transcript` downloads the public YouTube URL's best
+  audio with yt-dlp, prefers WebM when available, converts the first audio
+  stream to OGG/Opus, and sends that audio file to Gemini File API for
+  audio-only ASR. It does not request summaries, timestamps, or visual analysis
+  output. Pass `--direct-url` to `scripts/asr_entrypoints.py gemini-url` to use
+  the older direct-URL Gemini path.
+  By default the OGG is saved as
+  `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/Gemini-URL-ASR [VIDEO_ID]/work/gemini-audio.ogg`,
+  and the formatted Markdown transcript is saved as
+  `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/Gemini-URL-ASR [VIDEO_ID]/gemini-local-audio-asr-transcript.md`,
+  or under `WHISPER_CAPTIONER_OUTPUT_DIR/artifacts/generated/` when that
+  override is set.
+  Markdown transcript formatting follows a lightweight built-in CJK formatter:
+  metadata header, transcript section, Chinese/English spacing, common CJK
+  punctuation cleanup, and sentence-based paragraph breaks.
+  The TUI also has `ASR Markdown -> jieba/Ollama embedding RAG -> local Qwen
+  semantic segmentation`. It now uses a four-layer long-video transcript
+  pipeline: Chinese sentence splitting, Paragraph/Topic semantic windows,
+  TF-IDF plus `qwen3-embedding:0.6b` dual indexes with RRF fusion, then local
+  `qwen3.5:4b` structure analysis. The local index has Sentence, Paragraph,
+  and Topic embedding layers, and writes `*-ollama-segmented.md`. The CLI can
+  compare `--embedding-backend ollama`, `tfidf`, or `hybrid`.
+  The command TUI exposes the four segmentation variants as separate menu
+  entries: pure Qwen, TF-IDF RAG, Ollama embedding RAG, and Hybrid RAG.
+  It also exposes a fifth ASR post-processing mode backed by Gemini 2.5
+  Flash/Pro for richer Markdown formatting when an API key is available.
 - `Local OGG/audio -> NUC ASR` normalizes the local file to 16 kHz mono WAV and
   offers Qwen3-ASR 1.7B (text accuracy first, explicitly pseudo-timestamped),
   faster-whisper large-v3 (word timestamps), or both sequentially.

@@ -28,11 +28,18 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.gemini_youtube_url_asr_smoke import save_result, transcribe_youtube_url
-from whisper_captioner.config import FFMPEG, FFPROBE, GENERATED_DIR, NUC_OLLAMA_HOST
+from scripts.transcript_rag_segmenter import build_rag_context
+from scripts.transcript_markdown import segmented_markdown, transcript_markdown
+from whisper_captioner.config import FFMPEG, FFPROBE, GENERATED_DIR, NUC_OLLAMA_HOST, YT_DLP
 from whisper_captioner.credentials import load_secret, save_secret
 from whisper_captioner.external_backends import gemini_transcribe_audio
 from whisper_captioner.models import ASRResult, RetryRegion, SubtitleSegment, SubtitleWord
-from whisper_captioner.subtitle_io import save_asr_result, save_segments_as_srt
+from whisper_captioner.subtitle_io import (
+    parse_subtitle_file,
+    save_asr_result,
+    save_segments_as_srt,
+    save_segments_as_txt,
+)
 from whisper_captioner.subtitle_reliability import (
     audit_asr_result,
     build_cues,
@@ -51,6 +58,62 @@ DEFAULT_NUC_NATIVE_BATCH_SIZE = max(
     0,
     int(os.environ.get("WHISPER_CAPTIONER_NUC_NATIVE_BATCH_SIZE", "8")),
 )
+DEFAULT_LOCAL_OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+DEFAULT_LOCAL_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_SEGMENT_MODEL = "qwen3.5:4b"
+DEFAULT_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
+DEFAULT_SEGMENT_NUM_CTX = 131072
+
+RICH_MARKDOWN_SYSTEM_PROMPT = (
+    "你是中文视频字幕的严格校订编辑、中文长文稿结构编辑和 Markdown 排版编辑。"
+    "任务是先对 ASR 全文做忠实去噪和规整，再按语义组织成高可读 Markdown。"
+    "只输出规整后的 Markdown 正文，不要解释。\n\n"
+    "忠实校订规则："
+    "1. 这是忠实校订和成文排版，不是摘要、提纲、出版式压缩或观点改写；"
+    "2. 只允许删除明显无语义口癖、停顿词、结巴造成的连续重复、完全相同且相邻的重复句；"
+    "3. 可以修正明显病句、错别字、标点和技术术语；"
+    "4. 不得删除教学讲解中的强调、解释、因果关系、过渡、例子、数字、代码标识、条件、否定表达和操作步骤；"
+    "5. 不得总结、扩写、改变观点、重排论证或添加原文没有的知识；"
+    "6. 输出长度原则上不得低于输入正文的 80%，不确定是否应删除时保留原文。\n\n"
+    "Markdown 排版规则："
+    "1. 使用简体中文；2. 按主题分成二级标题，必要时使用三级标题；3. 每段 2 到 5 句；"
+    "4. 修正常见中文排版，例如中英文数字间距和中文标点；"
+    "5. 不添加时间戳、说话人或未出现在原文的信息；"
+    "6. 如果提供了 RAG 候选窗口，把它们仅作为主题边界参考，不能替代完整原文；"
+    "7. 充分使用 Markdown 排版：用项目符号或编号列表整理枚举项，用表格整理并列政策/准证信息；"
+    "8. 对关键结论、年份、金额、风险提醒使用加粗；对特别需要注意的风险使用 <u>下划线</u>；"
+    "9. 对准证名、英文术语、平台名、政策名使用行内代码样式，例如 `EP`、`S Pass`、`WP`、`DP`、`PR`、`EntrePass`、`GIP`、`LinkedIn`、`JobStreet`；"
+    "10. 章节之间可以使用 --- 分隔，但不要过度装饰。"
+)
+
+GEMINI_RICH_MARKDOWN_SYSTEM_PROMPT = (
+    RICH_MARKDOWN_SYSTEM_PROMPT
+    + "12. 你尤其要像专业中文编辑一样处理结构：开头用一个 blockquote 写全文核心，"
+    "遇到准证、金额、适用人群、优缺点必须优先用表格；"
+    "遇到风险、过时信息、中介欺诈、灰色路径必须用 <u>风险提示</u> 标出；"
+    "不要把原文压缩成摘要，必须保留主要论点、例子和叙述顺序。"
+)
+
+
+def rich_markdown_user_prompt(body: str, *, rag_context: str = "") -> str:
+    user_parts = [
+        "请对下面 ASR 文稿进行全文规整、语义分段和 Markdown 排版优化。\n\n"
+        "工作方式：先做“语句规整”，只清理明显 ASR 噪声和口语病句；"
+        "再做“转写成文稿”，保留原视频核心观点、术语、例子和逻辑顺序。"
+        "不要逐句罗列字幕，不要保留字幕编号，也不要把全文压缩成摘要。\n\n"
+        "输出参考形态：\n\n"
+        "> 一句话说明本节/全文核心。\n\n"
+        "## 一、主题标题\n\n"
+        "正文段落，包含 **重点**、`术语`、<u>风险提示</u>。\n\n"
+        "| 项目 | 说明 |\n|---|---|\n| `EP` | 示例说明 |\n\n"
+        "### 1. 子主题\n\n"
+        "- 列表项\n\n"
+        "---\n\n",
+    ]
+    if rag_context:
+        user_parts.extend(["本地 RAG 候选结构证据：\n\n", rag_context, "\n\n"])
+    user_parts.extend(["完整原文如下：\n\n", body])
+    return "".join(user_parts)
 
 
 @dataclass(frozen=True)
@@ -182,11 +245,41 @@ def default_gemini_output(url: str) -> Path:
     return GENERATED_DIR / f"Gemini-URL-ASR [{identity}]"
 
 
+def remote_title(source: str, *, cookies_from_chrome: bool = False, chrome_profile: str = "Default") -> str:
+    command = [YT_DLP, "--no-playlist", "--print", "title"]
+    if cookies_from_chrome:
+        command.extend(["--cookies-from-browser", f"chrome:{chrome_profile}"])
+    command.append(source)
+    completed = subprocess.run(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        return ""
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    return lines[0] if lines else ""
+
+
+def default_native_subtitle_output(source: str, *, cookies_from_chrome: bool = False, chrome_profile: str = "Default") -> Path:
+    title = remote_title(
+        source,
+        cookies_from_chrome=cookies_from_chrome,
+        chrome_profile=chrome_profile,
+    )
+    identity = safe_name(title or youtube_identity(source) or "video")
+    return GENERATED_DIR / f"Native-Subtitles [{identity}]"
+
+
 def completed_gemini_job(
     manifest_path: Path,
     *,
     source: str,
     model: str,
+    mode: str | None = None,
 ) -> dict[str, Any] | None:
     if not manifest_path.is_file():
         return None
@@ -195,6 +288,7 @@ def completed_gemini_job(
         manifest.get("status") != "completed"
         or manifest.get("source") != source
         or manifest.get("model") != model
+        or (mode is not None and manifest.get("mode") != mode)
     ):
         return None
     outputs = manifest.get("outputs")
@@ -205,7 +299,55 @@ def completed_gemini_job(
         for key in ("transcript", "metadata")
     ):
         return None
+    if Path(outputs["transcript"]).suffix.lower() != ".md":
+        return None
     return manifest
+
+
+def download_url_audio(source: str, output_dir: Path) -> Path:
+    work = output_dir / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    template = work / "source-audio.%(ext)s"
+    candidates = sorted(work.glob("source-audio.*"))
+    source_audio = next(
+        (
+            item
+            for item in candidates
+            if item.is_file()
+            and item.name not in {"source-audio.json"}
+            and item.stat().st_size > 0
+        ),
+        None,
+    )
+    if source_audio is not None:
+        print(f"复用 yt-dlp 原始音频：{source_audio}", flush=True)
+        return source_audio
+    run_command(
+        [
+            YT_DLP,
+            "--no-playlist",
+            "-f",
+            "bestaudio[ext=webm]/bestaudio",
+            "-o",
+            str(template),
+            source,
+        ],
+        "用 yt-dlp 下载 webm/bestaudio 原始音频",
+    )
+    candidates = sorted(work.glob("source-audio.*"))
+    source_audio = next(
+        (
+            item
+            for item in candidates
+            if item.is_file()
+            and item.name not in {"source-audio.json"}
+            and item.stat().st_size > 0
+        ),
+        None,
+    )
+    if source_audio is None:
+        raise RuntimeError("yt-dlp did not produce source audio")
+    return source_audio
 
 
 def run_gemini_url(args: argparse.Namespace) -> int:
@@ -214,41 +356,209 @@ def run_gemini_url(args: argparse.Namespace) -> int:
     output_dir = (args.output_dir or default_gemini_output(args.url)).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "asr-manifest.json"
+    mode = (
+        "gemini-youtube-url-audio-only"
+        if args.direct_url
+        else "gemini-url-downloaded-ogg-file-api"
+    )
     completed = completed_gemini_job(
         manifest_path,
         source=args.url,
         model=args.model,
+        mode=mode,
     )
     if completed is not None:
         print(f"复用已完成的 Gemini URL 全文：{completed['outputs']['transcript']}")
         return 0
     manifest = manifest_start(
         manifest_path,
-        mode="gemini-youtube-url-audio-only",
+        mode=mode,
         title=f"Gemini URL ASR [{youtube_identity(args.url)}]",
         source=args.url,
         model=args.model,
         visual_analysis_requested=False,
+        input="direct-youtube-url" if args.direct_url else "yt-dlp-audio-ogg-file-api",
     )
     try:
-        print("Gemini URL 离线转写：仅请求语音全文，不请求视觉分析或时间戳。", flush=True)
-        result = transcribe_youtube_url(
-            url=args.url,
-            api_key=gemini_api_key(),
-            model=args.model,
-            timeout=args.timeout,
-        )
-        outputs = save_result(result, output_dir)
+        if args.direct_url:
+            print("Gemini URL 离线转写：直接提交 URL，仅请求语音全文，不请求视觉分析或时间戳。", flush=True)
+            result = transcribe_youtube_url(
+                url=args.url,
+                api_key=gemini_api_key(),
+                model=args.model,
+                timeout=args.timeout,
+            )
+            outputs = save_result(result, output_dir)
+            elapsed_seconds = result.metadata["elapsed_seconds"]
+        else:
+            print("Gemini URL 离线转写：yt-dlp 下载音频 -> OGG/Opus -> Gemini File API。", flush=True)
+            source_audio = download_url_audio(args.url, output_dir)
+            gemini = run_gemini_local_audio(
+                source_audio,
+                output_dir,
+                model=args.model,
+                timeout=args.timeout,
+                upload_timeout=args.upload_timeout,
+                processing_timeout=args.processing_timeout,
+            )
+            outputs = {
+                "transcript": gemini["transcript"],
+                "metadata": gemini["metadata"],
+                "audio": gemini["ogg"],
+                "source_audio": str(source_audio),
+            }
+            result = type("GeminiUrlFileResult", (), {"text": Path(gemini["transcript"]).read_text(encoding="utf-8")})()
+            elapsed_seconds = gemini["elapsed"]
         manifest.update(
             status="completed",
             outputs=outputs,
             characters=len(result.text),
-            elapsed_seconds=result.metadata["elapsed_seconds"],
+            elapsed_seconds=elapsed_seconds,
             recommended_output=outputs["transcript"],
         )
         manifest_write(manifest_path, manifest)
+        if outputs.get("audio"):
+            print(f"完成。OGG：{outputs['audio']}", flush=True)
+        if outputs.get("source_audio"):
+            print(f"完成。yt-dlp 原始音频：{outputs['source_audio']}", flush=True)
         print(f"\n完成。全文：{outputs['transcript']}", flush=True)
         return 0
+    except BaseException as exc:
+        manifest.update(
+            status="interrupted" if isinstance(exc, KeyboardInterrupt) else "failed",
+            error=str(exc) or type(exc).__name__,
+        )
+        manifest_write(manifest_path, manifest)
+        raise
+
+
+def subtitle_download_command(
+    source: str,
+    output_template: Path,
+    *,
+    write_flag: str,
+    sub_langs: str,
+    cookies_from_chrome: bool,
+    chrome_profile: str,
+) -> list[str]:
+    command = [
+        YT_DLP,
+        "--no-playlist",
+        "--skip-download",
+        write_flag,
+        "--sub-langs",
+        sub_langs,
+        "--sub-format",
+        "srt/vtt/best",
+        "-o",
+        str(output_template),
+    ]
+    if cookies_from_chrome:
+        command.extend(["--cookies-from-browser", f"chrome:{chrome_profile}"])
+    command.append(source)
+    return command
+
+
+def parse_downloaded_subtitles(subs_dir: Path) -> tuple[Path, list[SubtitleSegment]] | None:
+    candidates = [
+        path
+        for path in sorted(subs_dir.glob("native.*"))
+        if path.is_file() and path.suffix.lower() in {".srt", ".vtt"}
+    ]
+    for path in candidates:
+        segments = parse_subtitle_file(path)
+        usable = [
+            SubtitleSegment(segment.start, segment.end, " ".join(segment.text.split()).strip())
+            for segment in segments
+            if segment.text.strip() and segment.end > segment.start
+        ]
+        if usable:
+            return path, usable
+    return None
+
+
+def run_native_subtitles(args: argparse.Namespace) -> int:
+    if urlparse(args.url).scheme not in {"http", "https"}:
+        raise RuntimeError("需要输入 YouTube/Bilibili 等公开视频链接")
+    output_dir = (
+        args.output_dir
+        or default_native_subtitle_output(
+            args.url,
+            cookies_from_chrome=args.cookies_from_chrome,
+            chrome_profile=args.chrome_profile,
+        )
+    ).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / "native-subtitles-manifest.json"
+    manifest = manifest_start(
+        manifest_path,
+        mode="native-subtitles",
+        title="视频自带字幕下载",
+        source=args.url,
+        stages={},
+    )
+    subs_dir = output_dir / "work" / "native-subtitles"
+    subs_dir.mkdir(parents=True, exist_ok=True)
+    output_template = subs_dir / "native.%(ext)s"
+    try:
+        attempts = [
+            ("人工字幕", "--write-subs", args.preferred_sub_langs),
+            ("自动字幕", "--write-auto-subs", args.preferred_sub_langs),
+            ("任意人工字幕", "--write-subs", args.fallback_sub_langs),
+            ("任意自动字幕", "--write-auto-subs", args.fallback_sub_langs),
+        ]
+        for label, write_flag, sub_langs in attempts:
+            for stale_path in subs_dir.glob("native.*"):
+                if stale_path.is_file():
+                    stale_path.unlink()
+            print(f"\n[{label}] 检测并尝试下载字幕：{sub_langs}", flush=True)
+            completed = subprocess.run(
+                subtitle_download_command(
+                    args.url,
+                    output_template,
+                    write_flag=write_flag,
+                    sub_langs=sub_langs,
+                    cookies_from_chrome=args.cookies_from_chrome,
+                    chrome_profile=args.chrome_profile,
+                ),
+                text=True,
+                check=False,
+            )
+            manifest.setdefault("stages", {})[label] = {
+                "status": "completed" if completed.returncode == 0 else "failed",
+                "returncode": completed.returncode,
+                "sub_langs": sub_langs,
+                "write_flag": write_flag,
+                "updated_at": now(),
+            }
+            manifest_write(manifest_path, manifest)
+            found = parse_downloaded_subtitles(subs_dir)
+            if found is None:
+                continue
+            raw_path, segments = found
+            subtitle_name = safe_name(raw_path.stem).replace(".", "-")
+            output_base = output_dir / f"{subtitle_name}-视频自带字幕"
+            srt_path = output_base.with_suffix(".srt")
+            txt_path = output_base.with_suffix(".txt")
+            save_segments_as_srt(srt_path, segments)
+            save_segments_as_txt(txt_path, segments)
+            manifest.update(
+                status="completed",
+                subtitle_kind=label,
+                downloaded_subtitle=str(raw_path),
+                segment_count=len(segments),
+                outputs={"srt": str(srt_path), "txt": str(txt_path), "raw": str(raw_path)},
+                recommended_output=str(srt_path),
+            )
+            manifest_write(manifest_path, manifest)
+            print(f"\n检测到并已下载视频自带字幕：{raw_path}", flush=True)
+            print(f"完成。SRT：{srt_path}", flush=True)
+            print(f"完成。TXT：{txt_path}", flush=True)
+            return 0
+        manifest.update(status="not-found", recommended_output="")
+        manifest_write(manifest_path, manifest)
+        print("\n未检测到可下载的自带字幕。可以继续使用 Gemini/NUC ASR 入口识别。", flush=True)
+        return 3
     except BaseException as exc:
         manifest.update(
             status="interrupted" if isinstance(exc, KeyboardInterrupt) else "failed",
@@ -264,10 +574,19 @@ def default_gemini_local_output(source: Path) -> Path:
 
 def save_gemini_local_result(result: Any, output_dir: Path, *, audio_path: Path, source: Path) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    transcript = output_dir / "gemini-local-audio-asr-transcript.txt"
+    transcript = output_dir / "gemini-local-audio-asr-transcript.md"
     metadata = output_dir / "gemini-local-audio-asr-metadata.json"
     if result.text.strip():
-        transcript.write_text(result.text.strip() + "\n", encoding="utf-8")
+        transcript.write_text(
+            transcript_markdown(
+                result.text,
+                title="Gemini Audio ASR Transcript",
+                source=str(source),
+                model=result.model,
+                audio_path=audio_path,
+            ),
+            encoding="utf-8",
+        )
     write_json(
         metadata,
         {
@@ -324,12 +643,14 @@ def run_gemini_local_audio(
 
 
 def completed_gemini_local_stage(stage: dict[str, Any]) -> bool:
-    return all(
+    if not all(
         isinstance(stage.get(key), str)
         and Path(stage[key]).is_file()
         and Path(stage[key]).stat().st_size > 0
         for key in ("transcript", "metadata")
-    )
+    ):
+        return False
+    return Path(stage["transcript"]).suffix.lower() == ".md"
 
 
 def run_gemini_local(args: argparse.Namespace) -> int:
@@ -375,6 +696,186 @@ def run_gemini_local(args: argparse.Namespace) -> int:
         )
         manifest_write(manifest_path, manifest)
         raise
+
+
+def transcript_body_from_markdown(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    marker = "\n## Transcript\n"
+    if marker in text:
+        return text.split(marker, 1)[1].strip()
+    marker = "\n## Segmented Transcript\n"
+    if marker in text:
+        return text.split(marker, 1)[1].strip()
+    return text.strip()
+
+
+def ollama_chat(
+    *,
+    api_url: str,
+    model: str,
+    system_prompt: str,
+    user_text: str,
+    num_ctx: int,
+    num_predict: int,
+    timeout: float,
+) -> str:
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        "think": False,
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+            "num_ctx": num_ctx,
+            "num_predict": num_predict,
+        },
+    }
+    request = urllib.request.Request(
+        api_url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started = time.monotonic()
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = json.loads(response.read().decode("utf-8"))
+    elapsed = time.monotonic() - started
+    message = raw.get("message") or {}
+    content = str(message.get("content") or "").strip()
+    if not content:
+        raise RuntimeError(f"Ollama returned no segmented content after {elapsed:.1f}s")
+    print(f"Ollama 分段完成：{elapsed:.1f}s，输出 {len(content)} 字符", flush=True)
+    return content
+
+
+def gemini_generate_rich_markdown(
+    *,
+    body: str,
+    api_key: str,
+    model: str,
+    timeout: float,
+) -> str:
+    if not api_key.strip():
+        raise RuntimeError("GEMINI_API_KEY is required")
+    from google import genai
+    from google.genai import types as genai_types
+
+    client = genai.Client(
+        api_key=api_key,
+        http_options=genai_types.HttpOptions(timeout=max(30, int(timeout)) * 1000),
+    )
+    prompt = (
+        f"{GEMINI_RICH_MARKDOWN_SYSTEM_PROMPT}\n\n"
+        f"{rich_markdown_user_prompt(body)}"
+    )
+    started = time.monotonic()
+    response = client.models.generate_content(
+        model=model,
+        contents=[prompt],
+        config=genai_types.GenerateContentConfig(
+            temperature=0.1,
+            max_output_tokens=24000,
+            response_mime_type="text/plain",
+        ),
+    )
+    elapsed = time.monotonic() - started
+    text = str(getattr(response, "text", "") or "").strip()
+    if not text:
+        raw = response.model_dump(mode="json", exclude_none=True) if hasattr(response, "model_dump") else {}
+        raise RuntimeError(f"Gemini returned no rich Markdown text: {raw}")
+    print(f"Gemini 富 Markdown 规整完成：{elapsed:.1f}s，输出 {len(text)} 字符", flush=True)
+    return text
+
+
+def run_segment_markdown(args: argparse.Namespace) -> int:
+    source = args.markdown.expanduser().resolve()
+    if not source.is_file():
+        raise RuntimeError(f"Markdown transcript not found: {source}")
+    body = transcript_body_from_markdown(source)
+    if not body:
+        raise RuntimeError(f"Markdown transcript contains no body text: {source}")
+    output = args.output.expanduser().resolve() if args.output else source.with_name(source.stem + "-ollama-segmented.md")
+    rag_context = ""
+    rag_stats: dict[str, int] = {}
+    if args.rag:
+        rag_context, rag_stats = build_rag_context(
+            body,
+            max_windows=args.rag_windows,
+            backend=args.embedding_backend,
+            embedding_model=args.embedding_model,
+            ollama_base_url=args.ollama_base_url,
+            embedding_timeout=args.embedding_timeout,
+        )
+        print(
+            f"本地 RAG 预处理：{rag_stats.get('sentences', 0)} 句，"
+            f"{rag_stats.get('windows', 0)} 个候选证据，"
+            f"S/P/T={rag_stats.get('sentence_units', 0)}/"
+            f"{rag_stats.get('paragraph_units', 0)}/"
+            f"{rag_stats.get('topic_units', 0)}，"
+            f"embedding={rag_stats.get('embedding_backend', args.embedding_backend)}",
+            flush=True,
+        )
+    system_prompt = RICH_MARKDOWN_SYSTEM_PROMPT
+    user_text = rich_markdown_user_prompt(body, rag_context=rag_context)
+    print(
+        f"本机 Ollama 分段：model={args.model}，num_ctx={args.num_ctx}，输入 {len(body)} 字符",
+        flush=True,
+    )
+    segmented = ollama_chat(
+        api_url=args.ollama_url,
+        model=args.model,
+        system_prompt=system_prompt,
+        user_text=user_text,
+        num_ctx=args.num_ctx,
+        num_predict=args.num_predict,
+        timeout=args.timeout,
+    )
+    output.write_text(
+        segmented_markdown(
+            segmented,
+            title="Ollama Segmented ASR Transcript",
+            source=str(source),
+            model=args.model,
+            input_path=source,
+            input_label="Input Markdown" if source.suffix.lower() == ".md" else "Input Text",
+        ),
+        encoding="utf-8",
+    )
+    print(f"完成。分段文稿：{output}", flush=True)
+    return 0
+
+
+def run_segment_gemini(args: argparse.Namespace) -> int:
+    source = args.transcript.expanduser().resolve()
+    if not source.is_file():
+        raise RuntimeError(f"Transcript not found: {source}")
+    body = transcript_body_from_markdown(source)
+    if not body:
+        raise RuntimeError(f"Transcript contains no body text: {source}")
+    output = args.output.expanduser().resolve() if args.output else source.with_name(source.stem + f"-05-gemini-{safe_name(args.model)}-rich.md")
+    print(f"Gemini 富 Markdown 规整：model={args.model}，输入 {len(body)} 字符", flush=True)
+    segmented = gemini_generate_rich_markdown(
+        body=body,
+        api_key=gemini_api_key(),
+        model=args.model,
+        timeout=args.timeout,
+    )
+    output.write_text(
+        segmented_markdown(
+            segmented,
+            title="Gemini Rich Markdown ASR Transcript",
+            source=str(source),
+            model=args.model,
+            input_path=source,
+            input_label="Input Markdown" if source.suffix.lower() == ".md" else "Input Text",
+        ),
+        encoding="utf-8",
+    )
+    print(f"完成。Gemini 规整文稿：{output}", flush=True)
+    return 0
 
 
 def run_command(command: list[str], label: str) -> None:
@@ -1970,7 +2471,34 @@ def main() -> int:
     gemini.add_argument("--output-dir", type=Path)
     gemini.add_argument("--model", default="gemini-2.5-flash")
     gemini.add_argument("--timeout", type=float, default=1200.0)
+    gemini.add_argument("--upload-timeout", type=int, default=300)
+    gemini.add_argument("--processing-timeout", type=int, default=1200)
+    gemini.add_argument(
+        "--direct-url",
+        action="store_true",
+        help="Submit the YouTube URL directly to Gemini instead of downloading audio with yt-dlp.",
+    )
     gemini.set_defaults(handler=run_gemini_url)
+
+    native_subtitles = subparsers.add_parser(
+        "native-subtitles",
+        help="Detect and download native subtitles from a YouTube/Bilibili URL",
+    )
+    native_subtitles.add_argument("url")
+    native_subtitles.add_argument("--output-dir", type=Path)
+    native_subtitles.add_argument(
+        "--preferred-sub-langs",
+        default="zh.*",
+        help="Preferred subtitle language expression for yt-dlp.",
+    )
+    native_subtitles.add_argument(
+        "--fallback-sub-langs",
+        default="all,-live_chat",
+        help="Fallback subtitle language expression for yt-dlp.",
+    )
+    native_subtitles.add_argument("--cookies-from-chrome", action="store_true")
+    native_subtitles.add_argument("--chrome-profile", default="Default")
+    native_subtitles.set_defaults(handler=run_native_subtitles)
 
     gemini_local = subparsers.add_parser(
         "gemini-local",
@@ -1983,6 +2511,35 @@ def main() -> int:
     gemini_local.add_argument("--upload-timeout", type=int, default=300)
     gemini_local.add_argument("--processing-timeout", type=int, default=1200)
     gemini_local.set_defaults(handler=run_gemini_local)
+
+    segment_md = subparsers.add_parser(
+        "segment-md",
+        help="Segment a Markdown ASR transcript with local Ollama.",
+    )
+    segment_md.add_argument("markdown", type=Path, metavar="TRANSCRIPT_MD")
+    segment_md.add_argument("--output", type=Path)
+    segment_md.add_argument("--model", default=DEFAULT_SEGMENT_MODEL)
+    segment_md.add_argument("--ollama-url", default=DEFAULT_LOCAL_OLLAMA_URL)
+    segment_md.add_argument("--ollama-base-url", default=DEFAULT_LOCAL_OLLAMA_BASE_URL)
+    segment_md.add_argument("--num-ctx", type=int, default=DEFAULT_SEGMENT_NUM_CTX)
+    segment_md.add_argument("--num-predict", type=int, default=12000)
+    segment_md.add_argument("--timeout", type=float, default=1800.0)
+    segment_md.add_argument("--rag", action=argparse.BooleanOptionalAction, default=True)
+    segment_md.add_argument("--rag-windows", type=int, default=24)
+    segment_md.add_argument("--embedding-backend", choices=("ollama", "tfidf", "hybrid"), default="ollama")
+    segment_md.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
+    segment_md.add_argument("--embedding-timeout", type=float, default=120.0)
+    segment_md.set_defaults(handler=run_segment_markdown)
+
+    segment_gemini = subparsers.add_parser(
+        "segment-gemini",
+        help="Format an ASR transcript as rich Markdown with Gemini 2.5 Flash/Pro.",
+    )
+    segment_gemini.add_argument("transcript", type=Path, metavar="TRANSCRIPT")
+    segment_gemini.add_argument("--output", type=Path)
+    segment_gemini.add_argument("--model", default="gemini-2.5-flash")
+    segment_gemini.add_argument("--timeout", type=float, default=900.0)
+    segment_gemini.set_defaults(handler=run_segment_gemini)
 
     nuc = subparsers.add_parser("nuc-local", help="Transcribe a local audio/video media file on the NUC")
     nuc.add_argument("audio", type=Path, metavar="MEDIA")

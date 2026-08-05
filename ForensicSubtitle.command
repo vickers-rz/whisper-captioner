@@ -21,9 +21,25 @@ Forensic Subtitle TUI
 Usage:
   ./ForensicSubtitle.command menu       Interactive TUI (default on double-click)
   ./ForensicSubtitle.command gemini-url [URL]
-                                       Gemini URL -> audio-only full transcript
+                                       URL -> yt-dlp webm/bestaudio -> OGG/Opus -> Gemini ASR
+  ./ForensicSubtitle.command gemini-url-direct [URL]
+                                       Gemini URL direct -> audio-only full transcript
+  ./ForensicSubtitle.command native-subtitles [URL]
+                                       YouTube/Bilibili URL -> detect/download native subtitles
   ./ForensicSubtitle.command gemini-local [MEDIA]
                                        Local audio/video media -> Gemini OGG/File API transcript
+  ./ForensicSubtitle.command segment-md [TRANSCRIPT_MD]
+                                       Hybrid RAG -> local Qwen rich Markdown segmentation
+  ./ForensicSubtitle.command segment-pure [TRANSCRIPT]
+                                       Pure local Qwen rich Markdown segmentation
+  ./ForensicSubtitle.command segment-tfidf [TRANSCRIPT]
+                                       TF-IDF RAG -> local Qwen rich Markdown segmentation
+  ./ForensicSubtitle.command segment-ollama [TRANSCRIPT]
+                                       Ollama embedding RAG -> local Qwen rich Markdown segmentation
+  ./ForensicSubtitle.command segment-hybrid [TRANSCRIPT]
+                                       Hybrid RAG -> local Qwen rich Markdown segmentation
+  ./ForensicSubtitle.command segment-gemini [TRANSCRIPT]
+                                       Gemini 2.5 Flash/Pro -> rich Markdown segmentation
   ./ForensicSubtitle.command nuc-local [MEDIA]
                                        Local audio/video media -> selectable NUC ASR
   ./ForensicSubtitle.command run [URL]  Run/resume the complete pipeline
@@ -95,6 +111,24 @@ strip_outer_quotes() {
     \'*\') stripped_value="${stripped_value#\'}"; stripped_value="${stripped_value%\'}" ;;
   esac
   printf "%s" "$stripped_value"
+}
+
+gemini_url_identity() {
+  "$PYTHON_BIN" - "$1" <<'PY'
+import re
+import sys
+from urllib.parse import parse_qs, urlparse
+
+url = sys.argv[1]
+parsed = urlparse(url)
+query = parse_qs(parsed.query)
+identity = (query.get("v") or [""])[0]
+if not identity:
+    parts = [part for part in parsed.path.split("/") if part]
+    identity = parts[-1] if parts else "youtube"
+identity = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "-", identity).strip(" .-") or "youtube"
+print(identity[:120])
+PY
 }
 
 mask_secret() {
@@ -172,10 +206,15 @@ prompt_gemini_key() {
 
 run_gemini_url_asr() {
   supplied_url="${1:-}"
+  direct_url="${2:-0}"
   if [ -n "$supplied_url" ]; then
     url_value="$supplied_url"
   else
-    echo "输入公开 YouTube URL（不会调用 yt-dlp）："
+    if [ "$direct_url" = "1" ]; then
+      echo "输入公开 YouTube URL（直接交给 Gemini，仅请求音频转写）："
+    else
+      echo "输入公开 YouTube URL（将用 yt-dlp 下载 webm/bestaudio，再转为 OGG/Opus 发给 Gemini）："
+    fi
     printf "> "
     read -r url_value
   fi
@@ -192,23 +231,105 @@ run_gemini_url_asr() {
   echo
   echo "产物目录留空时，将按 YouTube video ID 保存到："
   echo "  $OUTPUT_ROOT"
+  if [ "$direct_url" != "1" ]; then
+    default_identity="$(gemini_url_identity "$url_value")"
+    default_job_dir="$OUTPUT_ROOT/Gemini-URL-ASR [$default_identity]"
+    echo "默认 OGG/Opus 保存路径："
+    echo "  $default_job_dir/work/gemini-audio.ogg"
+    echo "默认 yt-dlp 原始音频保存路径："
+    echo "  $default_job_dir/work/source-audio.<ext>"
+    echo "默认 ASR 文稿保存路径："
+    echo "  $default_job_dir/gemini-local-audio-asr-transcript.md"
+  else
+    default_identity="$(gemini_url_identity "$url_value")"
+    default_job_dir="$OUTPUT_ROOT/Gemini-URL-ASR [$default_identity]"
+    echo "当前为直接 URL 模式：不会生成本地 OGG。"
+    echo "默认 ASR 文稿保存路径："
+    echo "  $default_job_dir/gemini-youtube-url-audio-only-transcript.md"
+  fi
   printf "自定义本次作业目录（可留空）: "
   read -r custom_output
 
   command_args=(gemini-url "$url_value" --model "$model_value")
+  if [ "$direct_url" = "1" ]; then
+    command_args+=(--direct-url)
+  fi
+  if [ -n "$custom_output" ]; then
+    custom_output="$(strip_outer_quotes "$custom_output")"
+    command_args+=(--output-dir "$custom_output")
+    if [ "$direct_url" != "1" ]; then
+      echo "本次 OGG/Opus 将保存到："
+      echo "  $custom_output/work/gemini-audio.ogg"
+      echo "本次 ASR 文稿将保存到："
+      echo "  $custom_output/gemini-local-audio-asr-transcript.md"
+    else
+      echo "本次 ASR 文稿将保存到："
+      echo "  $custom_output/gemini-youtube-url-audio-only-transcript.md"
+    fi
+  fi
+  if [ "$direct_url" = "1" ]; then
+    job_label="Gemini URL -> 直接提交 URL -> Gemini 全文转写"
+  else
+    job_label="Gemini URL -> yt-dlp 音频下载 -> OGG/Opus -> Gemini 全文转写"
+  fi
+  if [ -n "$api_key_value" ]; then
+    GEMINI_API_KEY="$api_key_value" run_logged \
+      "$job_label" \
+      asr_worker "${command_args[@]}"
+  else
+    run_logged \
+      "$job_label" \
+      asr_worker "${command_args[@]}"
+  fi
+}
+
+run_native_subtitles() {
+  supplied_url="${1:-}"
+  if [ -n "$supplied_url" ]; then
+    url_value="$supplied_url"
+  else
+    echo "输入 YouTube/Bilibili 视频 URL（检测是否有自带字幕；有则直接下载）："
+    printf "> "
+    read -r url_value
+  fi
+  if [ -z "$url_value" ]; then
+    echo "未输入视频 URL。"
+    return 2
+  fi
+
+  echo
+  printf "允许 yt-dlp 读取 Chrome Cookie？Bilibili/会员/地区限制视频建议启用 [y/N]: "
+  read -r cookie_choice
+  cookie_choice="${cookie_choice:-N}"
+  chrome_profile="${FORENSIC_CHROME_PROFILE:-Default}"
+  case "$cookie_choice" in
+    y|Y|yes|YES)
+      printf "Chrome Profile 名称或路径 [%s]: " "$chrome_profile"
+      read -r requested_chrome_profile
+      chrome_profile="${requested_chrome_profile:-$chrome_profile}"
+      ;;
+  esac
+
+  echo
+  echo "产物目录留空时，将按视频标题保存到："
+  echo "  $OUTPUT_ROOT"
+  printf "自定义本次作业目录（可留空）: "
+  read -r custom_output
+
+  command_args=(native-subtitles "$url_value")
+  case "$cookie_choice" in
+    y|Y|yes|YES)
+      command_args+=(--cookies-from-chrome --chrome-profile "$chrome_profile")
+      ;;
+  esac
   if [ -n "$custom_output" ]; then
     custom_output="$(strip_outer_quotes "$custom_output")"
     command_args+=(--output-dir "$custom_output")
   fi
-  if [ -n "$api_key_value" ]; then
-    GEMINI_API_KEY="$api_key_value" run_logged \
-      "Gemini URL -> 全文转写（仅请求音频转写，不生成视频理解结果）" \
-      asr_worker "${command_args[@]}"
-  else
-    run_logged \
-      "Gemini URL -> 全文转写（仅请求音频转写，不生成视频理解结果）" \
-      asr_worker "${command_args[@]}"
-  fi
+
+  run_logged \
+    "视频链接 -> 检测/下载自带字幕（优先中文字幕；无中文字幕则尝试任意字幕）" \
+    asr_worker "${command_args[@]}"
 }
 
 run_gemini_local_asr() {
@@ -249,6 +370,126 @@ run_gemini_local_asr() {
   else
     run_logged \
       "本地媒体 -> Gemini OGG/File API 全文转写" \
+      asr_worker "${command_args[@]}"
+  fi
+}
+
+run_segment_markdown() {
+  supplied_markdown="${1:-}"
+  segmentation_mode="${2:-hybrid}"
+  if [ -n "$supplied_markdown" ]; then
+    markdown_value="$supplied_markdown"
+  else
+    echo "输入 ASR 文稿路径（支持 .md 或 .txt）："
+    printf "> "
+    read -r markdown_value
+  fi
+  markdown_value="$(strip_outer_quotes "$markdown_value")"
+  if [ -z "$markdown_value" ]; then
+    echo "未输入 Markdown 文稿路径。"
+    return 2
+  fi
+  case "$segmentation_mode" in
+    pure)
+      output_suffix="01-pure-qwen35-4b-rich"
+      job_label="纯 Qwen3.5-4B -> 富 Markdown 全文规整"
+      ;;
+    tfidf)
+      output_suffix="02-tfidf-rag-qwen35-4b-rich"
+      job_label="TF-IDF RAG -> Qwen3.5-4B 富 Markdown 全文规整"
+      ;;
+    ollama)
+      output_suffix="03-ollama-embedding-rag-qwen35-4b-rich"
+      job_label="Ollama embedding RAG -> Qwen3.5-4B 富 Markdown 全文规整"
+      ;;
+    hybrid|*)
+      output_suffix="04-hybrid-rag-qwen35-4b-rich"
+      job_label="Hybrid RAG -> Qwen3.5-4B 富 Markdown 全文规整"
+      segmentation_mode="hybrid"
+      ;;
+  esac
+  input_dir="$(dirname "$markdown_value")"
+  input_base="$(basename "$markdown_value")"
+  input_stem="${input_base%.*}"
+  output_value="$input_dir/$input_stem-$output_suffix.md"
+  echo
+  echo "默认分段文稿保存路径："
+  echo "  $output_value"
+  printf "自定义本次分段文稿路径（可留空）: "
+  read -r custom_output
+
+  command_args=(segment-md "$markdown_value")
+  case "$segmentation_mode" in
+    pure)
+      command_args+=(--no-rag)
+      ;;
+    tfidf)
+      command_args+=(--embedding-backend tfidf)
+      ;;
+    ollama)
+      command_args+=(--embedding-backend ollama)
+      ;;
+    hybrid)
+      command_args+=(--embedding-backend hybrid)
+      ;;
+  esac
+  if [ -n "$custom_output" ]; then
+    custom_output="$(strip_outer_quotes "$custom_output")"
+    command_args+=(--output "$custom_output")
+  else
+    command_args+=(--output "$output_value")
+  fi
+  run_logged \
+    "$job_label" \
+    asr_worker "${command_args[@]}"
+}
+
+run_segment_gemini() {
+  supplied_markdown="${1:-}"
+  if [ -n "$supplied_markdown" ]; then
+    markdown_value="$supplied_markdown"
+  else
+    echo "输入 ASR 文稿路径（支持 .md 或 .txt）："
+    printf "> "
+    read -r markdown_value
+  fi
+  markdown_value="$(strip_outer_quotes "$markdown_value")"
+  if [ -z "$markdown_value" ]; then
+    echo "未输入 ASR 文稿路径。"
+    return 2
+  fi
+
+  choose_gemini_model
+  model_value="$GEMINI_MODEL_VALUE"
+  prompt_gemini_key
+  api_key_value="$GEMINI_API_KEY_VALUE"
+
+  model_slug="$(printf "%s" "$model_value" | tr '/:' '--')"
+  input_dir="$(dirname "$markdown_value")"
+  input_base="$(basename "$markdown_value")"
+  input_stem="${input_base%.*}"
+  output_value="$input_dir/$input_stem-05-gemini-$model_slug-rich.md"
+
+  echo
+  echo "默认 Gemini 富 Markdown 文稿保存路径："
+  echo "  $output_value"
+  printf "自定义本次 Gemini 文稿路径（可留空）: "
+  read -r custom_output
+
+  command_args=(segment-gemini "$markdown_value" --model "$model_value")
+  if [ -n "$custom_output" ]; then
+    custom_output="$(strip_outer_quotes "$custom_output")"
+    command_args+=(--output "$custom_output")
+  else
+    command_args+=(--output "$output_value")
+  fi
+  if [ -n "$api_key_value" ]; then
+    GEMINI_API_KEY="$api_key_value" run_logged \
+      "Gemini $model_value -> 富 Markdown 全文规整" \
+      asr_worker "${command_args[@]}"
+  else
+    run_logged \
+      "Gemini $model_value -> 富 Markdown 全文规整" \
       asr_worker "${command_args[@]}"
   fi
 }
@@ -408,14 +649,21 @@ interactive_menu() {
   Whisper Captioner · 视频字幕取证流水线
 ============================================================
 
-  1) Gemini URL -> 全文转写（无 yt-dlp，不输出视频理解）
-  2) 本地音频/视频媒体 -> Gemini OGG/File API 全文转写
-  3) 本地音频/视频媒体 -> NUC ASR（Qwen / large-v3-turbo）
-  4) 一键运行 / 续跑完整取证 Pipeline
-  5) 查看近期作业状态
-  6) 打开产物目录
-  7) 查看最近日志
-  8) 环境诊断
+  1) Gemini URL -> yt-dlp 下载音频 -> OGG/Opus -> Gemini 全文转写
+  2) Gemini URL -> 直接交给 Gemini（不下载音频）
+  3) YouTube/Bilibili 链接 -> 检测/下载视频自带字幕
+  4) 本地音频/视频媒体 -> Gemini OGG/File API 全文转写
+  5) ASR 文稿 -> 纯 Qwen3.5-4B 富 Markdown 规整
+  6) ASR 文稿 -> TF-IDF RAG + Qwen3.5-4B 富 Markdown 规整
+  7) ASR 文稿 -> Ollama Embedding RAG + Qwen3.5-4B 富 Markdown 规整
+  8) ASR 文稿 -> Hybrid RAG + Qwen3.5-4B 富 Markdown 规整
+  9) ASR 文稿 -> Gemini 2.5 Flash/Pro 富 Markdown 规整
+  10) 本地音频/视频媒体 -> NUC ASR（Qwen / large-v3-turbo）
+  11) 一键运行 / 续跑完整取证 Pipeline
+  12) 查看近期作业状态
+  13) 打开产物目录
+  14) 查看最近日志
+  15) 环境诊断
   h) 查看 Pipeline 说明
   q) 退出
 EOF
@@ -425,13 +673,20 @@ EOF
     set +e
     case "$choice" in
       1) run_gemini_url_asr; action_status=$? ;;
-      2) run_gemini_local_asr; action_status=$? ;;
-      3) run_nuc_local_asr; action_status=$? ;;
-      4) run_pipeline; action_status=$? ;;
-      5) show_status; action_status=$? ;;
-      6) open_outputs; action_status=$? ;;
-      7) tail_log; action_status=$? ;;
-      8) doctor; action_status=$? ;;
+      2) run_gemini_url_asr "" 1; action_status=$? ;;
+      3) run_native_subtitles; action_status=$? ;;
+      4) run_gemini_local_asr; action_status=$? ;;
+      5) run_segment_markdown "" pure; action_status=$? ;;
+      6) run_segment_markdown "" tfidf; action_status=$? ;;
+      7) run_segment_markdown "" ollama; action_status=$? ;;
+      8) run_segment_markdown "" hybrid; action_status=$? ;;
+      9) run_segment_gemini; action_status=$? ;;
+      10) run_nuc_local_asr; action_status=$? ;;
+      11) run_pipeline; action_status=$? ;;
+      12) show_status; action_status=$? ;;
+      13) open_outputs; action_status=$? ;;
+      14) tail_log; action_status=$? ;;
+      15) doctor; action_status=$? ;;
       h|H) less "$SCRIPT_ROOT/docs/final_forensic_subtitle_pipeline.md"; action_status=$? ;;
       q|Q) exit 0 ;;
       *) echo "未知选项：$choice"; action_status=2 ;;
@@ -449,7 +704,15 @@ command_name="${1:-menu}"
 case "$command_name" in
   menu) interactive_menu ;;
   gemini-url) shift; run_gemini_url_asr "${1:-}" ;;
+  gemini-url-direct) shift; run_gemini_url_asr "${1:-}" 1 ;;
+  native-subtitles) shift; run_native_subtitles "${1:-}" ;;
   gemini-local) shift; run_gemini_local_asr "${1:-}" ;;
+  segment-md) shift; run_segment_markdown "${1:-}" hybrid ;;
+  segment-pure) shift; run_segment_markdown "${1:-}" pure ;;
+  segment-tfidf) shift; run_segment_markdown "${1:-}" tfidf ;;
+  segment-ollama) shift; run_segment_markdown "${1:-}" ollama ;;
+  segment-hybrid) shift; run_segment_markdown "${1:-}" hybrid ;;
+  segment-gemini) shift; run_segment_gemini "${1:-}" ;;
   nuc-local) shift; run_nuc_local_asr "${1:-}" ;;
   run) shift; run_pipeline "${1:-}" ;;
   status) show_status ;;

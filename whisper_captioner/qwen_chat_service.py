@@ -1592,12 +1592,20 @@ class QwenChatServiceManager:
             return prompt, system_prompt
 
         system_prompt = (
-            "你是一个严谨的中文文稿整理助手。请仅根据用户提供的字幕内容写成更适合阅读的完整文稿，"
-            "可以按自然段组织，但不要杜撰字幕中没有的信息。"
+            "你是一个严谨的中文文稿整理助手和 Markdown 排版编辑。"
+            "请仅根据用户提供的字幕内容写成更适合阅读的完整文稿，"
+            "可以按自然段、标题、小标题、列表和表格组织，但不要杜撰字幕中没有的信息。"
         )
         prompt = (
             "请把下面字幕转写成一篇顺畅、可读的中文文稿。"
-            "如果内容明显是教程或访谈，请保留核心逻辑与层次。\n\n"
+            "如果内容明显是教程或访谈，请保留核心逻辑与层次。\n"
+            "要求：\n"
+            "1. 不要逐句罗列字幕，不要保留字幕编号。\n"
+            "2. 保留原视频的核心观点、术语、例子和逻辑顺序。\n"
+            "3. 可以合并重复口语、修正病句、补足自然衔接，但不要虚构原文没有的信息。\n"
+            "4. 使用 Markdown 标题、小标题、自然段、列表和表格。\n"
+            "5. 对关键结论、年份、金额、风险提醒使用加粗；对特别需要注意的风险使用 <u>下划线</u>。\n"
+            "6. 对准证名、英文术语、平台名、政策名使用行内代码样式，例如 `EP`、`S Pass`、`WP`、`DP`、`PR`。\n\n"
             f"{timestamped_text}"
         )
         return prompt, system_prompt
@@ -1678,8 +1686,8 @@ class QwenChatServiceManager:
         source_path = Path(str(subtitle.get("path", ""))).expanduser()
         out_dir = source_path.parent if source_path.exists() else self.exports_dir / convo["id"]
         out_dir.mkdir(parents=True, exist_ok=True)
-        txt_path = out_dir / f"{export_stem}.txt"
-        txt_path.write_text(result, encoding="utf-8")
+        result_path = out_dir / f"{export_stem}.md"
+        result_path.write_text(result, encoding="utf-8")
 
         if action == "cleanup":
             segments = [

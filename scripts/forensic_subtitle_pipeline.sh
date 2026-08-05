@@ -43,7 +43,8 @@ case "$command_name" in
   finalize)
     [[ $# -eq 4 ]] || { usage >&2; exit 2; }
     run_python "$ROOT/scripts/forensic_subtitle_command.py" finalize \
-      --nuc-asr "$2" --gemini "$3" --output-dir "$4"
+      --nuc-asr "$2" --gemini "$3" --output-dir "$4" \
+      --llm-segmentation --ollama-model qwen2.5:7b
     ;;
   targeted-ocr)
     [[ $# -eq 6 ]] || { usage >&2; exit 2; }

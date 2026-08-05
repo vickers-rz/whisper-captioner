@@ -484,7 +484,23 @@ def run_pipeline(args: argparse.Namespace, cookie_session: YtDlpCookieSession) -
     final_srt = final_dir / "final.srt"
     final_json = final_dir / "final-timeline.json"
     if not stage_ready(manifest, "finalize", [final_srt, final_json]):
-        run([sys.executable, str(PROJECT_ROOT / "scripts/forensic_subtitle_command.py"), "finalize", "--nuc-asr", str(asr_path), "--gemini", str(final_transcript), "--output-dir", str(final_dir)], "阶段 5-6/6：算法断句并映射 NUC words 时间")
+        run(
+            [
+                sys.executable,
+                str(PROJECT_ROOT / "scripts/forensic_subtitle_command.py"),
+                "finalize",
+                "--nuc-asr",
+                str(asr_path),
+                "--gemini",
+                str(final_transcript),
+                "--output-dir",
+                str(final_dir),
+                "--llm-segmentation",
+                "--ollama-model",
+                "qwen2.5:7b",
+            ],
+            "阶段 5-6/6：LLM 语义断句并映射 NUC words 时间",
+        )
         quality = validate_final(final_json)
         mark_stage(manifest_path, manifest, "finalize", "completed", srt=str(final_srt), timeline=str(final_json), quality=quality)
 

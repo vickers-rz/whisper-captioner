@@ -6,10 +6,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.transcript_markdown import transcript_markdown
 
 
 PROMPT = """
@@ -108,9 +115,18 @@ def transcribe_youtube_url(
 
 def save_result(result: GeminiUrlAsrResult, output_dir: Path) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    transcript = output_dir / "gemini-youtube-url-audio-only-transcript.txt"
+    transcript = output_dir / "gemini-youtube-url-audio-only-transcript.md"
     metadata = output_dir / "gemini-youtube-url-audio-only-metadata.json"
-    transcript.write_text(result.text.rstrip() + "\n", encoding="utf-8")
+    transcript.write_text(
+        transcript_markdown(
+            result.text,
+            title="Gemini YouTube URL ASR Transcript",
+            source=result.metadata["url"],
+            model=result.metadata["model"],
+            input_label="public-youtube-url-video-part",
+        ),
+        encoding="utf-8",
+    )
     metadata.write_text(
         json.dumps(
             {**result.metadata, "response": result.raw_response},
