@@ -1,0 +1,17 @@
+{
+  "kind": "gemini-text-only-asr",
+  "status": "completed",
+  "created_at": "2026-08-19T05:34:06+08:00",
+  "source": "https://www.youtube.com/watch?v=zKmxAB9OfYM",
+  "source_kind": "yt-dlp-webm-ffmpeg-copy-ogg-files-api",
+  "model": "gemini-3.6-flash",
+  "timestamps_requested": false,
+  "characters": 3832,
+  "elapsed_seconds": 77.325,
+  "response_sha256": "4dcd3368c8ce1df347a820dde980d13c770ca22c06f9b1b85550de4e734fbae8",
+  "outputs": {
+    "text": "/private/var/mobile/Containers/Data/Application/D48D3D6D-7379-457C-A30B-566DBFEDA338/Documents/Gemini-ASR/zKmxAB9OfYM-webm-copy-ogg-vpn-direct/transcript.txt",
+    "markdown": "/private/var/mobile/Containers/Data/Application/D48D3D6D-7379-457C-A30B-566DBFEDA338/Documents/Gemini-ASR/zKmxAB9OfYM-webm-copy-ogg-vpn-direct/transcript.md",
+    "raw_response": "/private/var/mobile/Containers/Data/Application/D48D3D6D-7379-457C-A30B-566DBFEDA338/Documents/Gemini-ASR/zKmxAB9OfYM-webm-copy-ogg-vpn-direct/gemini-response.json"
+  }
+}

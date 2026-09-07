@@ -1,0 +1,84 @@
+{
+  "kind": "standalone-asr",
+  "status": "completed",
+  "created_at": "2026-08-19T18:52:29+0800",
+  "updated_at": "2026-08-19T18:57:00+0800",
+  "mode": "gemini-local-audio-asr",
+  "title": "Gemini local ASR: 紧握着痛苦不放的我们，得到了什么呢？.mp3",
+  "source": "/Volumes/02_HDD_unTar_NFS/播客/紧握着痛苦不放的我们，得到了什么呢？.mp3",
+  "model": "gemini-2.5-flash",
+  "stages": {
+    "gemini": {
+      "status": "completed",
+      "updated_at": "2026-08-19T18:57:00+0800",
+      "model": "gemini-2.5-flash",
+      "characters": 1814,
+      "ogg": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/021-cd2ad6e7b22e/work/gemini-audio.ogg",
+      "transcript": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/021-cd2ad6e7b22e/gemini-local-audio-asr-transcript.md",
+      "metadata": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/021-cd2ad6e7b22e/gemini-local-audio-asr-metadata.json",
+      "elapsed": 8.38660192489624,
+      "diagnostics": {
+        "transport": "file-api",
+        "cleanup": "deleted",
+        "file_name": "files/2wn5e2887g9c",
+        "upload_elapsed": 2.3966893750002782,
+        "file_state": "FILESTATE.ACTIVE",
+        "generation_elapsed": 8.38660192489624,
+        "response": {
+          "sdk_http_response": {
+            "headers": {
+              "x-gemini-service-tier": "standard",
+              "content-type": "application/json; charset=UTF-8",
+              "vary": "Origin, X-Origin, Referer",
+              "content-encoding": "gzip",
+              "date": "Wed, 19 Aug 2026 10:56:59 GMT",
+              "server": "scaffolding on HTTPServer2",
+              "x-xss-protection": "0",
+              "x-frame-options": "SAMEORIGIN",
+              "x-content-type-options": "nosniff",
+              "server-timing": "gfet4t7; dur=7638",
+              "alt-svc": "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000",
+              "transfer-encoding": "chunked"
+            }
+          },
+          "candidates": [
+            {
+              "content": {
+                "parts": [
+                  {
+                    "text": "我们都有过痛苦的体验，在生活的某个瞬间，感受到自己被\n卷入漩涡了，被拽入深渊了，痛苦不堪，崩溃不已，却难以自拔，我们都经历过。\nHello，新老朋友们大家好呀，我是痛苦的时候最爱思考问题的电台王瑞，这里是安维记，用心理学照亮你。\n如果把痛苦比作黑洞，你一定见识过它强大的破坏力。\n但你可能也会感到困惑，如果自保是我们的本能，快乐原则是人类天性，为什么饱受折磨的我们却不尽快走出痛苦呢？\n其实答案藏在黑洞的另一个隐喻里，那就是它还有强大的吸引力。\n痛和痛苦一字之差，对吧？\n意味着怎么样地不同呢？\n大多数情况下，痛不是出于自己的选择。\n那你生理上比如说被刺痛了，被打了一下，被烫了，那我们马上会缩手会躲。\n那情绪上的痛感也是类似的，感受到丧失时的哀伤，被冷落时的失望，受到欺骗时的愤怒，这些都是自然反应，是聪明的身体在保护我们。\n所以痛感让我们得以感受自己的需求，确认自己的底线，做出真正贴近内心的选择。\n那痛苦又是什么呢？\n是丧失后难以停止的反刍，无法释怀的执拗，是被冷落后自我价值崩塌的绝望，是受到欺骗之后内心秩序的兵荒马乱。\n它们超出了我们对疼痛的自然反应。\n它会不断地增加这种苦痛的自我折磨。\n所以痛无法逃避，但是痛苦却是我们不自觉的主动选择。\n个体心理学创始人阿德勒认为，一个人陷入某种状态很长的时间走不出去，一定是因为它陷进去的这个场景给他带来了什么好处，满足了他的什么需求。\n所以有没有一种可能，我们其实这个时候非常非常需要这个痛苦。\n也许真相太过残酷，那我们只有沉溺痛苦，才能稍微心安理得地回避现实问题。\n那也许是最恶感太过沉重，那只有足够痛苦，我们才能允许自己犯错。\n也许人生太过艰难，只有陷入痛苦，我们才能不去解决更大的难题。\n所以你发现了吗？\n痛苦有的时候它是一种防御机制，让我们受伤的同时它也在保护着我们。\n只是现实并不会因为我们拒绝接受就改变了，就不存在了，那个更大的痛苦。\n那自我惩罚呢，无法抚平人真正的痛苦，它也会阻碍我们内心的成长。\n就是如果你在这个痛苦里边太长时间的话。\n如果失去了痛苦，我们还会失去些什么呢？\n也许是一部分的自我。\n走出痛苦表面上是超越了痛苦的自己，同时又好像背叛和杀死了代表自我的那个部分。\n是对过往的否定和抛弃，我们所有的面向都有存在的需要，都有被看见的需要。\n即使是混乱不堪，那也是我们自我的一部分。\n所以内心深处我们其实不太舍得真的抛下它。\n此外呢，我们可能失去了这种惯常的模式，比如说在电影《下妻物语》里边，小桃子对自己的母亲就说，人在面临巨大的幸福时会变得十分胆怯。\n抓住幸福其实比忍耐痛苦更需要勇气。\n每个人对不确定性的耐受力是有差异的，有時候面对确定的痛苦和不确定的幸福，我们宁愿选择确定而熟悉的痛苦，也无法忍受走出痛苦身处不安的陌生感和动荡的不确定感之中。\n越是亲近的人越难以旁观我们的痛苦，然而黑洞对我们而言的意义是什么呢？\n我们是不是准备好了走出来的准备？\n那走出来之后我们要去哪呢？\n这些问题只有我们自己才能想清楚。\n那理清之后的选择也是我们的自由。\n它不能被剥夺，也无法被代劳，没有人能替你做这件事情。\n这就是存在主义的哲学观。\n在存在的意义上，人全然的自由，就是你想要全部的自由就代表着你得为自己的选择和行为负责。\n当然走出痛苦的尝试固然值得，但是过程呢却是不可避免的痛。\n正因为如此，直面真相需要极大的勇气，在你还没有准备好的情况下，紧握着痛苦无法放手，也没什么不可以。\n即便在一些人看来，啊这是作茧自缚，画地为牢。\n但不论是茧还是牢，它们都象征着心理的安全区，容纳着无助的自我，承载着难熬的情绪。\n允许和陪伴自己在安全区里边多待一会儿，是我们的慈悲。\n是非常非常有力量的爱自己的一种方式。\n好了，今天的视频到这里就结束了，最后的今天呢就来发，允许痛苦吧。\n痛苦的黑洞中也许藏着隐秘的诱惑，藏着未被关照的自我，藏着没有被意识化的心理动力。\n当我们看见黑洞的吸引力，从压抑的无意识走向有意识的时候，自我就不会再被黑洞挟持，得以重新整合。\n如果你发现目前承受的痛苦，实在是太强烈了，已经无法靠你自己解决，那影响了你的学习、工作或者生活，可以寻求专业的心理咨询师的帮助。\n如果你担心心理咨询水太深，会踩雷，私信我，我可以给你发一份我历经九年积累整理的靠谱的咨询的指南。\n如果今天视频对你有所帮助，别忘了意见三连哦，安维记视频每周更新，我们下期见。\n拜拜。"
+                  }
+                ],
+                "role": "model"
+              },
+              "finish_reason": "STOP",
+              "index": 0
+            }
+          ],
+          "model_version": "gemini-2.5-flash",
+          "response_id": "84uFar-4ONew1MkPv9T2yAU",
+          "usage_metadata": {
+            "candidates_token_count": 1213,
+            "prompt_token_count": 11639,
+            "prompt_tokens_details": [
+              {
+                "modality": "TEXT",
+                "token_count": 84
+              },
+              {
+                "modality": "AUDIO",
+                "token_count": 11555
+              }
+            ],
+            "total_token_count": 12852
+          },
+          "automatic_function_calling_history": []
+        },
+        "finish_reason": "FINISHREASON.STOP",
+        "output_tokens": 1213,
+        "max_output_tokens": 60000
+      }
+    }
+  },
+  "recommended_output": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/021-cd2ad6e7b22e/gemini-local-audio-asr-transcript.md"
+}

@@ -1,0 +1,137 @@
+{
+  "root": "/Volumes/02_HDD_unTar_NFS/播客",
+  "model": "gemini-2.5-flash",
+  "total": 24,
+  "completed": [
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/「算命」真的是更适合中国宝宝的心理咨询吗？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/「算命」真的是更适合中国宝宝的心理咨询吗？.txt",
+      "elapsed_seconds": 17.8
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/一定要原谅父母吗？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/一定要原谅父母吗？.txt",
+      "elapsed_seconds": 17.5
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/不开心，好过刻意快乐.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/不开心，好过刻意快乐.txt",
+      "elapsed_seconds": 16.9
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/不是羞耻感不好，而是没学会「好好羞耻」.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/不是羞耻感不好，而是没学会「好好羞耻」.txt",
+      "elapsed_seconds": 23.9
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/不留退路，才能全力以赴吗？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/不留退路，才能全力以赴吗？.txt",
+      "elapsed_seconds": 14.2
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/做事总是三分钟热度，如何做个有毅力的人？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/做事总是三分钟热度，如何做个有毅力的人？.txt",
+      "elapsed_seconds": 17.8
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/做任何事都「跳过」情绪，人生就会成功吗？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/做任何事都「跳过」情绪，人生就会成功吗？.txt",
+      "elapsed_seconds": 30.5
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/关键时刻掉链子？「成功」可能令你害怕.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/关键时刻掉链子？「成功」可能令你害怕.txt",
+      "elapsed_seconds": 14.5
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/原生家庭：我选择不和解，然后轻轻放下.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/原生家庭：我选择不和解，然后轻轻放下.txt",
+      "elapsed_seconds": 164.5
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/回忆脑是比恋爱脑还可怕的绝症？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/回忆脑是比恋爱脑还可怕的绝症？.txt",
+      "elapsed_seconds": 20.4
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/忍着不哭，你到底还要为“情绪稳定”付出多少？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/忍着不哭，你到底还要为“情绪稳定”付出多少？.txt",
+      "elapsed_seconds": 12.7
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/我擅长迎难而下，存在主义视角下如何应对习惯性逃避？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/我擅长迎难而下，存在主义视角下如何应对习惯性逃避？.txt",
+      "elapsed_seconds": 16.0
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/我花钱时，总觉得自己不配.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/我花钱时，总觉得自己不配.txt",
+      "elapsed_seconds": 27.1
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/无法融入的群体，还要强行融入吗？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/无法融入的群体，还要强行融入吗？.txt",
+      "elapsed_seconds": 16.0
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/明明没做什么事，为什么这么累？聊聊看不见的情绪劳动.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/明明没做什么事，为什么这么累？聊聊看不见的情绪劳动.txt",
+      "elapsed_seconds": 21.0
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/曾经被孤立过，现在还能走出吗？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/曾经被孤立过，现在还能走出吗？.txt",
+      "elapsed_seconds": 20.9
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/童年，有没有可能一点都不重要？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/童年，有没有可能一点都不重要？.txt",
+      "elapsed_seconds": 38.2
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/结束不健康的关系不好吗？为什么还会失落呢....mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/结束不健康的关系不好吗？为什么还会失落呢....txt",
+      "elapsed_seconds": 15.1
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/躺平和摆烂，有什么区别吗？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/躺平和摆烂，有什么区别吗？.txt",
+      "elapsed_seconds": 13.3
+    }
+  ],
+  "skipped": [],
+  "failed": [
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/不想答应，却总是难以拒绝怎么办？.mp3",
+      "returncode": 1,
+      "elapsed_seconds": 4.8,
+      "job_dir": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/004-60bc8eb6a3f8"
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/为什么“爱自己”后，生活反而更遭了？｜灵性逃避.mp3",
+      "returncode": 1,
+      "elapsed_seconds": 5.7,
+      "job_dir": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/007-262e48da55b9"
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/卷不动又躺不平，如何找到人生角度？.mp3",
+      "returncode": 1,
+      "elapsed_seconds": 7.2,
+      "job_dir": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/011-37863ff40cbe"
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/紧握着痛苦不放的我们，得到了什么呢？.mp3",
+      "returncode": 1,
+      "elapsed_seconds": 5.8,
+      "job_dir": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/021-cd2ad6e7b22e"
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/选择困难症，真正难的是......mp3",
+      "returncode": 1,
+      "elapsed_seconds": 6.1,
+      "job_dir": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/024-77c1ce792128"
+    }
+  ],
+  "started_at": "2026-08-19T18:44:00+0800",
+  "finished_at": "2026-08-19T18:53:08+0800"
+}

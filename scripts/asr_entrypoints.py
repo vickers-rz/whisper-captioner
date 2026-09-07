@@ -27,9 +27,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.gemini_youtube_url_asr_smoke import save_result, transcribe_youtube_url
 from scripts.transcript_rag_segmenter import build_rag_context
-from scripts.transcript_markdown import segmented_markdown, transcript_markdown
+from scripts.transcript_markdown import segmented_markdown
 from whisper_captioner.config import FFMPEG, FFPROBE, GENERATED_DIR, NUC_OLLAMA_HOST, YT_DLP
 from whisper_captioner.credentials import load_secret, save_secret
 from whisper_captioner.external_backends import gemini_transcribe_audio
@@ -299,12 +298,18 @@ def completed_gemini_job(
         for key in ("transcript", "metadata")
     ):
         return None
-    if Path(outputs["transcript"]).suffix.lower() != ".md":
+    if Path(outputs["transcript"]).suffix.lower() != ".txt":
         return None
     return manifest
 
 
-def download_url_audio(source: str, output_dir: Path) -> Path:
+def download_url_audio(
+    source: str,
+    output_dir: Path,
+    *,
+    cookies_from_chrome: bool = False,
+    chrome_profile: str = "Default",
+) -> Path:
     work = output_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
     template = work / "source-audio.%(ext)s"
@@ -322,18 +327,18 @@ def download_url_audio(source: str, output_dir: Path) -> Path:
     if source_audio is not None:
         print(f"复用 yt-dlp 原始音频：{source_audio}", flush=True)
         return source_audio
-    run_command(
-        [
+    command = [
             YT_DLP,
             "--no-playlist",
             "-f",
             "bestaudio[ext=webm]/bestaudio",
             "-o",
             str(template),
-            source,
-        ],
-        "用 yt-dlp 下载 webm/bestaudio 原始音频",
-    )
+        ]
+    if cookies_from_chrome:
+        command.extend(["--cookies-from-browser", f"chrome:{chrome_profile}"])
+    command.append(source)
+    run_command(command, "用 yt-dlp 下载 webm/bestaudio 原始音频")
     candidates = sorted(work.glob("source-audio.*"))
     source_audio = next(
         (
@@ -356,11 +361,7 @@ def run_gemini_url(args: argparse.Namespace) -> int:
     output_dir = (args.output_dir or default_gemini_output(args.url)).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "asr-manifest.json"
-    mode = (
-        "gemini-youtube-url-audio-only"
-        if args.direct_url
-        else "gemini-url-downloaded-ogg-file-api"
-    )
+    mode = "gemini-youtube-url-asr" if args.direct_url else "gemini-url-downloaded-ogg-file-api"
     completed = completed_gemini_job(
         manifest_path,
         source=args.url,
@@ -381,18 +382,64 @@ def run_gemini_url(args: argparse.Namespace) -> int:
     )
     try:
         if args.direct_url:
-            print("Gemini URL 离线转写：直接提交 URL，仅请求语音全文，不请求视觉分析或时间戳。", flush=True)
-            result = transcribe_youtube_url(
-                url=args.url,
+            print("Gemini URL 直接 ASR：不调用 yt-dlp，不请求 OCR 或视觉分析。", flush=True)
+            from google import genai
+            from google.genai import types as genai_types
+
+            client = genai.Client(
                 api_key=gemini_api_key(),
-                model=args.model,
-                timeout=args.timeout,
+                http_options=genai_types.HttpOptions(timeout=max(30, int(args.timeout)) * 1000),
             )
-            outputs = save_result(result, output_dir)
-            elapsed_seconds = result.metadata["elapsed_seconds"]
+            started = time.monotonic()
+            response = client.models.generate_content(
+                model=args.model,
+                contents=[
+                    genai_types.Part(
+                        file_data=genai_types.FileData(file_uri=args.url),
+                        # Gemini 2.5 rejects media_resolution on direct
+                        # YouTube URLs. Sparse frame sampling keeps the visual
+                        # token overhead low while leaving the audio track
+                        # available for transcription.
+                        video_metadata=genai_types.VideoMetadata(fps=0.1),
+                    ),
+                    "仅转写视频中的实际语音为完整简体中文全文。忽略画面、字幕、标题和简介；不要总结、分析、时间戳或说话人标签。只输出转写正文。",
+                ],
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=60000,
+                    response_modalities=["TEXT"],
+                ),
+            )
+            text = str(getattr(response, "text", "") or "").strip()
+            if not text:
+                raise RuntimeError("Gemini returned no transcript text")
+            elapsed_seconds = time.monotonic() - started
+            transcript = output_dir / "gemini-youtube-url-asr-transcript.txt"
+            metadata = output_dir / "gemini-youtube-url-asr-metadata.json"
+            transcript.write_text(text + "\n", encoding="utf-8")
+            write_json(
+                metadata,
+                {
+                    "input": "direct-youtube-url",
+                    "model": args.model,
+                    "url": args.url,
+                    "characters": len(text),
+                    "elapsed_seconds": round(elapsed_seconds, 3),
+                    "visual_analysis_requested": False,
+                    "ocr_requested": False,
+                    "video_frame_sampling_fps": 0.1,
+                },
+            )
+            outputs = {"transcript": str(transcript), "metadata": str(metadata)}
+            result = type("GeminiDirectUrlResult", (), {"text": text})()
         else:
-            print("Gemini URL 离线转写：yt-dlp 下载音频 -> OGG/Opus -> Gemini File API。", flush=True)
-            source_audio = download_url_audio(args.url, output_dir)
+            print("Gemini URL 纯音频转写：yt-dlp 下载音轨 -> OGG/Opus -> Gemini File API。", flush=True)
+            source_audio = download_url_audio(
+                args.url,
+                output_dir,
+                cookies_from_chrome=args.cookies_from_chrome,
+                chrome_profile=args.chrome_profile,
+            )
             gemini = run_gemini_local_audio(
                 source_audio,
                 output_dir,
@@ -572,21 +619,42 @@ def default_gemini_local_output(source: Path) -> Path:
     return GENERATED_DIR / f"{safe_name(source.stem)}-Gemini-Local-ASR"
 
 
+def approximate_transcript_segments(text: str, duration: float) -> list[SubtitleSegment]:
+    """Distribute sentence-like text spans monotonically across total duration."""
+    units = [
+        unit.strip()
+        for unit in re.findall(r".*?(?:[。！？!?；;]+|\n+|$)", text, flags=re.DOTALL)
+        if unit.strip()
+    ]
+    if not units or duration <= 0:
+        return []
+    weights = [max(1, len(re.sub(r"\s+", "", unit))) for unit in units]
+    total_weight = sum(weights)
+    elapsed = 0.0
+    segments: list[SubtitleSegment] = []
+    for index, (unit, weight) in enumerate(zip(units, weights)):
+        start = elapsed
+        elapsed = duration if index == len(units) - 1 else elapsed + duration * weight / total_weight
+        segments.append(SubtitleSegment(start, elapsed, " ".join(unit.split())))
+    return segments
+
+
 def save_gemini_local_result(result: Any, output_dir: Path, *, audio_path: Path, source: Path) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    transcript = output_dir / "gemini-local-audio-asr-transcript.md"
+    transcript = output_dir / "gemini-local-audio-asr-transcript.txt"
+    approximate_srt = output_dir / "gemini-local-audio-asr-approximate.srt"
     metadata = output_dir / "gemini-local-audio-asr-metadata.json"
     if result.text.strip():
-        transcript.write_text(
-            transcript_markdown(
-                result.text,
-                title="Gemini Audio ASR Transcript",
-                source=str(source),
-                model=result.model,
-                audio_path=audio_path,
-            ),
-            encoding="utf-8",
-        )
+        transcript.write_text(result.text.strip() + "\n", encoding="utf-8")
+        try:
+            duration = probe_audio_duration(audio_path)
+            save_segments_as_srt(
+                approximate_srt,
+                approximate_transcript_segments(result.text, duration),
+            )
+        except Exception:
+            # TXT remains the primary artifact even if duration probing fails.
+            pass
     write_json(
         metadata,
         {
@@ -597,6 +665,11 @@ def save_gemini_local_result(result: Any, output_dir: Path, *, audio_path: Path,
             "status": result.status,
             "elapsed": result.elapsed,
             "characters": len(result.text),
+            "approximate_timeline": {
+                "method": "sentence-length-proportional-over-total-audio-duration",
+                "acoustic_alignment": False,
+                "warning": "Cue boundaries are approximate and are not speech timestamps.",
+            },
             "diagnostics": result.diagnostics,
             "warning": result.warning,
         },
@@ -604,6 +677,8 @@ def save_gemini_local_result(result: Any, output_dir: Path, *, audio_path: Path,
     outputs = {"metadata": str(metadata)}
     if transcript.is_file() and transcript.stat().st_size > 0:
         outputs["transcript"] = str(transcript)
+    if approximate_srt.is_file() and approximate_srt.stat().st_size > 0:
+        outputs["approximate_srt"] = str(approximate_srt)
     return outputs
 
 
@@ -636,6 +711,7 @@ def run_gemini_local_audio(
         "characters": len(result.text),
         "ogg": str(ogg),
         "transcript": outputs["transcript"],
+        "approximate_srt": outputs.get("approximate_srt", ""),
         "metadata": outputs["metadata"],
         "elapsed": result.elapsed,
         "diagnostics": result.diagnostics,
@@ -650,7 +726,7 @@ def completed_gemini_local_stage(stage: dict[str, Any]) -> bool:
         for key in ("transcript", "metadata")
     ):
         return False
-    return Path(stage["transcript"]).suffix.lower() == ".md"
+    return Path(stage["transcript"]).suffix.lower() == ".txt"
 
 
 def run_gemini_local(args: argparse.Namespace) -> int:
@@ -2465,7 +2541,7 @@ def main() -> int:
 
     gemini = subparsers.add_parser(
         "gemini-url",
-        help="Transcribe a public YouTube URL without yt-dlp or visual analysis output",
+        help="Download a public YouTube audio track and transcribe it with Gemini",
     )
     gemini.add_argument("url")
     gemini.add_argument("--output-dir", type=Path)
@@ -2473,11 +2549,9 @@ def main() -> int:
     gemini.add_argument("--timeout", type=float, default=1200.0)
     gemini.add_argument("--upload-timeout", type=int, default=300)
     gemini.add_argument("--processing-timeout", type=int, default=1200)
-    gemini.add_argument(
-        "--direct-url",
-        action="store_true",
-        help="Submit the YouTube URL directly to Gemini instead of downloading audio with yt-dlp.",
-    )
+    gemini.add_argument("--cookies-from-chrome", action="store_true")
+    gemini.add_argument("--chrome-profile", default="Default")
+    gemini.add_argument("--direct-url", action="store_true")
     gemini.set_defaults(handler=run_gemini_url)
 
     native_subtitles = subparsers.add_parser(

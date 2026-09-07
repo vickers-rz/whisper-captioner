@@ -28,13 +28,12 @@ The first two menu entries are independent of the complete forensic pipeline:
 - `Gemini URL -> full transcript` downloads the public YouTube URL's best
   audio with yt-dlp, prefers WebM when available, converts the first audio
   stream to OGG/Opus, and sends that audio file to Gemini File API for
-  audio-only ASR. It does not request summaries, timestamps, or visual analysis
-  output. Pass `--direct-url` to `scripts/asr_entrypoints.py gemini-url` to use
-  the older direct-URL Gemini path.
+  audio-only ASR. It never submits video frames to Gemini and does not request
+  OCR, summaries, timestamps, or visual analysis output.
   By default the OGG is saved as
   `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/Gemini-URL-ASR [VIDEO_ID]/work/gemini-audio.ogg`,
-  and the formatted Markdown transcript is saved as
-  `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/Gemini-URL-ASR [VIDEO_ID]/gemini-local-audio-asr-transcript.md`,
+  and the raw transcript is saved as
+  `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/Gemini-URL-ASR [VIDEO_ID]/gemini-local-audio-asr-transcript.txt`,
   or under `WHISPER_CAPTIONER_OUTPUT_DIR/artifacts/generated/` when that
   override is set.
   Markdown transcript formatting follows a lightweight built-in CJK formatter:

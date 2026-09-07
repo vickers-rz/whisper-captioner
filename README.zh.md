@@ -26,9 +26,8 @@ bash /Users/vickers/Documents/whisper-captioner/run.sh
 
 菜单前两项独立于完整取证流水线：
 
-- `Gemini URL -> full transcript`：用 `yt-dlp` 下载公开 YouTube URL 的最佳音频，优先使用 WebM，把首个音频流转为 OGG/Opus，然后通过 Gemini File API 做仅音频 ASR。它不会请求摘要、时间戳或视觉分析结果。如需旧的“直接把 URL 交给 Gemini”路径，可调用 `scripts/asr_entrypoints.py gemini-url --direct-url`。
-  默认 OGG 保存为 `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/Gemini-URL-ASR [VIDEO_ID]/work/gemini-audio.ogg`，排版后的 Markdown ASR 文稿保存为 `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/Gemini-URL-ASR [VIDEO_ID]/gemini-local-audio-asr-transcript.md`；如果设置了 `WHISPER_CAPTIONER_OUTPUT_DIR`，则位于该目录下的 `artifacts/generated/` 中。
-  Markdown 文稿使用内置轻量中文排版：metadata 标题区、正文区、中英文/数字间距、常见中文标点清理，以及按句子自动分段。
+- `Gemini URL -> full transcript`：用 `yt-dlp` 下载公开 YouTube URL 的最佳音频，优先使用 WebM，把首个音频流转为 OGG/Opus，然后通过 Gemini File API 做仅音频 ASR。该入口不会向 Gemini 提交视频帧，也不会请求 OCR、摘要、时间戳或视觉分析结果。
+  默认 OGG 保存为 `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/Gemini-URL-ASR [VIDEO_ID]/work/gemini-audio.ogg`，原始 TXT 全文保存为 `/Volumes/T7_APFS/MacBackup/Movies/WhisperCaptioner/artifacts/generated/Gemini-URL-ASR [VIDEO_ID]/gemini-local-audio-asr-transcript.txt`；如果设置了 `WHISPER_CAPTIONER_OUTPUT_DIR`，则位于该目录下的 `artifacts/generated/` 中。
   TUI 还提供 `ASR Markdown 文稿 -> jieba/Ollama embedding RAG -> 本机 Qwen 全文语义分段`。它现在使用面向长视频字幕的四层流水线：中文断句、Paragraph/Topic 语义窗口、TF-IDF 加 `qwen3-embedding:0.6b` 双索引与 RRF 融合，最后交给本机 `qwen3.5:4b` 做结构分析。本地索引包含 Sentence、Paragraph、Topic 三层 embedding，输出 `*-ollama-segmented.md`。CLI 可用 `--embedding-backend ollama`、`tfidf` 或 `hybrid` 对比不同方案。
   Command TUI 已把四种分段方案拆成四个独立菜单项：纯 Qwen、TF-IDF RAG、Ollama embedding RAG 和 Hybrid RAG。
   另外还新增第 5 种 ASR 后处理模式：Gemini 2.5 Flash/Pro 富 Markdown 规整，适合已配置 Gemini API Key 时使用。

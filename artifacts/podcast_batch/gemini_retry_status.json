@@ -1,0 +1,35 @@
+{
+  "model": "gemini-2.5-flash",
+  "total": 5,
+  "completed": [
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/不想答应，却总是难以拒绝怎么办？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/不想答应，却总是难以拒绝怎么办？.txt",
+      "attempts": 0
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/为什么“爱自己”后，生活反而更遭了？｜灵性逃避.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/为什么“爱自己”后，生活反而更遭了？｜灵性逃避.txt",
+      "attempts": 0
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/卷不动又躺不平，如何找到人生角度？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/卷不动又躺不平，如何找到人生角度？.txt",
+      "attempts": 0
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/紧握着痛苦不放的我们，得到了什么呢？.mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/紧握着痛苦不放的我们，得到了什么呢？.txt",
+      "attempts": 0
+    },
+    {
+      "source": "/Volumes/02_HDD_unTar_NFS/播客/选择困难症，真正难的是......mp3",
+      "target": "/Volumes/02_HDD_unTar_NFS/播客/选择困难症，真正难的是......txt",
+      "attempts": 3,
+      "elapsed_seconds": 17.7
+    }
+  ],
+  "failed": [],
+  "started_at": "2026-08-19T18:58:14+0800",
+  "finished_at": "2026-08-19T18:58:53+0800"
+}

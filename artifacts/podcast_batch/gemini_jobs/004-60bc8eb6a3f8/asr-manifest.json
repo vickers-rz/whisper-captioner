@@ -1,0 +1,85 @@
+{
+  "kind": "standalone-asr",
+  "status": "completed",
+  "created_at": "2026-08-19T18:44:53+0800",
+  "updated_at": "2026-08-19T18:55:28+0800",
+  "mode": "gemini-local-audio-asr",
+  "title": "Gemini local ASR: 不想答应，却总是难以拒绝怎么办？.mp3",
+  "source": "/Volumes/02_HDD_unTar_NFS/播客/不想答应，却总是难以拒绝怎么办？.mp3",
+  "model": "gemini-2.5-flash",
+  "stages": {
+    "gemini": {
+      "status": "completed",
+      "updated_at": "2026-08-19T18:55:28+0800",
+      "model": "gemini-2.5-flash",
+      "characters": 1912,
+      "ogg": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/004-60bc8eb6a3f8/work/gemini-audio.ogg",
+      "transcript": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/004-60bc8eb6a3f8/gemini-local-audio-asr-transcript.md",
+      "metadata": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/004-60bc8eb6a3f8/gemini-local-audio-asr-metadata.json",
+      "elapsed": 21.143150091171265,
+      "diagnostics": {
+        "transport": "file-api",
+        "cleanup": "deleted",
+        "file_name": "files/xg81q0amrwd1",
+        "upload_elapsed": 2.5086350420006056,
+        "file_state": "FILESTATE.ACTIVE",
+        "generation_elapsed": 21.143150091171265,
+        "response": {
+          "sdk_http_response": {
+            "headers": {
+              "x-gemini-service-tier": "standard",
+              "content-type": "application/json; charset=UTF-8",
+              "vary": "Origin, X-Origin, Referer",
+              "content-encoding": "gzip",
+              "date": "Wed, 19 Aug 2026 10:55:27 GMT",
+              "server": "scaffolding on HTTPServer2",
+              "x-xss-protection": "0",
+              "x-frame-options": "SAMEORIGIN",
+              "x-content-type-options": "nosniff",
+              "server-timing": "gfet4t7; dur=20753",
+              "alt-svc": "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000",
+              "transfer-encoding": "chunked"
+            }
+          },
+          "candidates": [
+            {
+              "content": {
+                "parts": [
+                  {
+                    "text": "许多人面对明明不想答应的请求，拒绝的话却总是开不了口。\n常年累月，积累了很多的委屈和愤怒，拒绝为什么这么难呢？\nHello，向日葵大家好，我是怕伤害别人，但该拒绝还是得拒绝的店长。\n阿姨这里是安慰剂，用心理学照着你。\n边界其实就是分清什么是你的，什么是我的的能力。\n这样的能力呢，我们从两岁就开始发展了。\n那个时候小孩会开始说不。\n不想吃饭，不想穿衣服。\n看着好像是在和大人作对啊。\n其实呢是小孩在以说不的方式，反复地去体验什么是我的需求，什么是自己的需求，什么是妈妈的需求，从而去感受和确认自我的存在。\n那边界不清的时候呢，往往分不清什么是别人的责任，什么是我的责任。\n被讨厌的勇气里面谈到的课题分离，就是在讲把自己的课题和别人的课题分开。\n如果说内心没有清晰的边界，过度为别人负责，或者说嘴上说着拒绝，但是边界不清晰啊，那你的边界就是黏黏糊糊的。\n即使你嘴上说着拒绝，但是也在传递我的拒绝也没那么重要，你可以忽视我的拒绝这样的感受。\n当对方收到了传递的这种隐含的信息的时候，知道你的边界是可以突破的，往往会继续施压，这个时候拒绝就会变得非常的艰难。\n许多人害怕拒绝另外一个重要的原因就是害怕拒绝之后的惩罚。\n如果是自己珍惜的好朋友，你可能会担心拒绝会破坏你们之间的关系。\n人间失格里面呢有一句话描述了这样的体验。\n我的不幸在于我缺乏拒绝别人的能力。\n我怕一旦我拒绝别人的话，便会在彼此心里留下一道永远无法修复的裂痕。\n这种一旦拒绝别人就害怕关系破裂，最终在关系中被抛弃的感受，常常和成长经历当中啊，我们不被允许拒绝父母或者说其他权威长辈有关系。\n这是曾经有一个综艺节目里边调查，让小朋友投票，父母常说的话里边你最害怕的是哪句，然后排在第一名的，大家知道是什么吗？\n那就是你再不听话，我们都不要你了啊。\n哦，现在听到都有创伤的。\n如果成长过程中，孩子对父母的拒绝会激发父母的愤怒，并以断掉关系作为威胁的方式的话，去惩罚孩子，那这会令孩子感到关系是脆弱的，关系是不堪一击的，是不足以稳固到可以容纳拒绝的。\n那长大以后同样的担心就会出现在和其他人的关系里边。\n早年的不安全感或许是因为拒绝的场景而激活了，值得小心翼翼地通过顺从维护心中脆弱的关系。\n而面对关系一般的人，有可能也会担心拒绝别人会被人记恨啊，伺机报复啊什么的。\n那这两种担心呢，都是内心对惩罚的害怕，一种是对被抛弃的惩罚的害怕，另外一种是对被攻击的惩罚的害怕。\n这个秘籍就是优雅说不，ERA。\n有三个步骤啊，能够帮助你从容地拒绝别人。\n第一步，共情，empathy。\n共情别人的需要和感受，首先呢，说出你理解别人的需要，这种理解呢，会让对方感到你们是站一边的，嗯。\n你拒绝的是他的请求，但你同时理解他的需要。\n比如你的队友想挂名小组作业，你当然觉得这既不公平也不合适。\n首先共情对方可能的需要，你可以说，我知道你最近可能挺累的，精力有限，但又想有一个分数，成绩还是很重要的。\n第二步，reason。\n告知对方自己无法帮到的理由，这里边真诚如实的告知就好了哈，你表达你的真诚，别人接不接受你的理由，那是他自己的课题。\n比如还是上面的例子，你或许可以接着回复，但是我们这个项目每个人都很重要，都有自己要负责的部分，大家需要一起合作。\n第三步，提出可替代性的建议。\nAlternative suggestion。\n这一步可以接着说，你看看你哪个部分比较擅长，咱们可以从任务清单里边选一下试试。\n那如果对方还不接受啊，那其实是他拒绝了你提供的所有的可能性，那那只能他自己去承担不参与团队贡献的结果了。\n好了，今天视频到这里就结束了，最后呢纪念弹幕就来发No means no吧。\n电影《完美陌生人》里有句台词是女儿打电话给父亲，女孩说晚上将要去男朋友家里边去约会，她很喜欢她的男朋友。\n也为自己带了必要的防护。\n只是真的要走到这一步的时候，她犹豫了，她不太确定要不要答应男朋友，她害怕她拒绝后男朋友会生气，会因此就不再喜欢她。\n这个爸爸在电话里就对她的女儿说了下面的话，也想分享给糖丸们。\n爸爸说，不要因为他不高兴而去他家。\n这不该是唯一的理由，你也别指望我多支持你去。\n但我要说的是，这是你人生中一个重要的时刻，是你会铭记一生的事情，不仅仅是你明天和朋友聊天的谈资，如果你以后想起，无论何时回想起来，这件是都会让你嘴角带笑的话，你就去做吧。\n但如果你并不怎么认为，或者不太确定，那就忘掉它吧，因为你还有大把时间，真正的自由是有说不的权利。\n希望糖丸们都有勇气拒绝，体验自由的人生。\n如果今天的视频对大家有些启发，别忘了意见302安慰剂的视频每周更新，我们下期见。\n拜拜。"
+                  }
+                ],
+                "role": "model"
+              },
+              "finish_reason": "STOP",
+              "index": 0
+            }
+          ],
+          "model_version": "gemini-2.5-flash",
+          "response_id": "iouFauSdJKiX1MkPh82imA4",
+          "usage_metadata": {
+            "candidates_token_count": 1216,
+            "prompt_token_count": 10339,
+            "prompt_tokens_details": [
+              {
+                "modality": "TEXT",
+                "token_count": 84
+              },
+              {
+                "modality": "AUDIO",
+                "token_count": 10255
+              }
+            ],
+            "thoughts_token_count": 1896,
+            "total_token_count": 13451
+          },
+          "automatic_function_calling_history": []
+        },
+        "finish_reason": "FINISHREASON.STOP",
+        "output_tokens": 1216,
+        "max_output_tokens": 60000
+      }
+    }
+  },
+  "recommended_output": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/004-60bc8eb6a3f8/gemini-local-audio-asr-transcript.md"
+}

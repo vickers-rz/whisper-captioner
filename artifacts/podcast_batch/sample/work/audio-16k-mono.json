@@ -1,0 +1,16 @@
+{
+  "source": "/Volumes/02_HDD_unTar_NFS/播客/童年，有没有可能一点都不重要？.mp3",
+  "size": 40222346,
+  "mtime_ns": 1787135485408382300,
+  "stream_info": {
+    "suffix": ".mp3",
+    "audio_streams": 1,
+    "video_streams": 0,
+    "selected_audio_stream": 0,
+    "selected_audio_codec": "mp3",
+    "selected_audio_sample_rate": "44100",
+    "selected_audio_channels": 2
+  },
+  "wav": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/sample/work/audio-16k-mono.wav",
+  "created_at": "2026-08-19T18:41:52+0800"
+}

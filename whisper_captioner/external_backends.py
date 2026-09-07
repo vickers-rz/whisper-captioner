@@ -396,13 +396,25 @@ def gemini_transcribe_audio(
             )
             progress("Gemini File API upload started")
             upload_started = time.monotonic()
+
+            def upload_audio_file():
+                # google-genai adds a path basename to the
+                # X-Goog-Upload-File-Name header.  httpx encodes header values
+                # as ASCII, so passing a path with a non-ASCII filename fails
+                # before any audio is uploaded.  A binary stream avoids that
+                # optional header while still allowing the SDK to determine
+                # the upload size.
+                with audio_path.open("rb") as audio_file:
+                    return file_client.files.upload(
+                        file=audio_file,
+                        config=genai_types.UploadFileConfig(
+                            mime_type=mimetypes.guess_type(audio_path.name)[0]
+                            or "audio/wav",
+                        ),
+                    )
+
             uploaded_file = _call_with_timeout(
-                lambda: file_client.files.upload(
-                    file=str(audio_path),
-                    config=genai_types.UploadFileConfig(
-                        mime_type=mimetypes.guess_type(audio_path.name)[0] or "audio/wav",
-                    ),
-                ),
+                upload_audio_file,
                 upload_timeout,
                 "Gemini File API upload",
             )

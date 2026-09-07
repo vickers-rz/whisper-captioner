@@ -23,7 +23,7 @@ Usage:
   ./ForensicSubtitle.command gemini-url [URL]
                                        URL -> yt-dlp webm/bestaudio -> OGG/Opus -> Gemini ASR
   ./ForensicSubtitle.command gemini-url-direct [URL]
-                                       Gemini URL direct -> audio-only full transcript
+                                       Direct YouTube URL -> Gemini TXT ASR (no yt-dlp)
   ./ForensicSubtitle.command native-subtitles [URL]
                                        YouTube/Bilibili URL -> detect/download native subtitles
   ./ForensicSubtitle.command gemini-local [MEDIA]
@@ -211,9 +211,9 @@ run_gemini_url_asr() {
     url_value="$supplied_url"
   else
     if [ "$direct_url" = "1" ]; then
-      echo "输入公开 YouTube URL（直接交给 Gemini，仅请求音频转写）："
+      echo "输入公开 YouTube URL（不调用 yt-dlp，直接交给 Gemini 做 ASR）："
     else
-      echo "输入公开 YouTube URL（将用 yt-dlp 下载 webm/bestaudio，再转为 OGG/Opus 发给 Gemini）："
+      echo "输入公开 YouTube URL（将用 yt-dlp 只下载音轨，再转为 OGG/Opus 发给 Gemini）："
     fi
     printf "> "
     read -r url_value
@@ -228,24 +228,32 @@ run_gemini_url_asr() {
   prompt_gemini_key
   api_key_value="$GEMINI_API_KEY_VALUE"
 
+  cookie_choice="N"
+  chrome_profile="${FORENSIC_CHROME_PROFILE:-Default}"
+  if [ "$direct_url" != "1" ]; then
+    printf "允许 yt-dlp 读取 Chrome Cookie？遇到 YouTube 人机验证时选 y [y/N]: "
+    read -r cookie_choice
+    cookie_choice="${cookie_choice:-N}"
+  fi
+
   echo
   echo "产物目录留空时，将按 YouTube video ID 保存到："
   echo "  $OUTPUT_ROOT"
+  default_identity="$(gemini_url_identity "$url_value")"
+  default_job_dir="$OUTPUT_ROOT/Gemini-URL-ASR [$default_identity]"
   if [ "$direct_url" != "1" ]; then
-    default_identity="$(gemini_url_identity "$url_value")"
-    default_job_dir="$OUTPUT_ROOT/Gemini-URL-ASR [$default_identity]"
     echo "默认 OGG/Opus 保存路径："
     echo "  $default_job_dir/work/gemini-audio.ogg"
     echo "默认 yt-dlp 原始音频保存路径："
     echo "  $default_job_dir/work/source-audio.<ext>"
-    echo "默认 ASR 文稿保存路径："
-    echo "  $default_job_dir/gemini-local-audio-asr-transcript.md"
+  fi
+  echo "默认 ASR 文稿保存路径："
+  if [ "$direct_url" = "1" ]; then
+    echo "  $default_job_dir/gemini-youtube-url-asr-transcript.txt"
   else
-    default_identity="$(gemini_url_identity "$url_value")"
-    default_job_dir="$OUTPUT_ROOT/Gemini-URL-ASR [$default_identity]"
-    echo "当前为直接 URL 模式：不会生成本地 OGG。"
-    echo "默认 ASR 文稿保存路径："
-    echo "  $default_job_dir/gemini-youtube-url-audio-only-transcript.md"
+    echo "  $default_job_dir/gemini-local-audio-asr-transcript.txt"
+    echo "默认粗略句段时间轴："
+    echo "  $default_job_dir/gemini-local-audio-asr-approximate.srt"
   fi
   printf "自定义本次作业目录（可留空）: "
   read -r custom_output
@@ -254,23 +262,29 @@ run_gemini_url_asr() {
   if [ "$direct_url" = "1" ]; then
     command_args+=(--direct-url)
   fi
+  case "$cookie_choice" in
+    y|Y|yes|YES)
+      command_args+=(--cookies-from-chrome --chrome-profile "$chrome_profile")
+      ;;
+  esac
   if [ -n "$custom_output" ]; then
     custom_output="$(strip_outer_quotes "$custom_output")"
     command_args+=(--output-dir "$custom_output")
-    if [ "$direct_url" != "1" ]; then
+    echo "本次 ASR 文稿将保存到："
+    if [ "$direct_url" = "1" ]; then
+      echo "  $custom_output/gemini-youtube-url-asr-transcript.txt"
+    else
+      echo "  $custom_output/gemini-local-audio-asr-transcript.txt"
       echo "本次 OGG/Opus 将保存到："
       echo "  $custom_output/work/gemini-audio.ogg"
-      echo "本次 ASR 文稿将保存到："
-      echo "  $custom_output/gemini-local-audio-asr-transcript.md"
-    else
-      echo "本次 ASR 文稿将保存到："
-      echo "  $custom_output/gemini-youtube-url-audio-only-transcript.md"
+      echo "本次粗略句段时间轴将保存到："
+      echo "  $custom_output/gemini-local-audio-asr-approximate.srt"
     fi
   fi
   if [ "$direct_url" = "1" ]; then
-    job_label="Gemini URL -> 直接提交 URL -> Gemini 全文转写"
+    job_label="Gemini URL -> 直接提交 URL -> Gemini TXT ASR"
   else
-    job_label="Gemini URL -> yt-dlp 音频下载 -> OGG/Opus -> Gemini 全文转写"
+    job_label="Gemini URL -> yt-dlp 纯音频下载 -> OGG/Opus -> Gemini 全文转写"
   fi
   if [ -n "$api_key_value" ]; then
     GEMINI_API_KEY="$api_key_value" run_logged \
@@ -650,7 +664,7 @@ interactive_menu() {
 ============================================================
 
   1) Gemini URL -> yt-dlp 下载音频 -> OGG/Opus -> Gemini 全文转写
-  2) Gemini URL -> 直接交给 Gemini（不下载音频）
+  2) Gemini URL -> 直接交给 Gemini（不调用 yt-dlp）
   3) YouTube/Bilibili 链接 -> 检测/下载视频自带字幕
   4) 本地音频/视频媒体 -> Gemini OGG/File API 全文转写
   5) ASR 文稿 -> 纯 Qwen3.5-4B 富 Markdown 规整

@@ -403,7 +403,7 @@ class ExternalBackendTests(unittest.TestCase):
 
     def test_file_api_upload_poll_generate_and_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            audio = Path(directory) / "long.wav"
+            audio = Path(directory) / "小人經-long.wav"
             audio.write_bytes(b"x")
             uploaded = SimpleNamespace(name="files/test", state="PROCESSING")
             active = SimpleNamespace(name="files/test", state="ACTIVE")
@@ -435,6 +435,9 @@ class ExternalBackendTests(unittest.TestCase):
                 result = gemini_transcribe_audio(audio, "secret")
         self.assertEqual(result.status, "completed")
         file_client.files.upload.assert_called_once()
+        uploaded_stream = file_client.files.upload.call_args.kwargs["file"]
+        self.assertTrue(hasattr(uploaded_stream, "read"))
+        self.assertTrue(uploaded_stream.closed)
         file_client.files.get.assert_called_once_with(name="files/test")
         file_client.files.delete.assert_called_once_with(name="files/test")
         self.assertEqual(result.diagnostics["cleanup"], "deleted")

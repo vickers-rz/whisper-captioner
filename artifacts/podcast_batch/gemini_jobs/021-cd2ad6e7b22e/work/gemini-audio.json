@@ -1,0 +1,18 @@
+{
+  "source": "/Volumes/02_HDD_unTar_NFS/播客/紧握着痛苦不放的我们，得到了什么呢？.mp3",
+  "size": 14446803,
+  "mtime_ns": 1787135597150381300,
+  "stream_info": {
+    "suffix": ".mp3",
+    "audio_streams": 1,
+    "video_streams": 0,
+    "selected_audio_stream": 0,
+    "selected_audio_codec": "mp3",
+    "selected_audio_sample_rate": "44100",
+    "selected_audio_channels": 2
+  },
+  "codec": "libopus",
+  "bitrate": "64k",
+  "ogg": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/021-cd2ad6e7b22e/work/gemini-audio.ogg",
+  "created_at": "2026-08-19T18:52:31+0800"
+}

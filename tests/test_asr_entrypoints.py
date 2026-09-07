@@ -264,6 +264,7 @@ class AsrEntrypointsTest(unittest.TestCase):
                     processing_timeout=10,
                 )
                 transcript_exists = Path(result["transcript"]).is_file()
+                transcript_text = Path(result["transcript"]).read_text(encoding="utf-8")
                 metadata_exists = Path(result["metadata"]).is_file()
         finally:
             (
@@ -332,6 +333,7 @@ class AsrEntrypointsTest(unittest.TestCase):
                     processing_timeout=10,
                 )
                 transcript_exists = Path(result["transcript"]).is_file()
+                transcript_text = Path(result["transcript"]).read_text(encoding="utf-8")
                 metadata_exists = Path(result["metadata"]).is_file()
         finally:
             (
@@ -345,6 +347,7 @@ class AsrEntrypointsTest(unittest.TestCase):
         self.assertEqual(calls["commands"], [])
         self.assertTrue(calls["force_file_api"])
         self.assertTrue(transcript_exists)
+        self.assertEqual(transcript_text, "原始 OGG 转写\n")
         self.assertTrue(metadata_exists)
         self.assertEqual(result["characters"], len("原始 OGG 转写"))
         self.assertTrue(transcript_exists)

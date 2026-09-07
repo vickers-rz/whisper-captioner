@@ -1,0 +1,18 @@
+{
+  "source": "/Volumes/02_HDD_unTar_NFS/播客/为什么“爱自己”后，生活反而更遭了？｜灵性逃避.mp3",
+  "size": 18606542,
+  "mtime_ns": 1787135638556802300,
+  "stream_info": {
+    "suffix": ".mp3",
+    "audio_streams": 1,
+    "video_streams": 0,
+    "selected_audio_stream": 0,
+    "selected_audio_codec": "mp3",
+    "selected_audio_sample_rate": "44100",
+    "selected_audio_channels": 2
+  },
+  "codec": "libopus",
+  "bitrate": "64k",
+  "ogg": "/Users/vickers/Documents/whisper-captioner/artifacts/podcast_batch/gemini_jobs/007-262e48da55b9/work/gemini-audio.ogg",
+  "created_at": "2026-08-19T18:45:39+0800"
+}
